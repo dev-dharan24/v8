@@ -1012,9 +1012,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       DCHECK(fp_mode_ == SaveFPRegsMode::kIgnore ||
              fp_mode_ == SaveFPRegsMode::kSave);
       // kReturnRegister0 should have been saved before entering the stub.
-      UseScratchRegisterScope temps(masm());
-      Register scratch = temps.Acquire();
-      int bytes = __ PushCallerSaved(fp_mode_, scratch, kReturnRegister0);
+      int bytes = __ PushCallerSaved(fp_mode_, kReturnRegister0);
       DCHECK(IsAligned(bytes, kSystemPointerSize));
       DCHECK_EQ(0, frame_access_state()->sp_delta());
       frame_access_state()->IncreaseSPDelta(bytes / kSystemPointerSize);
@@ -1028,9 +1026,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       DCHECK(fp_mode_ == SaveFPRegsMode::kIgnore ||
              fp_mode_ == SaveFPRegsMode::kSave);
       // Don't overwrite the returned value.
-      UseScratchRegisterScope temps(masm());
-      Register scratch = temps.Acquire();
-      int bytes = __ PopCallerSaved(fp_mode_, scratch, kReturnRegister0);
+      int bytes = __ PopCallerSaved(fp_mode_, kReturnRegister0);
       frame_access_state()->IncreaseSPDelta(-(bytes / kSystemPointerSize));
       DCHECK_EQ(0, frame_access_state()->sp_delta());
       DCHECK(caller_registers_saved_);
@@ -1954,28 +1950,25 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     }
     case kPPC_DoubleInsertLowWord32:
-      __ InsertDoubleLow(i.OutputDoubleRegister(), i.InputRegister(1), r0);
+      __ InsertDoubleLow(i.OutputDoubleRegister(), i.InputRegister(1));
       DCHECK_EQ(LeaveRC, i.OutputRCBit());
       break;
     case kPPC_DoubleInsertHighWord32:
-      __ InsertDoubleHigh(i.OutputDoubleRegister(), i.InputRegister(1), r0);
+      __ InsertDoubleHigh(i.OutputDoubleRegister(), i.InputRegister(1));
       DCHECK_EQ(LeaveRC, i.OutputRCBit());
       break;
     case kPPC_DoubleConstruct:
       __ MovInt64ComponentsToDouble(i.OutputDoubleRegister(),
-                                    i.InputRegister(0), i.InputRegister(1), r0);
+                                    i.InputRegister(0), i.InputRegister(1));
       DCHECK_EQ(LeaveRC, i.OutputRCBit());
       break;
     case kPPC_BitcastFloat32ToInt32:
       __ MovFloatToInt(i.OutputRegister(), i.InputDoubleRegister(0),
                        kScratchDoubleReg);
       break;
-    case kPPC_BitcastInt32ToFloat32: {
-      UseScratchRegisterScope temps(masm());
-      Register scratch = temps.Acquire();
-      __ MovIntToFloat(i.OutputDoubleRegister(), i.InputRegister(0), scratch);
+    case kPPC_BitcastInt32ToFloat32:
+      __ MovIntToFloat(i.OutputDoubleRegister(), i.InputRegister(0));
       break;
-    }
     case kPPC_BitcastDoubleToInt64:
       __ MovDoubleToInt64(i.OutputRegister(), i.InputDoubleRegister(0));
       break;
@@ -2625,12 +2618,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       int lane_size = LaneSizeBits(LaneSizeField::decode(instr->opcode()));
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
-      Register scratch2 = temps.Acquire();
       switch (lane_size) {
         case 32: {
           __ F32x4ExtractLane(i.OutputDoubleRegister(),
                               i.InputSimd128Register(0), i.InputInt8(1),
-                              kScratchSimd128Reg, scratch, scratch2);
+                              kScratchSimd128Reg, scratch);
           break;
         }
         case 64: {
@@ -3285,9 +3277,7 @@ void CodeGenerator::AssembleConstructFrame() {
         Simd128RegList simd128_regs_to_save;
         for (auto reg : wasm::kSimd128ParamRegisters)
           simd128_regs_to_save.set(reg);
-        UseScratchRegisterScope temps(masm());
-        Register scratch = temps.Acquire();
-        __ MultiPushF64AndV128(fp_regs_to_save, simd128_regs_to_save, scratch);
+        __ MultiPushF64AndV128(fp_regs_to_save, simd128_regs_to_save);
         __ mov(WasmHandleStackOverflowDescriptor::GapRegister(),
                Operand(required_slots * kSystemPointerSize));
         __ AddS64(
@@ -3305,7 +3295,7 @@ void CodeGenerator::AssembleConstructFrame() {
         // safepoint here.
         ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
         RecordSafepoint(reference_map);
-        __ MultiPopF64AndV128(fp_regs_to_save, simd128_regs_to_save, scratch);
+        __ MultiPopF64AndV128(fp_regs_to_save, simd128_regs_to_save);
         __ MultiPop(regs_to_save);
       } else {
         __ Call(static_cast<intptr_t>(Builtin::kWasmStackOverflow),
@@ -3418,16 +3408,14 @@ void CodeGenerator::AssembleReturn(InstructionOperand* additional_pop_count) {
     for (auto reg : wasm::kFpParamRegisters) fp_regs_to_save.set(reg);
     Simd128RegList simd128_regs_to_save;
     for (auto reg : wasm::kSimd128ParamRegisters) simd128_regs_to_save.set(reg);
-    UseScratchRegisterScope temps(masm());
-    Register scratch = temps.Acquire();
-    __ MultiPushF64AndV128(fp_regs_to_save, simd128_regs_to_save, scratch);
+    __ MultiPushF64AndV128(fp_regs_to_save, simd128_regs_to_save);
     __ Move(kCArgRegs[0], ExternalReference::isolate_address());
     __ PrepareCallCFunction(1);
     __ CallCFunction(ExternalReference::wasm_shrink_stack(), 1);
     // Restore old FP. We don't need to restore old SP explicitly, because
     // it will be restored from FP in LeaveFrame before return.
     __ mr(fp, kReturnRegister0);
-    __ MultiPopF64AndV128(fp_regs_to_save, simd128_regs_to_save, scratch);
+    __ MultiPopF64AndV128(fp_regs_to_save, simd128_regs_to_save);
     __ MultiPop(regs_to_save);
     __ bind(&done);
   }
@@ -3714,7 +3702,7 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
                   ? base::Double(static_cast<double>(src.ToFloat32()))
                   : base::Double(src.ToFloat64());
 #endif
-      __ LoadDoubleLiteral(dst, value, r0);
+      __ LoadDoubleLiteral(dst, value);
       if (destination->IsDoubleStackSlot()) {
         __ StoreF64(dst, g.ToMemOperand(destination));
       } else if (destination->IsFloatStackSlot()) {

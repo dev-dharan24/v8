@@ -72,9 +72,8 @@ int MacroAssembler::RequiredStackSizeForCallerSaved(SaveFPRegsMode fp_mode,
   return bytes;
 }
 
-int MacroAssembler::PushCallerSaved(SaveFPRegsMode fp_mode, Register scratch,
-                                    Register exclusion1, Register exclusion2,
-                                    Register exclusion3) {
+int MacroAssembler::PushCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1,
+                                    Register exclusion2, Register exclusion3) {
   int bytes = 0;
 
   RegList exclusions = {exclusion1, exclusion2, exclusion3};
@@ -83,19 +82,18 @@ int MacroAssembler::PushCallerSaved(SaveFPRegsMode fp_mode, Register scratch,
   bytes += list.Count() * kSystemPointerSize;
 
   if (fp_mode == SaveFPRegsMode::kSave) {
-    MultiPushF64AndV128(kCallerSavedDoubles, kCallerSavedSimd128s, scratch);
+    MultiPushF64AndV128(kCallerSavedDoubles, kCallerSavedSimd128s);
     bytes += kStackSavedSavedFPSizeInBytes;
   }
 
   return bytes;
 }
 
-int MacroAssembler::PopCallerSaved(SaveFPRegsMode fp_mode, Register scratch,
-                                   Register exclusion1, Register exclusion2,
-                                   Register exclusion3) {
+int MacroAssembler::PopCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1,
+                                   Register exclusion2, Register exclusion3) {
   int bytes = 0;
   if (fp_mode == SaveFPRegsMode::kSave) {
-    MultiPopF64AndV128(kCallerSavedDoubles, kCallerSavedSimd128s, scratch);
+    MultiPopF64AndV128(kCallerSavedDoubles, kCallerSavedSimd128s);
     bytes += kStackSavedSavedFPSizeInBytes;
   }
 
@@ -621,65 +619,22 @@ void MacroAssembler::MultiPopV128(Simd128RegList simd_regs, Register location) {
 
 void MacroAssembler::MultiPushF64AndV128(DoubleRegList dregs,
                                          Simd128RegList simd_regs,
-                                         Register scratch, Register location) {
-  MultiPushDoubles(dregs);
+                                         Register location) {
+  MultiPushDoubles(dregs, location);
 #if V8_ENABLE_WEBASSEMBLY
-  if (options().generating_embedded_builtin) {
-    // V8 uses the same set of fp param registers as Simd param registers.
-    // As these registers are two different sets on ppc we must make
-    // sure to also save them when Simd is enabled.
-    // Check the comments under crrev.com/c/2645694 for more details.
-    Label push_empty_simd, simd_pushed;
-    Move(scratch, ExternalReference::supports_simd_128_address());
-    LoadU8(scratch, MemOperand(scratch));
-    cmpi(scratch, Operand::Zero());  // If > 0 then simd is available.
-    ble(&push_empty_simd);
-    MultiPushV128(simd_regs);
-    b(&simd_pushed);
-    bind(&push_empty_simd);
-    // We still need to allocate empty space on the stack even if we
-    // are not pushing Simd registers (see kFixedFrameSizeFromFp).
-    addi(sp, sp,
-         Operand(-static_cast<int8_t>(simd_regs.Count()) * kSimd128Size));
-    bind(&simd_pushed);
-  } else {
-    if (CpuFeatures::SupportsSimd128()) {
-      MultiPushV128(simd_regs);
-    } else {
-      addi(sp, sp,
-           Operand(-static_cast<int8_t>(simd_regs.Count()) * kSimd128Size));
-    }
-  }
+  MultiPushV128(simd_regs, location);
 #endif
 }
 
 void MacroAssembler::MultiPopF64AndV128(DoubleRegList dregs,
                                         Simd128RegList simd_regs,
-                                        Register scratch, Register location) {
+                                        Register location) {
 #if V8_ENABLE_WEBASSEMBLY
-  if (options().generating_embedded_builtin) {
-    Label pop_empty_simd, simd_popped;
-    Move(scratch, ExternalReference::supports_simd_128_address());
-    LoadU8(scratch, MemOperand(scratch));
-    cmpi(scratch, Operand::Zero());  // If > 0 then simd is available.
-    ble(&pop_empty_simd);
-    MultiPopV128(simd_regs);
-    b(&simd_popped);
-    bind(&pop_empty_simd);
-    addi(sp, sp,
-         Operand(static_cast<int8_t>(simd_regs.Count()) * kSimd128Size));
-    bind(&simd_popped);
-  } else {
-    if (CpuFeatures::SupportsSimd128()) {
-      MultiPopV128(simd_regs);
-    } else {
-      addi(sp, sp,
-           Operand(static_cast<int8_t>(simd_regs.Count()) * kSimd128Size));
-    }
-  }
+  MultiPopV128(simd_regs, location);
 #endif
-  MultiPopDoubles(dregs);
+  MultiPopDoubles(dregs, location);
 }
+
 void MacroAssembler::PushAll(RegList registers) {
   if (registers.is_empty()) return;
   ASM_CODE_COMMENT(this);
@@ -957,11 +912,9 @@ void MacroAssembler::CallRecordWriteStub(Register object, Register slot_address,
 void MacroAssembler::CallVerifySkippedWriteBarrierStubSaveRegisters(
     Register object, Register value, SaveFPRegsMode fp_mode) {
   ASM_CODE_COMMENT(this);
-  UseScratchRegisterScope temps(this);
-  Register scratch = temps.Acquire();
-  PushCallerSaved(fp_mode, scratch);
+  PushCallerSaved(fp_mode);
   CallVerifySkippedWriteBarrierStub(object, value);
-  PopCallerSaved(fp_mode, scratch);
+  PopCallerSaved(fp_mode);
 }
 
 void MacroAssembler::CallVerifySkippedWriteBarrierStub(Register object,
@@ -1091,29 +1044,29 @@ void MacroAssembler::RestoreFrameStateForTailCall() {
 void MacroAssembler::CanonicalizeNaN(const DoubleRegister dst,
                                      const DoubleRegister src) {
   // Turn potential sNaN into qNaN.
-  LoadDoubleLiteral(kDoubleRegZero, base::Double(0.0), r0);
+  LoadDoubleLiteral(kDoubleRegZero, base::Double(0.0));
   fsub(dst, src, kDoubleRegZero);
 }
 
 void MacroAssembler::ConvertIntToDouble(Register src, DoubleRegister dst) {
-  MovIntToDouble(dst, src, r0);
+  MovIntToDouble(dst, src);
   fcfid(dst, dst);
 }
 
 void MacroAssembler::ConvertUnsignedIntToDouble(Register src,
                                                 DoubleRegister dst) {
-  MovUnsignedIntToDouble(dst, src, r0);
+  MovUnsignedIntToDouble(dst, src);
   fcfid(dst, dst);
 }
 
 void MacroAssembler::ConvertIntToFloat(Register src, DoubleRegister dst) {
-  MovIntToDouble(dst, src, r0);
+  MovIntToDouble(dst, src);
   fcfids(dst, dst);
 }
 
 void MacroAssembler::ConvertUnsignedIntToFloat(Register src,
                                                DoubleRegister dst) {
-  MovUnsignedIntToDouble(dst, src, r0);
+  MovUnsignedIntToDouble(dst, src);
   fcfids(dst, dst);
 }
 
@@ -1508,7 +1461,7 @@ void MacroAssembler::CheckDebugHook(Register fun, Register new_target,
   Move(r7, debug_hook_active);
   LoadU8(r7, MemOperand(r7));
   extsb(r7, r7);
-  CmpSmiLiteral(r7, Smi::zero(), r0);
+  CmpSmiLiteral(r7, Smi::zero());
   beq(&skip_hook);
 
   {
@@ -1570,7 +1523,7 @@ void MacroAssembler::InvokeFunctionCode(Register function, Register new_target,
       CallJSFunction(function, unused_argument_count);
       break;
     case InvokeType::kJump:
-      JumpJSFunction(function, r0);
+      JumpJSFunction(function);
       break;
   }
 }
@@ -1824,7 +1777,7 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
     SmiUntag(kJavaScriptCallArgCountRegister);
   }
   static_assert(kJavaScriptCallCodeStartRegister == r5, "ABI mismatch");
-  JumpJSFunction(kJavaScriptCallTargetRegister, r0);
+  JumpJSFunction(kJavaScriptCallTargetRegister);
 }
 
 
@@ -2402,7 +2355,9 @@ void MacroAssembler::LoadSmiLiteral(Register dst, Tagged<Smi> smi) {
 }
 
 void MacroAssembler::LoadDoubleLiteral(DoubleRegister result,
-                                       base::Double value, Register scratch) {
+                                       base::Double value) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   if (V8_EMBEDDED_CONSTANT_POOL_BOOL && is_constant_pool_available() &&
       !(scratch == r0 && ConstantPoolAccessIsInOverflow())) {
     ConstantPoolEntry::Access access = ConstantPoolAddEntry(value);
@@ -2427,14 +2382,12 @@ void MacroAssembler::LoadDoubleLiteral(DoubleRegister result,
   mtfprd(result, scratch);
 }
 
-void MacroAssembler::MovIntToDouble(DoubleRegister dst, Register src,
-                                    Register scratch) {
+void MacroAssembler::MovIntToDouble(DoubleRegister dst, Register src) {
   // sign-extend src to 64-bit
   mtfprwa(dst, src);
 }
 
-void MacroAssembler::MovUnsignedIntToDouble(DoubleRegister dst, Register src,
-                                            Register scratch) {
+void MacroAssembler::MovUnsignedIntToDouble(DoubleRegister dst, Register src) {
   // zero-extend src to 64-bit
   mtfprwz(dst, src);
 }
@@ -2446,22 +2399,25 @@ void MacroAssembler::MovInt64ToDouble(DoubleRegister dst,
 
 void MacroAssembler::MovInt64ComponentsToDouble(DoubleRegister dst,
                                                 Register src_hi,
-                                                Register src_lo,
-                                                Register scratch) {
+                                                Register src_lo) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   ShiftLeftU64(scratch, src_hi, Operand(32));
   rldimi(scratch, src_lo, 0, 32);
   mtfprd(dst, scratch);
 }
 
-void MacroAssembler::InsertDoubleLow(DoubleRegister dst, Register src,
-                                     Register scratch) {
+void MacroAssembler::InsertDoubleLow(DoubleRegister dst, Register src) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   mffprd(scratch, dst);
   rldimi(scratch, src, 0, 32);
   mtfprd(dst, scratch);
 }
 
-void MacroAssembler::InsertDoubleHigh(DoubleRegister dst, Register src,
-                                      Register scratch) {
+void MacroAssembler::InsertDoubleHigh(DoubleRegister dst, Register src) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   mffprd(scratch, dst);
   rldimi(scratch, src, 32, 0);
   mtfprd(dst, scratch);
@@ -2480,8 +2436,9 @@ void MacroAssembler::MovDoubleToInt64(Register dst, DoubleRegister src) {
   mffprd(dst, src);
 }
 
-void MacroAssembler::MovIntToFloat(DoubleRegister dst, Register src,
-                                   Register scratch) {
+void MacroAssembler::MovIntToFloat(DoubleRegister dst, Register src) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   ShiftLeftU64(scratch, src, Operand(32));
   mtfprd(dst, scratch);
   xscvspdpn(dst, dst);
@@ -2879,50 +2836,60 @@ void MacroAssembler::CopySignF64(DoubleRegister dst, DoubleRegister lhs,
 }
 
 void MacroAssembler::CmpSmiLiteral(Register src1, Tagged<Smi> smi,
-                                   Register scratch, CRegister cr) {
+                                   CRegister cr) {
 #if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
   CmpS32(src1, Operand(smi), cr);
 #else
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   LoadSmiLiteral(scratch, smi);
   CmpS64(src1, scratch, cr);
 #endif
 }
 
 void MacroAssembler::CmplSmiLiteral(Register src1, Tagged<Smi> smi,
-                                    Register scratch, CRegister cr) {
+                                    CRegister cr) {
 #if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
   CmpU64(src1, Operand(smi), cr);
 #else
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   LoadSmiLiteral(scratch, smi);
   CmpU64(src1, scratch, cr);
 #endif
 }
 
-void MacroAssembler::AddSmiLiteral(Register dst, Register src, Tagged<Smi> smi,
-                                   Register scratch) {
+void MacroAssembler::AddSmiLiteral(Register dst, Register src,
+                                   Tagged<Smi> smi) {
 #if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
   AddS64(dst, src, Operand(smi.ptr()));
 #else
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   LoadSmiLiteral(scratch, smi);
   add(dst, src, scratch);
 #endif
 }
 
-void MacroAssembler::SubSmiLiteral(Register dst, Register src, Tagged<Smi> smi,
-                                   Register scratch) {
+void MacroAssembler::SubSmiLiteral(Register dst, Register src,
+                                   Tagged<Smi> smi) {
 #if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
   AddS64(dst, src, Operand(-(static_cast<intptr_t>(smi.ptr()))));
 #else
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   LoadSmiLiteral(scratch, smi);
   sub(dst, src, scratch);
 #endif
 }
 
 void MacroAssembler::AndSmiLiteral(Register dst, Register src, Tagged<Smi> smi,
-                                   Register scratch, RCBit rc) {
+                                   RCBit rc) {
 #if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
   AndU64(dst, src, Operand(smi), rc);
 #else
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   LoadSmiLiteral(scratch, smi);
   and_(dst, src, scratch, rc);
 #endif
@@ -3600,11 +3567,11 @@ void MacroAssembler::F64x2ExtractLane(DoubleRegister dst, Simd128Register src,
 void MacroAssembler::F32x4ExtractLane(DoubleRegister dst, Simd128Register src,
                                       uint8_t imm_lane_idx,
                                       Simd128Register scratch1,
-                                      Register scratch2, Register scratch3) {
+                                      Register scratch2) {
   constexpr int lane_width_in_bytes = 4;
   vextractuw(scratch1, src, Operand((3 - imm_lane_idx) * lane_width_in_bytes));
   mfvsrd(scratch2, scratch1);
-  MovIntToFloat(dst, scratch2, scratch3);
+  MovIntToFloat(dst, scratch2);
 }
 
 void MacroAssembler::I64x2ExtractLane(Register dst, Simd128Register src,
@@ -4809,16 +4776,16 @@ void MacroAssembler::CallJSDispatchEntry(JSDispatchHandle dispatch_handle,
   Call(code);
 }
 
-void MacroAssembler::JumpJSFunction(Register function_object, Register scratch,
+void MacroAssembler::JumpJSFunction(Register function_object,
                                     JumpMode jump_mode) {
   Register code = kJavaScriptCallCodeStartRegister;
   Register dispatch_handle = r0;
   UseScratchRegisterScope temps(this);
-  Register scratch2 = temps.Acquire();
+  Register scratch = temps.Acquire();
   LoadU32(
       dispatch_handle,
       FieldMemOperand(function_object, offsetof(JSFunction, dispatch_handle_)));
-  LoadEntrypointFromJSDispatchTable(code, dispatch_handle, scratch2);
+  LoadEntrypointFromJSDispatchTable(code, dispatch_handle, scratch);
   Jump(code);
 }
 

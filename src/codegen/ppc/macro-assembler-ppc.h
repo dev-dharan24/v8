@@ -133,8 +133,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 #endif
   }
 
-  void LoadDoubleLiteral(DoubleRegister result, base::Double value,
-                         Register scratch);
+  void LoadDoubleLiteral(DoubleRegister result, base::Double value);
 
   // load a literal signed int value <value> to GPR <dst>
   void LoadIntLiteral(Register dst, int value);
@@ -565,9 +564,9 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   void MultiPopV128(Simd128RegList dregs, Register location = sp);
 
   void MultiPushF64AndV128(DoubleRegList dregs, Simd128RegList simd_regs,
-                           Register scratch, Register location = sp);
+                           Register location = sp);
   void MultiPopF64AndV128(DoubleRegList dregs, Simd128RegList simd_regs,
-                          Register scratch, Register location = sp);
+                          Register location = sp);
   void PushAll(RegList registers);
   void PopAll(RegList registers);
   void PushAll(DoubleRegList registers, int stack_slot_size = kDoubleSize);
@@ -582,14 +581,13 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 
   // Push caller saved registers on the stack, and return the number of bytes
   // stack pointer is adjusted.
-  int PushCallerSaved(SaveFPRegsMode fp_mode, Register scratch,
-                      Register exclusion1 = no_reg,
+  int PushCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1 = no_reg,
                       Register exclusion2 = no_reg,
                       Register exclusion3 = no_reg);
   // Restore caller saved registers from the stack, and return the number of
   // bytes stack pointer is adjusted.
-  int PopCallerSaved(SaveFPRegsMode fp_mode, Register scratch,
-                     Register exclusion1 = no_reg, Register exclusion2 = no_reg,
+  int PopCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1 = no_reg,
+                     Register exclusion2 = no_reg,
                      Register exclusion3 = no_reg);
 
   // Load an object from the root table.
@@ -769,20 +767,19 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
                                    Register scratch, Label* ok);
 
   // Move values between integer and floating point registers.
-  void MovIntToDouble(DoubleRegister dst, Register src, Register scratch);
-  void MovUnsignedIntToDouble(DoubleRegister dst, Register src,
-                              Register scratch);
+  void MovIntToDouble(DoubleRegister dst, Register src);
+  void MovUnsignedIntToDouble(DoubleRegister dst, Register src);
   void MovInt64ToDouble(DoubleRegister dst,
                         Register src);
   void MovInt64ComponentsToDouble(DoubleRegister dst, Register src_hi,
-                                  Register src_lo, Register scratch);
-  void InsertDoubleLow(DoubleRegister dst, Register src, Register scratch);
-  void InsertDoubleHigh(DoubleRegister dst, Register src, Register scratch);
+                                  Register src_lo);
+  void InsertDoubleLow(DoubleRegister dst, Register src);
+  void InsertDoubleHigh(DoubleRegister dst, Register src);
   void MovDoubleLowToInt(Register dst, DoubleRegister src);
   void MovDoubleHighToInt(Register dst, DoubleRegister src);
   void MovDoubleToInt64(
       Register dst, DoubleRegister src);
-  void MovIntToFloat(DoubleRegister dst, Register src, Register scratch);
+  void MovIntToFloat(DoubleRegister dst, Register src);
   void MovFloatToInt(Register dst, DoubleRegister src, DoubleRegister scratch);
   // Register move. May do nothing if the registers are identical.
   void Move(Register dst, Tagged<Smi> smi) { LoadSmiLiteral(dst, smi); }
@@ -993,7 +990,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 
   // Convenience functions to call/jmp to the code of a JSFunction object.
   void CallJSFunction(Register function_object, uint16_t argument_count);
-  void JumpJSFunction(Register function_object, Register scratch,
+  void JumpJSFunction(Register function_object,
                       JumpMode jump_mode = JumpMode::kJump);
   void CallJSDispatchEntry(JSDispatchHandle dispatch_handle,
                            uint16_t argument_count);
@@ -1401,7 +1398,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
                         Register scratch2);
   void F32x4ExtractLane(DoubleRegister dst, Simd128Register src,
                         uint8_t imm_lane_idx, Simd128Register scratch1,
-                        Register scratch2, Register scratch3);
+                        Register scratch2);
   void I64x2ExtractLane(Register dst, Simd128Register src, uint8_t imm_lane_idx,
                         Simd128Register scratch);
   void I32x4ExtractLane(Register dst, Simd128Register src, uint8_t imm_lane_idx,
@@ -1522,16 +1519,12 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 
   // load a literal double value <value> to FPR <result>
 
-  void AddSmiLiteral(Register dst, Register src, Tagged<Smi> smi,
-                     Register scratch);
-  void SubSmiLiteral(Register dst, Register src, Tagged<Smi> smi,
-                     Register scratch);
-  void CmpSmiLiteral(Register src1, Tagged<Smi> smi, Register scratch,
-                     CRegister cr = cr0);
-  void CmplSmiLiteral(Register src1, Tagged<Smi> smi, Register scratch,
-                      CRegister cr = cr0);
+  void AddSmiLiteral(Register dst, Register src, Tagged<Smi> smi);
+  void SubSmiLiteral(Register dst, Register src, Tagged<Smi> smi);
+  void CmpSmiLiteral(Register src1, Tagged<Smi> smi, CRegister cr = cr0);
+  void CmplSmiLiteral(Register src1, Tagged<Smi> smi, CRegister cr = cr0);
   void AndSmiLiteral(Register dst, Register src, Tagged<Smi> smi,
-                     Register scratch, RCBit rc = LeaveRC);
+                     RCBit rc = LeaveRC);
 
   // ---------------------------------------------------------------------------
   // JavaScript invokes

@@ -403,7 +403,7 @@ void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source,
     // precondition here is: if maybe_target_code is an InstructionStream
     // object, it must NOT be marked_for_deoptimization (callers must ensure
     // this).
-    __ CmpSmiLiteral(maybe_target_code, Smi::zero(), r0);
+    __ CmpSmiLiteral(maybe_target_code, Smi::zero());
     __ bne(&jump_to_optimized_code);
   }
 
@@ -414,7 +414,7 @@ void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source,
   }
 
   // If the code object is null, just return to the caller.
-  __ CmpSmiLiteral(r3, Smi::zero(), r0);
+  __ CmpSmiLiteral(r3, Smi::zero());
   __ bne(&jump_to_optimized_code);
   __ Ret();
 
@@ -675,7 +675,7 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
   __ Move(scratch, debug_hook);
   __ LoadU8(scratch, MemOperand(scratch));
   __ extsb(scratch, scratch);
-  __ CmpSmiLiteral(scratch, Smi::zero(), r0);
+  __ CmpSmiLiteral(scratch, Smi::zero());
   __ bne(&prepare_step_in_if_stepping);
 
   // Flood function if we need to continue stepping in the suspended generator.
@@ -761,7 +761,7 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
     // undefined because generator functions are non-constructable.
     __ mr(r6, r4);
     __ mr(r4, r7);
-    __ JumpJSFunction(r4, r0);
+    __ JumpJSFunction(r4);
   }
 
   __ bind(&prepare_step_in_if_stepping);
@@ -843,7 +843,7 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
     // Save callee-saved double registers.
     __ MultiPushDoubles(kCalleeSavedDoubles);
     // Set up the reserved register for 0.0.
-    __ LoadDoubleLiteral(kDoubleRegZero, base::Double(0.0), r0);
+    __ LoadDoubleLiteral(kDoubleRegZero, base::Double(0.0));
 
     // Initialize the root register.
     // C calling convention. The first argument is passed in r3.
@@ -3030,14 +3030,10 @@ struct SaveWasmParamsScope {
              simd128_regs.Count());
 
     __ MultiPush(gp_regs);
-    UseScratchRegisterScope temps(masm);
-    Register scratch = temps.Acquire();
-    __ MultiPushF64AndV128(fp_regs, simd128_regs, scratch);
+    __ MultiPushF64AndV128(fp_regs, simd128_regs);
   }
   ~SaveWasmParamsScope() {
-    UseScratchRegisterScope temps(masm);
-    Register scratch = temps.Acquire();
-    __ MultiPopF64AndV128(fp_regs, simd128_regs, scratch);
+    __ MultiPopF64AndV128(fp_regs, simd128_regs);
     __ MultiPop(gp_regs);
   }
 
@@ -3049,8 +3045,6 @@ struct SaveWasmParamsScope {
 
 void Builtins::Generate_WasmLiftoffFrameSetup(MacroAssembler* masm) {
   Register func_index = wasm::kLiftoffFrameSetupFunctionReg;
-  // TODO(miladfarca): Unify scratch register usage and remove extra scopes
-  // once `MultiPushF64AndV128` is refactored, check http://crrev.com/c/7844576.
   UseScratchRegisterScope temps(masm);
   Register vector = temps.Acquire();
   Label allocate_vector, done;
@@ -3180,12 +3174,9 @@ void Builtins::Generate_WasmDebugBreak(MacroAssembler* masm) {
 
     // Save all parameter registers. They might hold live values, we restore
     // them after the runtime call.
-    UseScratchRegisterScope temps(masm);
-    Register scratch = temps.Acquire();
     __ MultiPush(WasmDebugBreakFrameConstants::kPushedGpRegs);
     __ MultiPushF64AndV128(WasmDebugBreakFrameConstants::kPushedFpRegs,
-                           WasmDebugBreakFrameConstants::kPushedSimd128Regs,
-                           scratch);
+                           WasmDebugBreakFrameConstants::kPushedSimd128Regs);
 
     // Initialize the JavaScript context with 0. CEntry will use it to
     // set the current context on the isolate.
@@ -3194,8 +3185,7 @@ void Builtins::Generate_WasmDebugBreak(MacroAssembler* masm) {
 
     // Restore registers.
     __ MultiPopF64AndV128(WasmDebugBreakFrameConstants::kPushedFpRegs,
-                          WasmDebugBreakFrameConstants::kPushedSimd128Regs,
-                          scratch);
+                          WasmDebugBreakFrameConstants::kPushedSimd128Regs);
     __ MultiPop(WasmDebugBreakFrameConstants::kPushedGpRegs);
   }
   __ Ret();
