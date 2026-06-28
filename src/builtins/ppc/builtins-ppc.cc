@@ -458,9 +458,7 @@ void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source,
     ConstantPoolUnavailableScope constant_pool_unavailable(masm);
 
     if (V8_EMBEDDED_CONSTANT_POOL_BOOL) {
-      UseScratchRegisterScope temps(masm);
-      Register scratch = temps.Acquire();
-      __ LoadConstantPoolPointerRegisterFromCodeTargetAddress(r3, r0, scratch);
+      __ LoadConstantPoolPointerRegisterFromCodeTargetAddress(r3);
     }
 
     __ LoadCodeInstructionStart(r3, r3);
@@ -3238,7 +3236,7 @@ void SwitchStacks(MacroAssembler* masm, ExternalReference fn,
     if (!is_return) {
       __ Move(kCArgRegs[2], sp);
       __ Move(kCArgRegs[3], fp);
-      __ GetLabelAddress(kCArgRegs[4], saved_pc, r0);
+      __ GetLabelAddress(kCArgRegs[4], saved_pc);
     }
     __ Move(kCArgRegs[0], ExternalReference::isolate_address(masm->isolate()));
     __ CallCFunction(fn, num_args);
@@ -3586,6 +3584,7 @@ void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
     __ Trap();
   }
   __ bind(&suspend);
+  __ LoadRoot(kReturnRegister0, RootIndex::kUndefinedValue);
   __ LeaveFrame(StackFrame::WASM_JSPI);
   // Pop receiver + parameter.
   __ AddS64(sp, sp, Operand(2 * kSystemPointerSize));
@@ -3747,7 +3746,7 @@ void Builtins::Generate_WasmFXSuspend(MacroAssembler* masm) {
     __ Move(kCArgRegs[0], ExternalReference::isolate_address());
     __ Move(kCArgRegs[1], sp);
     __ Move(kCArgRegs[2], fp);
-    __ GetLabelAddress(kCArgRegs[3], &resume, r0);
+    __ GetLabelAddress(kCArgRegs[3], &resume);
     __ CallCFunction(ExternalReference::wasm_suspend_wasmfx_stack(), 8);
   }
   Register target_stack = r4;
@@ -3808,7 +3807,7 @@ void Builtins::Generate_WasmFXSwitch(MacroAssembler* masm) {
     __ Move(kCArgRegs[0], ExternalReference::isolate_address());
     __ Move(kCArgRegs[1], sp);
     __ Move(kCArgRegs[2], fp);
-    __ GetLabelAddress(kCArgRegs[3], &resume, r0);
+    __ GetLabelAddress(kCArgRegs[3], &resume);
     __ CallCFunction(ExternalReference::wasm_switch_wasmfx_stack(), 9);
   }
 

@@ -5347,30 +5347,27 @@ class GraphBuildingNodeProcessor {
   maglev::ProcessResult Process(
       maglev::TruncateCheckedNumberOrOddballToInt32* node,
       const maglev::ProcessingState& state) {
-    TruncateJSPrimitiveToUntaggedOrDeoptOp::InputRequirement input_requirement;
+    TruncateJSPrimitiveToWord32OrDeoptOp::InputRequirement input_requirement;
     switch (node->conversion_type()) {
       case maglev::TaggedToFloat64ConversionType::kOnlyNumber:
         input_requirement =
-            TruncateJSPrimitiveToUntaggedOrDeoptOp::InputRequirement::kNumber;
+            TruncateJSPrimitiveToWord32OrDeoptOp::InputRequirement::kNumber;
         break;
       case maglev::TaggedToFloat64ConversionType::kNumberOrUndefined:
         UNREACHABLE();
       case maglev::TaggedToFloat64ConversionType::kNumberOrBoolean:
-        input_requirement = TruncateJSPrimitiveToUntaggedOrDeoptOp::
+        input_requirement = TruncateJSPrimitiveToWord32OrDeoptOp::
             InputRequirement::kNumberOrBoolean;
         break;
       case maglev::TaggedToFloat64ConversionType::kNumberOrOddball:
-        input_requirement = TruncateJSPrimitiveToUntaggedOrDeoptOp::
+        input_requirement = TruncateJSPrimitiveToWord32OrDeoptOp::
             InputRequirement::kNumberOrOddball;
         break;
     }
     GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->eager_deopt_info());
-    SetMap(
-        node,
-        __ TruncateJSPrimitiveToUntaggedOrDeopt(
-            Map(node->ValueInput()), frame_state,
-            TruncateJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind::kInt32,
-            input_requirement, node->eager_deopt_info()->feedback_to_update()));
+    SetMap(node, __ TruncateJSPrimitiveToWord32OrDeopt(
+                     Map(node->ValueInput()), frame_state, input_requirement,
+                     node->eager_deopt_info()->feedback_to_update()));
     return maglev::ProcessResult::kContinue;
   }
   maglev::ProcessResult Process(
@@ -5682,11 +5679,15 @@ class GraphBuildingNodeProcessor {
     return maglev::ProcessResult::kContinue;
   }
 
-  maglev::ProcessResult Process(maglev::AssertPeeled*,
+  maglev::ProcessResult Process(maglev::AssertPeeled* node,
                                 const maglev::ProcessingState&) {
     // The loop peeler removes this marker when it peels the surrounding loop,
-    // so reaching it means the loop was not peeled.
-    FATAL("%%AssertPeeled: loop was not peeled");
+    // so reaching it means the loop was not peeled. That satisfies
+    // %AssertNotPeeled but fails %AssertPeeled.
+    if (node->expect_peeled()) {
+      FATAL("%%AssertPeeled: loop was not peeled");
+    }
+    return maglev::ProcessResult::kContinue;
   }
 
   maglev::ProcessResult Process(maglev::MajorGCForCompilerTesting* node,

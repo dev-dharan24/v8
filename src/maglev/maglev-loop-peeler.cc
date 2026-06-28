@@ -730,10 +730,14 @@ void MaglevLoopPeeler::CloneBodySubgraph(PeelContext& ctx) {
     dst_block->nodes().reserve(block->nodes().size());
     for (Node*& node : block->nodes()) {
       if (node == nullptr) continue;
-      // A %AssertPeeled marker asserts this loop is peeled, which is happening
-      // now: drop it from the original body (so it never reaches the Turbolev
-      // backend) and don't clone it into the peeled iteration.
-      if (node->Is<AssertPeeled>()) {
+      // This loop is being peeled now. A %AssertPeeled marker asserts exactly
+      // that, so drop it from the original body (so it never reaches the
+      // Turbolev backend) and don't clone it into the peeled iteration. A
+      // %AssertNotPeeled marker asserts the opposite, so peeling violates it.
+      if (auto* assert_peeled = node->TryCast<AssertPeeled>()) {
+        if (!assert_peeled->expect_peeled()) {
+          FATAL("%%AssertNotPeeled: loop was peeled");
+        }
         node = nullptr;
         continue;
       }
@@ -1290,6 +1294,23 @@ void MaglevLoopPeeler::RewireDownstreamPhiRefs(PeelContext& ctx) {
     });
   }
 
+  // Downstream deopt frames reference the old header phi (soon an Identity to
+  // the PEM phi). Later passes can't move deopt-frame uses off an Identity, so
+  // point them straight at the PEM phi to keep it live.
+  for (BasicBlock* block : graph_->blocks()) {
+    if (block->is_dead() || ctx.loop.body_set.contains(block)) continue;
+    block->ForEachNodeAndControl([&](NodeBase* n) {
+      if (n->properties().has_eager_deopt_info()) {
+        RewireDeoptFramePhiRefs(n->eager_deopt_info(),
+                                ctx.header_phi_to_pem_phi);
+      }
+      if (n->properties().can_lazy_deopt()) {
+        RewireDeoptFramePhiRefs(n->lazy_deopt_info(),
+                                ctx.header_phi_to_pem_phi);
+      }
+    });
+  }
+
   // Every header phi is being replaced, so drop them all at once rather than
   // removing each one individually (which would be O(n^2)).
   ctx.loop.header()->state()->phis()->Clear();
@@ -1371,15 +1392,6 @@ void MaglevLoopPeeler::SplicePeeledBlocks(PeelContext& ctx) {
 
 bool MaglevLoopPeeler::Run() {
   bool mutated = false;
-  // TODO(victorgomes): Should we support OSR and resumable generators?
-  if (graph_->is_osr()) {
-    TRACE_PEEL_SKIP("skip pass: graph is OSR");
-    return false;
-  }
-  if (graph_->has_resumable_generator()) {
-    TRACE_PEEL_SKIP("skip pass: graph has resumable generator");
-    return false;
-  }
 
   ResolveLoopHeader();
 

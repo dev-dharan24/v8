@@ -4116,6 +4116,7 @@ namespace {
 
 bool VerifyIsNotEscaping(VirtualObjectList vos, InlinedAllocation* alloc) {
   for (VirtualObject* vo : vos) {
+    DCHECK_NOT_NULL(vo->allocation());
     if (vo->allocation() == alloc) continue;
     bool escaped = false;
     vo->ForEachSlot([&](ValueNode* nested_value, vobj::Field desc) -> bool {
@@ -11988,7 +11989,12 @@ ReduceResult MaglevGraphBuilder::VisitCallRuntime() {
       return ReduceResult::Done();
     case Runtime::kAssertPeeled:
       if (!is_turbolev()) break;
-      RETURN_IF_ABORT(AddNewNode<AssertPeeled>({}));
+      RETURN_IF_ABORT(AddNewNode<AssertPeeled>({}, true));
+      SetAccumulator(GetRootConstant(RootIndex::kUndefinedValue));
+      return ReduceResult::Done();
+    case Runtime::kAssertNotPeeled:
+      if (!is_turbolev()) break;
+      RETURN_IF_ABORT(AddNewNode<AssertPeeled>({}, false));
       SetAccumulator(GetRootConstant(RootIndex::kUndefinedValue));
       return ReduceResult::Done();
     case Runtime::kNewFunctionContext:

@@ -96,7 +96,7 @@
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-function.h"
 #include "src/objects/js-generator-inl.h"
-#include "src/objects/js-struct-inl.h"
+#include "src/objects/js-struct.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/managed-inl.h"
 #include "src/objects/module-inl.h"
@@ -3342,10 +3342,16 @@ class StackFrameSummaryIterator {
 
  private:
   void InitSummaries() {
-    if (!done() && frame()->is_javascript()) {
+    while (!done() && frame()->is_javascript()) {
       summaries_ = JavaScriptFrame::cast(frame())->Summarize();
+      if (summaries_.size() == 0) {
+        // We may have encountered a Builtin::kWasmMethodWrapper. Skip it.
+        stack_iterator_.Advance();
+        continue;
+      }
       DCHECK_GT(summaries_.size(), 0);
       index_ = summaries_.size() - 1;
+      break;
     }
   }
   StackFrameIterator stack_iterator_;
