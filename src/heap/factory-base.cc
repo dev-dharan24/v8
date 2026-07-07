@@ -6,8 +6,10 @@
 
 #include "src/ast/ast-source-ranges.h"
 #include "src/ast/ast.h"
+#include "src/base/strong-alias.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
+#include "src/common/synchronization-point-support.h"
 #include "src/execution/local-isolate.h"
 #include "src/handles/handles-inl.h"
 #include "src/heap/factory.h"
@@ -16,7 +18,6 @@
 #include "src/heap/local-factory-inl.h"
 #include "src/heap/local-heap-inl.h"
 #include "src/heap/read-only-heap.h"
-#include "src/init/isolate-group.h"
 #include "src/logging/log.h"
 #include "src/objects/arguments-inl.h"
 #include "src/objects/instance-type.h"
@@ -651,13 +652,10 @@ Handle<SharedFunctionInfo> FactoryBase<Impl>::NewSharedFunctionInfo(
   raw->CalculateConstructAsBuiltin();
   raw->set_kind(kind);
 
-  switch (adapt) {
-    case AdaptArguments::kYes:
-      raw->set_formal_parameter_count(JSParameterCount(len));
-      break;
-    case AdaptArguments::kNo:
-      raw->DontAdaptArguments();
-      break;
+  if (adapt) {
+    raw->set_formal_parameter_count(JSParameterCount(len));
+  } else {
+    raw->DontAdaptArguments();
   }
   raw->set_length(len);
 
@@ -1021,7 +1019,7 @@ Handle<String> FactoryBase<Impl>::NewConsString(DirectHandle<String> left,
                                                 DirectHandle<String> right,
                                                 int length, bool one_byte,
                                                 AllocationType allocation) {
-  SYNCHRONIZATION_POINT_FOR_TESTING("NewConsString");
+  SYNCHRONIZATION_POINT("NewConsString");
   DCHECK_GE(length, ConsString::kMinLength);
   DCHECK_LE(length, String::kMaxLength);
 
@@ -1276,22 +1274,9 @@ Handle<DescriptorArray> FactoryBase<Impl>::NewDescriptorArray(
       size, allocation, read_only_roots().descriptor_array_map());
   Tagged<DescriptorArray> array = Cast<DescriptorArray>(obj);
 
-  auto raw_gc_state = DescriptorArrayMarkingState::kInitialGCState;
-  if (allocation != AllocationType::kYoung &&
-      allocation != AllocationType::kReadOnly) {
-    auto* local_heap = allocation == AllocationType::kSharedOld
-                           ? isolate()->shared_space_isolate()->heap()
-                           : isolate()->heap();
-    Heap* heap = local_heap->AsHeap();
-    if (heap->incremental_marking()->IsMajorMarking()) {
-      // Black allocation: We must create a full marked state.
-      raw_gc_state = DescriptorArrayMarkingState::GetFullyMarkedState(
-          heap->mark_compact_collector()->epoch(), number_of_descriptors);
-    }
-  }
   array->Initialize(read_only_roots().empty_enum_cache(),
                     read_only_roots().undefined_value(), number_of_descriptors,
-                    slack, raw_gc_state);
+                    slack);
   return handle(array, isolate());
 }
 

@@ -180,6 +180,27 @@ void NodeBase::CheckCanOverwriteWith(Opcode new_opcode,
   DCHECK_IMPLIES(new_properties.needs_register_snapshot(),
                  properties().needs_register_snapshot());
   DCHECK_IMPLIES(new_properties.can_throw(), properties().can_throw());
+
+  size_t old_sizeof = -1;
+  switch (opcode()) {
+#define CASE(op)             \
+  case Opcode::k##op:        \
+    old_sizeof = sizeof(op); \
+    break;
+    NODE_BASE_LIST(CASE);
+#undef CASE
+  }
+
+  switch (new_opcode) {
+#define CASE(op)                                        \
+  case Opcode::k##op: {                                 \
+    DCHECK_LE(StaticInputCount<op>(), old_input_count); \
+    DCHECK_LE(sizeof(op), old_sizeof);                  \
+    break;                                              \
+  }
+    NODE_BASE_LIST(CASE)
+#undef CASE
+  }
 }
 
 #endif  // DEBUG
@@ -200,6 +221,8 @@ std::ostream& operator<<(std::ostream& os, UseRepresentation repr) {
       return os << "Float64";
     case UseRepresentation::kHoleyFloat64:
       return os << "HoleyFloat64";
+    case UseRepresentation::kNonTruncated:
+      return os << "NonTruncated";
   }
   UNREACHABLE();
 }
@@ -226,12 +249,13 @@ std::ostream& operator<<(std::ostream& os, const StringEqualInputMode mode) {
 
 bool Phi::is_loop_phi() const { return merge_state()->is_loop(); }
 
-ValueNode* ValueNode::UnwrapIdentitiesAndPhis() {
+namespace {
+template <typename UnwrapFunction>
+ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
   ValueNode* prev = nullptr;
-  ValueNode* node = this;
   while (prev != node) {
     prev = node;
-    node = node->UnwrapIdentities();
+    node = unwrap(node);
     if (Phi* phi = node->TryCast<Phi>()) {
       // We skip resumable loop phis since their single input could actually be
       // defined within the loop itself.
@@ -244,6 +268,16 @@ ValueNode* ValueNode::UnwrapIdentitiesAndPhis() {
     }
   }
   return node;
+}
+}  // namespace
+
+ValueNode* ValueNode::UnwrapIdentitiesAndPhis() {
+  return UnwrapSinglePhis(
+      this, [](ValueNode* node) { return node->UnwrapIdentities(); });
+}
+
+ValueNode* ValueNode::UnwrapForDeopt() {
+  return UnwrapSinglePhis(this, [](ValueNode* node) { return node->Unwrap(); });
 }
 
 bool Phi::is_unmerged_loop_phi() const {

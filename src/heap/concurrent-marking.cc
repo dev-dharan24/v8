@@ -12,6 +12,7 @@
 #include "include/v8config.h"
 #include "src/base/logging.h"
 #include "src/common/globals.h"
+#include "src/common/synchronization-point-support.h"
 #include "src/execution/isolate-inl.h"
 #include "src/flags/flags.h"
 #include "src/heap/base-page.h"
@@ -41,7 +42,6 @@
 #include "src/heap/pretenuring-handler.h"
 #include "src/heap/weak-object-worklists.h"
 #include "src/heap/young-generation-marking-visitor.h"
-#include "src/init/isolate-group.h"
 #include "src/init/v8.h"
 #include "src/objects/data-handler-inl.h"
 #include "src/objects/embedder-data-array-inl.h"
@@ -367,9 +367,8 @@ void ConcurrentMarking::RunMajor(JobDelegate* delegate,
   int kObjectsUntilInterruptCheck = 1000;
 
   const bool is_joining_thread = delegate->IsJoiningThread();
-  SYNCHRONIZATION_POINT_FOR_TESTING(is_joining_thread
-                                        ? "ConcurrentMarkerMajorMainThread"
-                                        : "ConcurrentMarkerMajorBgThread");
+  SYNCHRONIZATION_POINT(is_joining_thread ? "ConcurrentMarkerMajorMainThread"
+                                          : "ConcurrentMarkerMajorBgThread");
 
   uint8_t task_id = delegate->GetTaskId() + 1;
   TaskState* task_state = task_state_[task_id].get();
@@ -395,9 +394,9 @@ void ConcurrentMarking::RunMajor(JobDelegate* delegate,
                                 task_id);
   }
   bool another_ephemeron_iteration = false;
+  HeapAllocator* const heap_allocator = heap_->allocator();
   MainAllocator* const new_space_allocator =
-      heap_->use_new_space() ? heap_->allocator()->new_space_allocator()
-                             : nullptr;
+      heap_->use_new_space() ? heap_allocator->new_space_allocator() : nullptr;
 
   {
     TimedScope scope(&time_ms);
@@ -431,13 +430,10 @@ void ConcurrentMarking::RunMajor(JobDelegate* delegate,
         Address new_space_limit = kNullAddress;
         Address new_large_object = kNullAddress;
 
-        if (new_space_allocator) {
+        if (new_space_allocator) [[likely]] {
           std::tie(new_space_top, new_space_limit) =
               new_space_allocator->GetOriginalTopAndLimit();
-        }
-
-        if (heap_->new_lo_space()) {
-          new_large_object = heap_->new_lo_space()->pending_object();
+          new_large_object = heap_allocator->new_space_pending_large_object();
         }
 
         Address addr = object.address();
@@ -505,12 +501,12 @@ void ConcurrentMarking::RunMajor(JobDelegate* delegate,
 namespace {
 
 V8_INLINE bool IsYoungObjectInLab(MainAllocator* new_space_allocator,
-                                  NewLargeObjectSpace* new_lo_space,
+                                  HeapAllocator* heap_allocator,
                                   Tagged<HeapObject> heap_object) {
   // The order of the two loads is important.
   auto [new_space_top, new_space_limit] =
       new_space_allocator->GetOriginalTopAndLimit();
-  Address new_large_object = new_lo_space->pending_object();
+  Address new_large_object = heap_allocator->new_space_pending_large_object();
 
   Address addr = heap_object.address();
 
@@ -537,7 +533,7 @@ V8_INLINE size_t ConcurrentMarking::RunMinorImpl(JobDelegate* delegate,
   minor_marking_state_->MarkerStarted();
   MainAllocator* const new_space_allocator =
       heap_->allocator()->new_space_allocator();
-  NewLargeObjectSpace* const new_lo_space = heap_->new_lo_space();
+  HeapAllocator* const heap_allocator = heap_->allocator();
 
   do {
     if (delegate->IsJoiningThread()) {
@@ -548,7 +544,8 @@ V8_INLINE size_t ConcurrentMarking::RunMinorImpl(JobDelegate* delegate,
                    GCTracer::Scope::MINOR_MS_BACKGROUND_MARKING_CLOSURE,
                    ThreadKind::kBackground);
     while (marking_worklists_local.Pop(&heap_object)) {
-      if (IsYoungObjectInLab(new_space_allocator, new_lo_space, heap_object)) {
+      if (IsYoungObjectInLab(new_space_allocator, heap_allocator,
+                             heap_object)) {
         visitor.marking_worklists_local().PushOnHold(heap_object);
       } else {
         Tagged<Map> map = heap_object->map();

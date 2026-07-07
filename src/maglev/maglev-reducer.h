@@ -843,7 +843,7 @@ class MaglevReducer {
   VirtualObject* CreateContext(compiler::MapRef map, int length,
                                compiler::ScopeInfoRef scope_info,
                                ValueNode* previous_context,
-                               std::optional<ValueNode*> extension = {});
+                               ValueNode* extension = nullptr);
   VirtualObject* CreateArgumentsObject(compiler::MapRef map, ValueNode* length,
                                        ValueNode* elements,
                                        std::optional<ValueNode*> callee = {});
@@ -872,10 +872,10 @@ class MaglevReducer {
   VirtualObject* CreateAsyncResumeTask(ValueNode* generator, ValueNode* value,
                                        ValueNode* kind);
 
-  ReduceResult BuildLoadTaggedField(ValueNode* object, uint32_t offset,
-                                    NodeType type = NodeType::kUnknown,
-                                    bool is_const = false,
-                                    PropertyKey key = PropertyKey::None());
+  ReduceResult BuildLoadTaggedField(
+      ValueNode* object, uint32_t offset, NodeType type = NodeType::kUnknown,
+      bool is_const = false, PropertyKey key = PropertyKey::None(),
+      IsArrayLength is_array_length = IsArrayLength::kNo);
 
   ReduceResult BuildLoadFixedDoubleArrayElement(ValueNode* elements,
                                                 ValueNode* index);
@@ -1336,6 +1336,9 @@ class MaglevReducer {
 
   MaybeReduceResult TryFoldLogicalNot(ValueNode* input);
 
+  MaybeReduceResult TryFoldTestTypeOf(
+      ValueNode* input, interpreter::TestTypeOfFlags::LiteralFlag literal);
+
   bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
     return known_node_aspects().CheckType(broker(), node, type, old);
   }
@@ -1349,6 +1352,8 @@ class MaglevReducer {
   }
 
   void RecordType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
+    DCHECK(!node->Is<VirtualObject>());
+
     // For Turbolev, we insert an AssumeType node when recording a previously
     // not-known type so that the GraphOptimizer (and in particular the KNA
     // processor) can also be aware of this type when non-eagerly reoptimizing
@@ -1356,12 +1361,6 @@ class MaglevReducer {
     if (const bool already_known = EnsureType(node, type, old);
         already_known || !is_turbolev()) {
       return;
-    }
-    if (const auto* virtual_object = node->TryCast<VirtualObject>()) {
-      if (!virtual_object->allocation()) {
-        return;
-      }
-      node = virtual_object->allocation();
     }
 
     switch (node->value_representation()) {

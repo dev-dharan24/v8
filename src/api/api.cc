@@ -26,6 +26,7 @@
 #include "include/v8-function.h"
 #include "include/v8-json.h"
 #include "include/v8-locker.h"
+#include "include/v8-platform.h"
 #include "include/v8-primitive-object.h"
 #include "include/v8-profiler.h"
 #include "include/v8-source-location.h"
@@ -43,6 +44,7 @@
 #include "src/base/platform/memory.h"
 #include "src/base/platform/platform.h"
 #include "src/base/platform/time.h"
+#include "src/base/strong-alias.h"
 #include "src/base/template-utils.h"
 #include "src/base/utils/random-number-generator.h"
 #include "src/base/vector.h"
@@ -153,6 +155,7 @@
 #include "src/utils/version.h"
 
 #if V8_ENABLE_WEBASSEMBLY
+#include "src/base/fpu.h"
 #include "src/debug/debug-wasm-objects.h"
 #include "src/trap-handler/trap-handler.h"
 #include "src/wasm/streaming-decoder.h"
@@ -340,7 +343,7 @@ class ArrayBufferAllocator : public v8::ArrayBuffer::Allocator {
  public:
   explicit ArrayBufferAllocator(i::IsolateGroup* group)
       : sandbox_(group->sandbox()),
-        allocator_(group->GetSandboxedArrayBufferAllocator()) {}
+        allocator_(group->GetInSandboxAllocator()) {}
 
   void* Allocate(size_t length) override {
     return allocator_->Allocate(length);
@@ -360,7 +363,7 @@ class ArrayBufferAllocator : public v8::ArrayBuffer::Allocator {
 
  private:
   i::Sandbox* sandbox_ = nullptr;
-  i::SandboxedArrayBufferAllocatorBase* allocator_ = nullptr;
+  v8::Allocator* allocator_ = nullptr;
 };
 
 #else
@@ -4289,7 +4292,7 @@ std::shared_ptr<v8::BackingStore> v8::ArrayBuffer::GetBackingStore() {
   auto self = Utils::OpenDirectHandle(this);
   std::shared_ptr<i::BackingStore> backing_store = self->GetBackingStore();
   if (!backing_store) {
-    backing_store = i::BackingStore::EmptyBackingStore(i::SharedFlag::kNo);
+    backing_store = i::BackingStore::EmptyBackingStore(i::SharedFlag{false});
   }
   std::shared_ptr<i::BackingStoreBase> bs_base = backing_store;
   return std::static_pointer_cast<v8::BackingStore>(bs_base);
@@ -4307,7 +4310,7 @@ std::shared_ptr<v8::BackingStore> v8::SharedArrayBuffer::GetBackingStore() {
   auto self = Utils::OpenDirectHandle(this);
   std::shared_ptr<i::BackingStore> backing_store = self->GetBackingStore();
   if (!backing_store) {
-    backing_store = i::BackingStore::EmptyBackingStore(i::SharedFlag::kYes);
+    backing_store = i::BackingStore::EmptyBackingStore(i::SharedFlag{true});
   }
   std::shared_ptr<i::BackingStoreBase> bs_base = backing_store;
   return std::static_pointer_cast<v8::BackingStore>(bs_base);
@@ -6477,8 +6480,9 @@ size_t V8::GetWasmMemoryReservationSizeInBytes(WasmMemoryType type,
 #if V8_TRAP_HANDLER_SUPPORTED
   if (!is_memory64 || i::v8_flags.wasm_memory64_trap_handling) {
     return i::BackingStore::GetWasmReservationSize(
-        /* has_guard_regions */ true, byte_capacity,
-        /* is_wasm_memory64 */ is_memory64);
+        i::HasGuardRegions{true}, byte_capacity,
+        is_memory64 ? i::WasmMemoryFlag::kWasmMemory64
+                    : i::WasmMemoryFlag::kWasmMemory32);
   }
 #endif  // V8_TRAP_HANDLER_SUPPORTED
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -6603,6 +6607,10 @@ size_t v8::V8::GetSandboxReservationSizeInBytes() {
                   "v8::V8::GetSandboxReservationSizeInBytes",
                   "The sandbox must be initialized first");
   return i::Sandbox::current()->reservation_size();
+}
+
+void v8::V8::SetInSandboxAllocator(std::shared_ptr<Allocator> allocator) {
+  i::Sandbox::current()->set_in_sandbox_allocator(std::move(allocator));
 }
 
 v8::V8::SandboxMode v8::V8::GetSandboxMode() {
@@ -7212,7 +7220,7 @@ void Context::SetMicrotaskQueue(v8::MicrotaskQueue* queue) {
   Utils::ApiCheck(impl->EnteredContextCount() == 0,
                   "v8::Context::SetMicrotaskQueue()",
                   "Cannot set Microtask Queue with an entered context");
-  auto* mq = static_cast<const i::MicrotaskQueue*>(queue);
+  auto* mq = static_cast<i::MicrotaskQueue*>(queue);
   context->set_microtask_queue(i_isolate, mq);
   // Invalidate the EnqueueMicrotask cache if it references this context.
   if (i_isolate->current_microtask_native_context() == *context) {
@@ -8972,9 +8980,16 @@ MaybeLocal<WasmModuleObject> WasmModuleObject::FromCompiledModule(
 #endif  // V8_ENABLE_WEBASSEMBLY
 }
 
-MaybeLocal<WasmModuleObject> WasmModuleObject::Compile(
-    Isolate* v8_isolate, std::span<const uint8_t> wire_bytes) {
 #if V8_ENABLE_WEBASSEMBLY
+namespace {
+MaybeLocal<WasmModuleObject> CompileWasmModuleImpl(
+    Isolate* v8_isolate, std::span<const uint8_t> wire_bytes,
+    i::wasm::CompileTimeImports compile_imports) {
+  // Mirror the JS `WebAssembly.Module` constructor, which disables denormal
+  // floats at compile time when the host FPU flushes them.
+  if (base::FPU::GetFlushDenormals()) {
+    compile_imports.Add(i::wasm::CompileTimeImport::kDisableDenormalFloats);
+  }
   base::OwnedVector<const uint8_t> bytes = base::OwnedCopyOf(wire_bytes);
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
   // We don't check for `IsWasmCodegenAllowed` here, because this function is
@@ -8985,14 +9000,44 @@ MaybeLocal<WasmModuleObject> WasmModuleObject::Compile(
     i::wasm::ErrorThrower thrower(i_isolate, "WasmModuleObject::Compile()");
     auto enabled_features =
         i::wasm::WasmEnabledFeatures::FromIsolate(i_isolate);
-    // TODO(14179): Provide an API method that supports compile options.
     maybe_compiled = i::wasm::GetWasmEngine()->SyncCompile(
-        i_isolate, enabled_features, i::wasm::CompileTimeImports{}, &thrower,
+        i_isolate, enabled_features, std::move(compile_imports), &thrower,
         std::move(bytes));
   }
   CHECK_EQ(maybe_compiled.is_null(), i_isolate->has_exception());
   if (maybe_compiled.is_null()) return {};
   return Utils::ToLocal(maybe_compiled.ToHandleChecked());
+}
+}  // namespace
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+MaybeLocal<WasmModuleObject> WasmModuleObject::Compile(
+    Isolate* v8_isolate, std::span<const uint8_t> wire_bytes) {
+#if V8_ENABLE_WEBASSEMBLY
+  return CompileWasmModuleImpl(v8_isolate, wire_bytes,
+                               i::wasm::CompileTimeImports{});
+#else
+  Utils::ApiCheck(false, "WasmModuleObject::Compile",
+                  "WebAssembly support is not enabled");
+  UNREACHABLE();
+#endif  // V8_ENABLE_WEBASSEMBLY
+}
+
+MaybeLocal<WasmModuleObject> WasmModuleObject::Compile(
+    Isolate* v8_isolate, std::span<const uint8_t> wire_bytes,
+    const CompileTimeImports& compile_imports) {
+#if V8_ENABLE_WEBASSEMBLY
+  i::wasm::CompileTimeImports imports;
+  using Builtins = CompileTimeImports::Builtins;
+  if (compile_imports.builtins & Builtins::kJsString) {
+    imports.Add(i::wasm::CompileTimeImport::kJsString);
+  }
+  if (compile_imports.imported_string_constants_module != nullptr) {
+    imports.constants_module() =
+        compile_imports.imported_string_constants_module;
+    imports.Add(i::wasm::CompileTimeImport::kStringConstants);
+  }
+  return CompileWasmModuleImpl(v8_isolate, wire_bytes, std::move(imports));
 #else
   Utils::ApiCheck(false, "WasmModuleObject::Compile",
                   "WebAssembly support is not enabled");
@@ -9165,9 +9210,9 @@ i::InitializedFlag GetInitializedFlag(
     BackingStoreInitializationMode initialization_mode) {
   switch (initialization_mode) {
     case BackingStoreInitializationMode::kUninitialized:
-      return i::InitializedFlag::kUninitialized;
+      return i::InitializedFlag{false};
     case BackingStoreInitializationMode::kZeroInitialized:
-      return i::InitializedFlag::kZeroInitialized;
+      return i::InitializedFlag{true};
   }
   UNREACHABLE();
 }
@@ -9248,7 +9293,7 @@ std::unique_ptr<v8::BackingStore> v8::ArrayBuffer::NewBackingStore(
   }
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   std::unique_ptr<i::BackingStoreBase> backing_store =
-      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag::kNo,
+      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag{false},
                                 GetInitializedFlag(initialization_mode));
   if (!backing_store) {
     if (on_failure == BackingStoreOnFailureMode::kOutOfMemory) {
@@ -9291,7 +9336,7 @@ std::unique_ptr<v8::BackingStore> v8::ArrayBuffer::NewBackingStore(
 
   std::unique_ptr<i::BackingStoreBase> backing_store =
       i::BackingStore::WrapAllocation(data, byte_length, deleter, deleter_data,
-                                      i::SharedFlag::kNo);
+                                      i::SharedFlag{false});
   return std::unique_ptr<v8::BackingStore>(
       static_cast<v8::BackingStore*>(backing_store.release()));
 }
@@ -9319,7 +9364,7 @@ std::unique_ptr<BackingStore> v8::ArrayBuffer::NewResizableBackingStore(
   std::unique_ptr<i::BackingStoreBase> backing_store =
       i::BackingStore::TryAllocateAndPartiallyCommitMemory(
           nullptr, byte_length, max_byte_length, page_size, initial_pages,
-          max_pages, i::WasmMemoryFlag::kNotWasm, i::SharedFlag::kNo);
+          max_pages, i::WasmMemoryFlag::kNotWasm, i::SharedFlag{false});
   if (!backing_store) {
     i::V8::FatalProcessOutOfMemory(nullptr,
                                    "v8::ArrayBuffer::NewResizableBackingStore");
@@ -9571,7 +9616,7 @@ Local<SharedArrayBuffer> v8::SharedArrayBuffer::New(
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
 
   std::unique_ptr<i::BackingStore> backing_store =
-      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag::kYes,
+      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag{true},
                                 GetInitializedFlag(initialization_mode));
 
   if (!backing_store) {
@@ -9592,7 +9637,7 @@ MaybeLocal<SharedArrayBuffer> v8::SharedArrayBuffer::MaybeNew(
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
 
   std::unique_ptr<i::BackingStore> backing_store =
-      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag::kYes,
+      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag{true},
                                 GetInitializedFlag(initialization_mode));
 
   if (!backing_store) return {};
@@ -9637,7 +9682,7 @@ std::unique_ptr<v8::BackingStore> v8::SharedArrayBuffer::NewBackingStore(
   }
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   std::unique_ptr<i::BackingStoreBase> backing_store =
-      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag::kYes,
+      i::BackingStore::Allocate(i_isolate, byte_length, i::SharedFlag{true},
                                 GetInitializedFlag(initialization_mode));
   if (!backing_store) {
     if (on_failure == BackingStoreOnFailureMode::kOutOfMemory) {
@@ -9658,7 +9703,7 @@ std::unique_ptr<v8::BackingStore> v8::SharedArrayBuffer::NewBackingStore(
   CHECK_LE(byte_length, i::JSArrayBuffer::kMaxByteLength);
   std::unique_ptr<i::BackingStoreBase> backing_store =
       i::BackingStore::WrapAllocation(data, byte_length, deleter, deleter_data,
-                                      i::SharedFlag::kYes);
+                                      i::SharedFlag{true});
   return std::unique_ptr<v8::BackingStore>(
       static_cast<v8::BackingStore*>(backing_store.release()));
 }

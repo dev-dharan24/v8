@@ -83,6 +83,7 @@
 #include "src/objects/property-details.h"
 #include "src/objects/shared-function-info.h"
 #include "src/objects/slots-inl.h"
+#include "src/objects/string.h"
 #include "src/objects/type-hints.h"
 #include "src/roots/roots.h"
 #include "src/utils/utils.h"
@@ -3397,22 +3398,18 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceTypeOf(ValueNode* value) {
 }
 
 ReduceResult MaglevGraphBuilder::VisitTestTypeOf() {
-  // TODO(v8:7700): Add a branch version of TestTypeOf that does not need to
-  // materialise the boolean value.
-  TypeOfLiteralFlag literal =
+  const auto literal_flag =
       interpreter::TestTypeOfFlags::Decode(GetFlag8Operand(0));
-  if (literal == TypeOfLiteralFlag::kOther) {
+  if (literal_flag == TypeOfLiteralFlag::kOther) {
     SetAccumulator(GetRootConstant(RootIndex::kFalseValue));
     return ReduceResult::Done();
   }
-  ValueNode* value = GetAccumulator();
-  auto GetResult = [&](TypeOfLiteralFlag expected, RootIndex _) {
-    return GetRootConstant(literal == expected ? RootIndex::kTrueValue
-                                               : RootIndex::kFalseValue);
-  };
-  PROCESS_AND_RETURN_IF_DONE(TryReduceTypeOf(value, GetResult), SetAccumulator);
 
-  return SetAccumulator(AddNewNode<TestTypeOf>({value}, literal));
+  ValueNode* value = GetAccumulator();
+  PROCESS_AND_RETURN_IF_DONE(reducer_.TryFoldTestTypeOf(value, literal_flag),
+                             SetAccumulator);
+
+  return SetAccumulator(AddNewNode<TestTypeOf>({value}, literal_flag));
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildScriptContextStore(
@@ -4596,10 +4593,11 @@ ReduceResult MaglevGraphBuilder::BuildLoadField(
   // Do the load.
   if (field_index.is_double()) {
     ValueNode* heap_number;
-    GET_VALUE_OR_ABORT(heap_number,
-                       AddNewNode<LoadTaggedField>(
-                           {load_source}, field_index.offset(),
-                           NodeType::kHeapNumber, false, PropertyKey::None()));
+    GET_VALUE_OR_ABORT(
+        heap_number,
+        AddNewNode<LoadTaggedField>({load_source}, field_index.offset(),
+                                    NodeType::kHeapNumber, false,
+                                    PropertyKey::None(), IsArrayLength::kNo));
     return AddNewNode<LoadFloat64>(
         {heap_number}, static_cast<int>(offsetof(HeapNumber, value_)));
   }
@@ -4655,9 +4653,9 @@ ReduceResult MaglevGraphBuilder::BuildLoadJSArrayLength(ValueNode* js_array,
 
   ValueNode* length;
   GET_VALUE_OR_ABORT(
-      length,
-      BuildLoadTaggedField(js_array, offsetof(JSArray, length_), length_type,
-                           false, broker()->length_string()));
+      length, BuildLoadTaggedField(
+                  js_array, offsetof(JSArray, length_), length_type, false,
+                  broker()->length_string(), IsArrayLength::kYes));
   reducer_.RecordKnownProperty(js_array, broker()->length_string(), length,
                                false, compiler::AccessMode::kLoad);
   return length;
@@ -4812,9 +4810,10 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
     } else {
       ValueNode* heap_number;
       GET_VALUE_OR_ABORT(
-          heap_number, AddNewNode<LoadTaggedField>(
-                           {store_target}, field_index.offset(),
-                           NodeType::kHeapNumber, false, PropertyKey::None()));
+          heap_number,
+          AddNewNode<LoadTaggedField>({store_target}, field_index.offset(),
+                                      NodeType::kHeapNumber, false,
+                                      PropertyKey::None(), IsArrayLength::kNo));
       return AddNewNode<StoreFloat64>(
           {heap_number, value}, static_cast<int>(offsetof(HeapNumber, value_)));
     }
@@ -11997,6 +11996,12 @@ ReduceResult MaglevGraphBuilder::VisitCallRuntime() {
       RETURN_IF_ABORT(AddNewNode<AssertPeeled>({}, false));
       SetAccumulator(GetRootConstant(RootIndex::kUndefinedValue));
       return ReduceResult::Done();
+    case Runtime::kAssertEscapeAnalysisElided:
+      if (!is_turbolev()) break;
+      RETURN_IF_ABORT(AddNewNode<AssertEscapeAnalysisElided>(
+          {current_interpreter_frame_.get(args[0])}));
+      SetAccumulator(GetRootConstant(RootIndex::kUndefinedValue));
+      return ReduceResult::Done();
     case Runtime::kNewFunctionContext:
       accumulator_scope_info_ =
           compilation_unit_->shared_function_info().scope_info(broker());
@@ -12729,10 +12734,21 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
     if (maybe_length.has_value()) {
       DCHECK_GE(*maybe_length, 0);
       DCHECK_LT(*maybe_length, JSArray::kInitialMaxFastElementArray);
-      return BuildAndAllocateJSArray(
-          initial_map, GetSmiConstant(*maybe_length),
-          BuildElementsArray(elements_kind, *maybe_length),
-          slack_tracking_prediction, allocation_type);
+      static constexpr int kElementLoopUnrollLimit = 16;
+      if (*maybe_length <= kElementLoopUnrollLimit) {
+        return BuildAndAllocateJSArray(
+            initial_map, GetSmiConstant(*maybe_length),
+            BuildElementsArray(elements_kind, *maybe_length),
+            slack_tracking_prediction, allocation_type);
+      } else {
+        ValueNode* elements;
+        GET_VALUE_OR_ABORT(elements, AddNewNode<AllocateElementsArray>(
+                                         {GetInt32Constant(*maybe_length)},
+                                         elements_kind, allocation_type));
+        return BuildAndAllocateJSArray(
+            initial_map, GetSmiConstant(*maybe_length), elements,
+            slack_tracking_prediction, allocation_type);
+      }
     }
 
     // We don't know anything about the length, so we rely on the allocation
@@ -13393,6 +13409,30 @@ ReduceResult MaglevGraphBuilder::VisitCreateArrayFromIterable() {
                         Builtin::kIterableToListWithSymbolLookup>({iterable}));
 }
 
+ReduceResult MaglevGraphBuilder::VisitArrayDestructure() {
+  ValueNode* receiver = GetAccumulator();
+  uint32_t count = iterator_.GetRegisterCountOperand(1);
+  ValueNode* count_node = GetSmiConstant(count);
+  interpreter::RegisterList outputs = iterator_.GetRegisterListOperand(0);
+  ValueNode* result;
+  {
+    LazyDeoptFrameScope lazy_deopt_scope(
+        this, Builtin::kArrayDestructureLazyDeoptContinuation, {},
+        base::VectorOf<ValueNode*>(
+            {GetSmiConstant(outputs.first_register().index()), count_node}));
+    GET_VALUE_OR_ABORT(
+        result, BuildCallBuiltinWithTaggedInputs<Builtin::kArrayDestructure>(
+                    {receiver, count_node}));
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    ValueNode* element = AddNewNodeNoInputConversion<LoadTaggedField>(
+        {result}, FixedArray::OffsetOfElementAt(i), NodeType::kUnknown, false,
+        PropertyKey::None(), IsArrayLength::kNo);
+    StoreRegister(outputs[i], element);
+  }
+  return ReduceResult::Done();
+}
+
 ReduceResult MaglevGraphBuilder::VisitCreateEmptyArrayLiteral() {
   FeedbackSlot slot_index = GetSlotOperand(0);
   compiler::FeedbackSource feedback_source(feedback(), slot_index);
@@ -13939,13 +13979,18 @@ ReduceResult MaglevGraphBuilder::VisitCreateClosure() {
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildInlinedAllocatedContext(
-    compiler::MapRef map, compiler::ScopeInfoRef scope, int context_length) {
+    compiler::MapRef map, int context_length, compiler::ScopeInfoRef scope,
+    ValueNode* extension) {
   const int kContextAllocationLimit = 16;
   if (context_length > kContextAllocationLimit) return {};
   DCHECK_GE(context_length, Context::MIN_CONTEXT_SLOTS);
-  auto context =
-      reducer_.CreateContext(map, context_length, scope, GetContext());
-  return reducer_.BuildInlinedAllocation(context, AllocationType::kYoung);
+  VirtualObject* context = reducer_.CreateContext(map, context_length, scope,
+                                                  GetContext(), extension);
+  InlinedAllocation* allocation;
+  GET_VALUE_OR_ABORT(allocation, reducer_.BuildInlinedAllocation(
+                                     context, AllocationType::kYoung));
+  reducer_.RecordType(allocation, NodeType::kContext);
+  return allocation;
 }
 
 ReduceResult MaglevGraphBuilder::VisitCreateBlockContext() {
@@ -13960,7 +14005,7 @@ ReduceResult MaglevGraphBuilder::VisitCreateBlockContext() {
   };
 
   PROCESS_AND_RETURN_IF_DONE(TryBuildInlinedAllocatedContext(
-                                 map, scope_info, scope_info.ContextLength()),
+                                 map, scope_info.ContextLength(), scope_info),
                              done);
   // Fallback.
   done(BuildCallRuntime(Runtime::kPushBlockContext, {GetConstant(scope_info)})
@@ -13972,12 +14017,15 @@ ReduceResult MaglevGraphBuilder::VisitCreateCatchContext() {
   // CreateCatchContext <exception> <scope_info_idx>
   ValueNode* exception = LoadRegister(0);
   compiler::ScopeInfoRef scope_info = GetRefOperand<ScopeInfo>(1);
-  auto context = reducer_.CreateContext(
-      broker()->target_native_context().catch_context_map(broker()),
-      Context::MIN_CONTEXT_EXTENDED_SLOTS, scope_info, GetContext(), exception);
-  RETURN_IF_ABORT(SetAccumulator(
-      reducer_.BuildInlinedAllocation(context, AllocationType::kYoung)));
 
+  InlinedAllocation* allocation;
+  GET_VALUE_OR_ABORT(
+      allocation,
+      TryBuildInlinedAllocatedContext(
+          broker()->target_native_context().catch_context_map(broker()),
+          Context::MIN_CONTEXT_EXTENDED_SLOTS, scope_info, exception));
+
+  SetAccumulator(allocation);
   accumulator_scope_info_ = scope_info;
   return ReduceResult::Done();
 }
@@ -13994,8 +14042,8 @@ ReduceResult MaglevGraphBuilder::VisitCreateFunctionContext() {
   };
 
   PROCESS_AND_RETURN_IF_DONE(
-      TryBuildInlinedAllocatedContext(map, info,
-                                      slot_count + Context::MIN_CONTEXT_SLOTS),
+      TryBuildInlinedAllocatedContext(
+          map, slot_count + Context::MIN_CONTEXT_SLOTS, info),
       done);
   // Fallback.
   done(AddNewNodeNoInputConversion<CreateFunctionContext>(
@@ -14019,8 +14067,8 @@ ReduceResult MaglevGraphBuilder::VisitCreateEvalContext() {
   };
 
   PROCESS_AND_RETURN_IF_DONE(
-      TryBuildInlinedAllocatedContext(map, info,
-                                      slot_count + Context::MIN_CONTEXT_SLOTS),
+      TryBuildInlinedAllocatedContext(
+          map, slot_count + Context::MIN_CONTEXT_SLOTS, info),
       done);
   if (slot_count <= static_cast<uint32_t>(
                         ConstructorBuiltins::MaximumFunctionContextSlots())) {
@@ -14037,12 +14085,15 @@ ReduceResult MaglevGraphBuilder::VisitCreateWithContext() {
   // CreateWithContext <register> <scope_info_idx>
   ValueNode* object = LoadRegister(0);
   compiler::ScopeInfoRef scope_info = GetRefOperand<ScopeInfo>(1);
-  auto context = reducer_.CreateContext(
-      broker()->target_native_context().with_context_map(broker()),
-      Context::MIN_CONTEXT_EXTENDED_SLOTS, scope_info, GetContext(), object);
-  RETURN_IF_ABORT(SetAccumulator(
-      reducer_.BuildInlinedAllocation(context, AllocationType::kYoung)));
 
+  InlinedAllocation* allocation;
+  GET_VALUE_OR_ABORT(
+      allocation,
+      TryBuildInlinedAllocatedContext(
+          broker()->target_native_context().with_context_map(broker()),
+          Context::MIN_CONTEXT_EXTENDED_SLOTS, scope_info, object));
+
+  SetAccumulator(allocation);
   accumulator_scope_info_ = scope_info;
   return ReduceResult::Done();
 }
@@ -16259,7 +16310,10 @@ void MaglevGraphBuilder::OsrPrewalk() {
     previous_fallsthrough = fallsthrough;
   }
 
-  DCHECK(is_reachable[entrypoint_]);
+  if (!is_reachable[entrypoint_]) {
+    should_abort_compilation_ = true;
+    return;
+  }
   if (!previous_fallsthrough) {
     auto it = saved_states.find(entrypoint_);
     if (it != saved_states.end()) {
@@ -16285,6 +16339,7 @@ void MaglevGraphBuilder::OsrPrewalk() {
 
 void MaglevGraphBuilder::BuildBody() {
   OsrPrewalk();
+  if (should_abort_compilation_) return;
   int position = 0;
   while (!source_position_iterator_.done() &&
          source_position_iterator_.code_offset() < entrypoint_) {

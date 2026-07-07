@@ -2984,7 +2984,7 @@ int BoyerMooreLookahead::GetSkipTable(
 }
 
 // See comment above on the implementation of GetSkipTable.
-void BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
+bool BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
   const int kSize = RegExpMacroAssembler::kTableSize;
 
   int min_lookahead = 0;
@@ -2992,7 +2992,7 @@ void BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
 
   if (!FindWorthwhileInterval(&min_lookahead, &max_lookahead)) {
     TRACE_COMPILER(compiler_, "  No worthwhile interval found");
-    return;
+    return false;
   }
 
   // Check if we only have a single non-empty position info, and that info
@@ -3007,7 +3007,7 @@ void BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
       // If we have a position where no characters can match then we just can't
       // match.
       masm->Fail();
-      return;
+      return true;
     }
 
     if (found_single_position || map->map_count() > 2) {
@@ -3045,7 +3045,7 @@ void BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
 
   if (found_single_position && max_lookahead < 3) {
     // The mask-compare can probably handle this better.
-    return;
+    return false;
   }
 
   // TODO(pthier): Remove condition once all architectures that support SIMD for
@@ -3062,7 +3062,7 @@ void BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
                            length() - 1, &cont, &cont);
 
     masm->Bind(&cont);
-    return;
+    return true;
   }
 
   Factory* factory = masm->isolate()->factory();
@@ -3083,6 +3083,7 @@ void BoyerMooreLookahead::EmitSkipInstructions(RegExpMacroAssembler* masm) {
   masm->SkipUntilBitInTable(max_lookahead, boolean_skip_table, nibble_table,
                             skip_distance, length() - 1, &cont, &cont);
   masm->Bind(&cont);
+  return true;
 }
 
 /* Code generation for choice nodes.
@@ -3248,8 +3249,30 @@ EmitResult ChoiceNode::Emit(Compiler* compiler, Trace* trace) {
                                 &special_loop_state, text_length, flags);
     if (trace == nullptr) return EmitResult::Error();
   } else {
-    preload.eats_at_least_ =
-        EmitOptimizedUnanchoredSearch(compiler, trace, &special_loop_state);
+    bool bm_scan_emitted = false;
+    preload.eats_at_least_ = EmitOptimizedUnanchoredSearch(
+        compiler, trace, &special_loop_state, &bm_scan_emitted);
+
+    // Try the SkipUntilOneOfMasked dispatch and the SkipUntil* search prelude,
+    // both restricted to the implicit `.*?` LoopChoice and only when BM
+    // lookahead didn't already emit a competing scan. OneOfMasked is tried
+    // first: it emits the op dispatching directly to the per-alt bodies and
+    // owns the whole node (mirroring the peephole), so on a match it returns
+    // and EmitChoices is skipped. The prelude is a straight-line
+    // position-finder that falls through to EmitChoices.
+    if (v8_flags.regexp_simd_in_rc && !bm_scan_emitted &&
+        AsLoopChoiceNode() != nullptr && trace->is_trivial()) {
+      ActionNode* wrapper = nullptr;
+      Node* body = MatchLazyStarLoopBody(compiler, &wrapper);
+      if (body != nullptr) {
+        if (std::optional<EmitResult> result = EmitSkipUntilOneOfMaskedSearch(
+                compiler, trace, body, wrapper)) {
+          RETURN_IF_ERROR(*result);
+          return EmitResult::Success();
+        }
+        EmitSkipUntilSearchPrelude(compiler, trace, body);
+      }
+    }
 
     RETURN_IF_ERROR(
         EmitChoices(compiler, &alt_gens, 0, trace, &preload, flags));
@@ -3292,6 +3315,23 @@ Trace* ChoiceNode::EmitFixedLengthLoop(
   // decrement the current position and check it against the pushed value.
   // This avoids pushing backtrack information for each iteration of the loop,
   // which could take up a lot of space.
+  //
+  // Shape (the "loop envelope"); the per-iteration body and the fused consume
+  // scan (MaybeEmitFixedLengthConsumeScan) plug into the same frame:
+  //
+  //   PushCurrentPosition()             // step-back start marker
+  //   loop_top:
+  //     <body>                          // one iteration; backtracks to
+  //                                     // after_body_match_attempt on failure
+  //   after_body_match_attempt:
+  //     <continuation>
+  //   step_label:
+  //     CheckFixedLengthLoop(backtrack) // at the marker? give up
+  //     AdvanceCurrentPosition(-len)    // else step back one iteration ...
+  //     GoTo(after_body_match_attempt)  // ... and retry the continuation
+  //
+  // Replacing <body> with a single forward scan leaves this frame untouched, so
+  // backtracking is identical.
   DCHECK(trace->special_loop_state() == nullptr);
   macro_assembler->PushCurrentPosition();
   // This is the label for trying to match what comes after the greedy
@@ -3303,8 +3343,14 @@ Trace* ChoiceNode::EmitFixedLengthLoop(
   fixed_length_match_trace.set_backtrack(&after_body_match_attempt);
   fixed_length_loop_state->BindLoopTopLabel(macro_assembler);
   fixed_length_match_trace.set_special_loop_state(fixed_length_loop_state);
-  EmitResult result =
-      alternatives_->at(0).node()->Emit(compiler, &fixed_length_match_trace);
+  // Fuse a greedy character-class body into a single forward scan; otherwise
+  // emit the per-iteration body.
+  EmitResult result = EmitResult::Success();
+  if (!MaybeEmitFixedLengthConsumeScan(compiler, &after_body_match_attempt,
+                                       text_length)) {
+    result =
+        alternatives_->at(0).node()->Emit(compiler, &fixed_length_match_trace);
+  }
   macro_assembler->Bind(&after_body_match_attempt);
   if (result.IsError()) return nullptr;
 
@@ -3325,7 +3371,9 @@ Trace* ChoiceNode::EmitFixedLengthLoop(
 }
 
 int ChoiceNode::EmitOptimizedUnanchoredSearch(
-    Compiler* compiler, Trace* trace, SpecialLoopState* search_loop_state) {
+    Compiler* compiler, Trace* trace, SpecialLoopState* search_loop_state,
+    bool* bm_scan_emitted) {
+  *bm_scan_emitted = false;
   int eats_at_least = PreloadState::kEatsAtLeastNotYetInitialized;
   if (alternatives_->length() != 2) return eats_at_least;
 
@@ -3379,9 +3427,573 @@ int ChoiceNode::EmitOptimizedUnanchoredSearch(
       printer->PrintBoyerMooreLookahead(bm);
     }
 #endif
-    bm->EmitSkipInstructions(macro_assembler);
+    if (bm->EmitSkipInstructions(macro_assembler)) {
+      // BM owns the search; do not attempt the inline SkipUntil* scan paths.
+      *bm_scan_emitted = true;
+    }
   }
   return eats_at_least;
+}
+
+namespace {
+
+// EATS_AT_LEAST tags are no-ops that propagate to on_success; skip past any
+// run of them.
+Node* SkipEatsAtLeastTags(Node* node) {
+  while (ActionNode* a = node->AsActionNode()) {
+    if (a->action_type() != ActionNode::EATS_AT_LEAST) break;
+    node = a->on_success();
+  }
+  return node;
+}
+
+// Walks past EATS_AT_LEAST tags and at most one deferrable ActionNode wrapper
+// to expose the first "real" body node. Returns nullptr if the chain has more
+// than one non-deferrable action. The wrapper (e.g. STORE_POSITION for the
+// implicit capture group 0) is returned in *wrapper_out when non-null, so a
+// caller that emits the body directly can defer it into the body's trace; a
+// caller that goes through EmitChoices passes nullptr and lets the real node
+// graph emit it.
+Node* FindBodyNodeUnderOneWrapper(Node* body, ActionNode** wrapper_out) {
+  if (wrapper_out != nullptr) *wrapper_out = nullptr;
+  Node* node = SkipEatsAtLeastTags(body);
+  if (ActionNode* a = node->AsActionNode()) {
+    if (!a->IsSimpleAction()) return nullptr;
+    if (wrapper_out != nullptr) *wrapper_out = a;
+    node = SkipEatsAtLeastTags(a->on_success());
+  }
+  return node;
+}
+
+// Emits `body` against a copy of `base_trace`, deferring `wrapper` (if any)
+// into the trace so its action (e.g. the capture-0 STORE_POSITION) runs as part
+// of the body's flush. For callers that emit the body directly rather than
+// through EmitChoices.
+EmitResult EmitBodyMaybeWrapped(Compiler* compiler, Node* body,
+                                const Trace& base_trace, ActionNode* wrapper) {
+  Trace trace(base_trace);
+  if (wrapper != nullptr) trace.add_action(wrapper);
+  return body->Emit(compiler, &trace);
+}
+
+}  // namespace
+
+// Shared structural gate for the two inline SkipUntil* scan strategies. See the
+// header for the full contract.
+Node* ChoiceNode::MatchLazyStarLoopBody(Compiler* compiler,
+                                        ActionNode** wrapper_out) {
+  // The caller has established that `this` is some LoopChoiceNode with a
+  // trivial entry trace, but it might just be a `(?:foo)*` quantifier loop.
+  // We only fire on the implicit `.*?` shape: alt 1 is an omnivorous Text
+  // node re-entering this loop. Same predicate that
+  // EmitOptimizedUnanchoredSearch uses.
+  if (alternatives_->length() != 2) return nullptr;
+  GuardedAlternative alt1 = alternatives_->at(1);
+  if (alt1.guards() != nullptr && alt1.guards()->length() != 0) return nullptr;
+  if (alt1.node()->GetSuccessorOfOmnivorousTextNode(compiler) != this) {
+    return nullptr;
+  }
+  return FindBodyNodeUnderOneWrapper(alternatives_->at(0).node(), wrapper_out);
+}
+
+std::optional<EmitResult> ChoiceNode::EmitSkipUntilOneOfMaskedSearch(
+    Compiler* compiler, Trace* trace, Node* body, ActionNode* wrapper) {
+  // Matches the implicit unanchored-search sub-graph whose body is a plain
+  // 2-alternative Choice of TextNodes, and emits a SkipUntilOneOfMasked scan
+  // that dispatches straight to the two alternative bodies (see the block
+  // comment on the emission below for the resulting control flow):
+  //
+  // clang-format off
+  //   LoopChoiceNode (implicit `.*?` search)
+  //    |- alt 0: ChoiceNode  <- `inner`: the A|B we accelerate
+  //    |          |- alt 0: TextNode  (e.g. [cgt]gggtaaa)
+  //    |          `- alt 1: TextNode  (e.g. tttaccc[acg])
+  //    `- alt 1: TextNode  (omnivorous advance; re-enters the loop)
+  // clang-format on
+  if (!v8_flags.regexp_quick_check) return std::nullopt;
+  // The op lowerings only handle 1-byte (LATIN1) input.
+  // TODO(jgruber): Support 2-byte.
+  if (!compiler->one_byte()) return std::nullopt;
+
+  DCHECK(trace->is_trivial());
+  ChoiceNode* inner = body->AsChoiceNode();
+  if (inner == nullptr) return std::nullopt;
+  static constexpr int kNumAlternatives = 2;
+  if (inner->alternatives()->length() != kNumAlternatives) return std::nullopt;
+  // Must be a plain ChoiceNode-style alternation. LoopChoiceNode's two alts
+  // are (body, continue), not parallel patterns; NegativeLookaroundChoice's
+  // alts encode lookaround semantics. Neither matches the SkipUntilOneOfMasked
+  // dispatch model.
+  if (inner->AsLoopChoiceNode() != nullptr) return std::nullopt;
+  if (inner->AsNegativeLookaroundChoiceNode() != nullptr) return std::nullopt;
+
+  // Both alternatives must be direct TextNodes; this keeps QuickCheck local
+  // and matches the peephole's target shape.
+  for (int i = 0; i < kNumAlternatives; i++) {
+    auto* guards = inner->alternatives()->at(i).guards();
+    if (guards != nullptr && guards->length() != 0) return std::nullopt;
+    TextNode* alt_text = inner->alternatives()->at(i).node()->AsTextNode();
+    if (alt_text == nullptr) return std::nullopt;
+    // The bodies are emitted forward from the candidate with at_start=FALSE
+    // (see the emit_alt lambda below); the inner alternatives of the implicit
+    // `.*?` search are always forward-reading. A backward TextNode would break
+    // both the forward scan geometry and the at_start assumption.
+    DCHECK(!alt_text->read_backward());
+  }
+
+  // The masked op loads a 4-char window at each candidate.
+  static constexpr int kSkipChars = 4;
+  constexpr bool kPossiblyAtStart = false;
+
+  // eats_at_least is cached by the analysis pass, so this cheap bail (each
+  // alternative must supply the kSkipChars-wide load) can run before the QC
+  // work below.
+  const int eats_at_least = inner->EatsAtLeast(kPossiblyAtStart);
+  if (eats_at_least < kSkipChars) return std::nullopt;
+  const int max_offset = eats_at_least - 1;
+
+  // Per-alt and union QuickCheck details across the first kSkipChars
+  // characters. Budget=1 is enough since both alts are TextNodes; QC fills
+  // positions locally without recursing into Choices.
+  static constexpr int kQCBudget = 1;
+  // Both alternatives' QC details describe the window starting at the scan
+  // candidate, so each fills from -- and the union merges at -- window
+  // position 0.
+  static constexpr int kQCWindowStart = 0;
+  QuickCheckDetails alt0_qc(kSkipChars), alt1_qc(kSkipChars);
+  inner->alternatives()->at(0).node()->GetQuickCheckDetails(
+      &alt0_qc, compiler, kQCWindowStart, kPossiblyAtStart, kQCBudget);
+  if (alt0_qc.cannot_match()) return std::nullopt;
+  inner->alternatives()->at(1).node()->GetQuickCheckDetails(
+      &alt1_qc, compiler, kQCWindowStart, kPossiblyAtStart, kQCBudget);
+  if (alt1_qc.cannot_match()) return std::nullopt;
+
+  // The union is the per-alt details merged. Merge mutates both its receiver
+  // and its argument, so merge into copies to keep alt0_qc/alt1_qc intact for
+  // the per-alt filter.
+  QuickCheckDetails union_qc = alt0_qc;
+  {
+    QuickCheckDetails tmp = alt1_qc;
+    union_qc.Merge(&tmp, kQCWindowStart);
+  }
+
+  if (!alt0_qc.Rationalize(compiler->one_byte())) return std::nullopt;
+  if (!alt1_qc.Rationalize(compiler->one_byte())) return std::nullopt;
+  if (!union_qc.Rationalize(compiler->one_byte())) return std::nullopt;
+  if (alt0_qc.mask() == 0 || alt1_qc.mask() == 0 || union_qc.mask() == 0) {
+    return std::nullopt;
+  }
+
+  // Emit the op dispatching directly to the two alternative bodies, mirroring
+  // the peephole-folded form (which routes on_match1->alt0, on_match2->alt1
+  // plus a preserved-tail back-edge, and is ~2% faster on regex-dna than
+  // routing all exits to one candidate and re-deriving the dispatch in
+  // EmitChoices). The resulting control flow:
+  //
+  //   loop:       SkipUntilOneOfMasked(...) -> alt0_body / alt1_body / fail
+  //   advance:    cp += 1; goto loop
+  //   retry_alt1: reload, re-check alt 1's QC; miss -> advance, else fall
+  //               through to alt1_body   (alt 0's backtrack target)
+  //   alt1_body:  <alt 1>   backtrack -> advance
+  //   alt0_body:  <alt 0>   backtrack -> retry_alt1   (try alt 1 here)
+  //   fail:       Backtrack
+  //
+  // The op's scalar dispatcher (which the SIMD path funnels through) loads
+  // kSkipChars chars, bounds-checks to max_offset, and verifies the per-alt
+  // mask before reaching on_match*, so each body carries characters_preloaded /
+  // bound_checked_up_to / quick_check_performed for its alternative.
+  TRACE("* Emit SkipUntilOneOfMasked dispatch");
+  RegExpMacroAssembler* masm = compiler->macro_assembler();
+  // The scan reads the candidate at offset 0 and steps forward one char.
+  constexpr int kScanCpOffset = 0;
+  constexpr int kScanAdvanceBy = 1;
+  Label loop, advance, retry_alt1, alt0_body, alt1_body, fail;
+
+  masm->Bind(&loop);
+  masm->SkipUntilOneOfMasked(kScanCpOffset, kScanAdvanceBy, union_qc.value(),
+                             union_qc.mask(), max_offset, alt0_qc.value(),
+                             alt0_qc.mask(), alt1_qc.value(), alt1_qc.mask(),
+                             &alt0_body, &alt1_body, &fail);
+
+  masm->Bind(&advance);
+  masm->AdvanceCurrentPosition(kScanAdvanceBy);
+  masm->GoTo(&loop);
+
+  // alt 0's body failed: try alt 1 at the same position. The op bounds-checked
+  // the kSkipChars chars, so the reload is unchecked; re-check alt 1's quick-
+  // check and on a miss advance, otherwise fall into alt 1's body.
+  masm->Bind(&retry_alt1);
+  masm->LoadCurrentCharacter(kScanCpOffset, nullptr, /*check_bounds=*/false,
+                             kSkipChars);
+  masm->CheckNotCharacterAfterAnd(alt1_qc.value(), alt1_qc.mask(), &advance);
+
+  auto emit_alt = [&](Label* entry, int alt_index, QuickCheckDetails* qc,
+                      Label* backtrack) -> EmitResult {
+    masm->Bind(entry);
+    Trace base_trace;
+    base_trace.set_characters_preloaded(kSkipChars);
+    base_trace.set_bound_checked_up_to(max_offset);
+    base_trace.set_quick_check_performed(qc);
+    base_trace.set_at_start(Trace::FALSE_VALUE);
+    base_trace.set_backtrack(backtrack);
+    return EmitBodyMaybeWrapped(compiler,
+                                inner->alternatives()->at(alt_index).node(),
+                                base_trace, wrapper);
+  };
+
+  // alt 1 is emitted first so it falls through from retry_alt1; alt 0
+  // backtracks to retry_alt1 (the priority chain).
+  RETURN_IF_ERROR(emit_alt(&alt1_body, 1, &alt1_qc, &advance));
+  RETURN_IF_ERROR(emit_alt(&alt0_body, 0, &alt0_qc, &retry_alt1));
+
+  // SkipUntilOneOfMasked exhausted the input. Trace is trivial, so backtrack
+  // pops the stack and lands on the bottom-of-stack PushBacktrack(fail).
+  masm->Bind(&fail);
+  masm->Backtrack();
+
+  return EmitResult::Success();
+}
+
+namespace {
+
+// Builds the SkipUntilBitInTable boolean table (and the SIMD nibble table when
+// want_nibble_table) from the leading ClassRanges into *table_out /
+// *nibble_table_out. Returns false without allocating if the class is
+// unsuitable. 1 = "might match, stop scanning"; 0 = "skip". Chars >= 128 fold
+// into (c & 0x7f) with OR; the extra false positives are filtered by the body.
+bool BuildBitTableForClassPrefix(ClassRanges* cr, bool one_byte,
+                                 bool want_nibble_table, Factory* factory,
+                                 Zone* zone, Handle<ByteArray>* table_out,
+                                 Handle<ByteArray>* nibble_table_out) {
+  // The table indexes by (c & 0x7f) and caps iteration at the one-byte max, so
+  // it is only correct for 1-byte subjects today. The `one_byte` parameter is
+  // kept for the planned 2-byte widening (see the TODO at the call site).
+  DCHECK(one_byte);
+  // TODO(jgruber): Negated classes (e.g. `[^"]*"`) are common leading classes
+  // and could be supported by marking the complement set. Mind the mod-128
+  // folding order: compute membership over the full [0, 0xff] range first
+  // (i.e. the chars NOT in the class), then fold into slots with OR. Inverting
+  // the table after folding is wrong, since a slot may collide a matching and a
+  // non-matching char.
+  if (cr->is_negated()) return false;
+
+  ZoneList<CharacterRange>* ranges = cr->ranges(zone);
+  CharacterRange::Canonicalize(ranges);
+  if (one_byte) CharacterRange::ClampToOneByte(ranges);
+  if (ranges->is_empty()) return false;
+
+  // In 1-byte mode the subject character is at most 0xff, so we only consider
+  // that far. Ranges are canonicalized (ascending), so if the smallest `from`
+  // is already past kMaxChar nothing would be set: bail without allocating.
+  static constexpr base::uc32 kMaxChar = String::kMaxOneByteCharCode;
+  if (ranges->at(0).from() > kMaxChar) return false;
+
+  // The class is suitable; allocate the table(s) now.
+  // TODO(jgruber): Dedupe with GetSkipTable.
+  static constexpr int kMask = RegExpMacroAssembler::kTableMask;
+  static constexpr int kSize = RegExpMacroAssembler::kTableSize;
+  static constexpr int kBitsPerByte = 8;
+  Handle<ByteArray> table = factory->NewByteArray(kSize, AllocationType::kOld);
+  Handle<ByteArray> nibble_table;
+  if (want_nibble_table) {
+    static_assert(kSize == 128);
+    nibble_table =
+        factory->NewByteArray(kSize / kBitsPerByte, AllocationType::kOld);
+  }
+  std::memset(table->begin(), 0, table->ulength().value());
+  const bool fill_nibble = !nibble_table.is_null();
+  if (fill_nibble) {
+    std::memset(nibble_table->begin(), 0, nibble_table->ulength().value());
+  }
+
+  for (auto& r : *ranges) {
+    const base::uc32 lo = r.from();
+    const base::uc32 hi = std::min<base::uc32>(r.to(), kMaxChar);
+    // lo > hi means lo > kMaxChar; ranges are canonicalized ascending, so every
+    // later range starts even higher. Nothing more can be set.
+    if (lo > hi) break;
+    for (base::uc32 c = lo; c <= hi; c++) {
+      const int idx = c & kMask;
+      table->set(idx, 1);
+      if (fill_nibble) {
+        int lo_nibble = idx & 0x0f;
+        int hi_nibble = (idx >> 4) & 0x07;
+        int row = nibble_table->get(lo_nibble);
+        row |= 1 << hi_nibble;
+        nibble_table->set(lo_nibble, row);
+      }
+    }
+  }
+  *table_out = table;
+  *nibble_table_out = nibble_table;
+  return true;
+}
+
+// Collects up to two code units <= max_char from the canonical (ascending)
+// range list `ranges` into `chars`, in order. Returns the number collected (0,
+// 1, or 2), or kCharSetTooLarge if a third such unit exists, in which case no
+// single SkipUntil* op covers the set.
+constexpr int kCharSetTooLarge = -1;
+int CollectSmallCharSet(const ZoneList<CharacterRange>* ranges,
+                        base::uc32 max_char, base::uc32 chars[2]) {
+  int count = 0;
+  for (const CharacterRange& r : *ranges) {
+    if (r.from() > max_char) break;  // canonical ascending: nothing lower left
+    for (base::uc32 c = r.from(); c <= std::min(r.to(), max_char); c++) {
+      if (count == 2) return kCharSetTooLarge;
+      chars[count++] = c;
+    }
+  }
+  return count;
+}
+
+// Emits the cheapest SkipUntil* op that stops the scan at one of `chars`
+// (`count` is 1 or 2 code units). Mirrors EmitQuickCheck's masked/unmasked
+// selection: a one-bit-apart pair (e.g. the case-insensitive {a, A}) folds into
+// a single masked compare, as in ShortCutEmitCharacterPair. Both exits target
+// the same labels; search preludes pass on_match == on_no_match and re-check
+// the body there, consume loops pass the loop exit for both.
+void EmitSkipUntilSmallCharSet(RegExpMacroAssembler* masm, bool one_byte,
+                               int cp_offset, int advance_by,
+                               const base::uc32* chars, int count,
+                               int bounds_check_offset, Label* on_match,
+                               Label* on_no_match) {
+  DCHECK(count == 1 || count == 2);
+  if (count == 1) {
+    masm->SkipUntilChar(cp_offset, advance_by, chars[0], bounds_check_offset,
+                        on_match, on_no_match);
+    return;
+  }
+  const base::uc32 exor = chars[0] ^ chars[1];
+  if ((exor & (exor - 1)) == 0) {
+    const uint32_t mask = CharMask(one_byte) ^ exor;
+    masm->SkipUntilCharAnd(cp_offset, advance_by, chars[0], mask,
+                           bounds_check_offset, on_match, on_no_match);
+  } else {
+    masm->SkipUntilCharOrChar(cp_offset, advance_by, chars[0], chars[1],
+                              bounds_check_offset, on_match, on_no_match);
+  }
+}
+
+}  // namespace
+
+void ChoiceNode::EmitSkipUntilSearchPrelude(Compiler* compiler, Trace* trace,
+                                            Node* body) {
+  // Matches the implicit unanchored-search sub-graph and accelerates the scan
+  // to the first position where the body can match. The op is only a
+  // position-finder: EmitChoices emits the body at the candidate and re-checks
+  // it, so an over-approximate stop set is fine.
+  //
+  // clang-format off
+  //   LoopChoiceNode (implicit `.*?` search)
+  //    |- alt 0: body  <- what we accelerate
+  //    `- alt 1: TextNode  (omnivorous advance; re-enters the loop)
+  // clang-format on
+  //
+  // Three strategies, cheapest first:
+  //   (1) an exact small positive leading class [c] / [cd] -> SkipUntilChar /
+  //       SkipUntilCharOrChar / SkipUntilCharAnd,
+  //   (2) otherwise the body's 1-char quick check -> SkipUntilChar / CharAnd
+  //       (covers leading atoms and sub-loops, e.g. /a+/),
+  //   (3) otherwise a leading-class bit table -> SkipUntilBitInTable (1-byte).
+  // (1) and (2) are valid for 2-byte input; (3) is 1-byte only. Gated on the
+  // same flag as the sibling scan strategies it competes with so that
+  // --no-regexp-quick-check disables all of them uniformly when debugging.
+  if (!v8_flags.regexp_quick_check) return;
+  DCHECK(trace->is_trivial());
+
+  RegExpMacroAssembler* masm = compiler->macro_assembler();
+  const bool one_byte = compiler->one_byte();
+  // The scan reads the candidate at offset 0 and steps forward one char; only
+  // the candidate position must be in bounds.
+  constexpr int kScanCpOffset = 0;
+  constexpr int kScanAdvanceBy = 1;
+  constexpr int kBoundsCheckOffset = 0;
+  const base::uc32 max_char = MaxCodeUnit(one_byte);
+  Label cont;
+
+  // (1) Exact small positive leading class. SkipUntilChar / CharOrChar /
+  // CharAnd are valid for 2-byte input: the scalar lowerings go through the
+  // width-aware LoadCurrentCharacter, and the SIMD lowerings compare
+  // char_size()-wide lanes.
+  TextNode* body_text = body->AsTextNode();
+  const bool class_led =
+      body_text != nullptr && !body_text->read_backward() &&
+      !body_text->elements()->is_empty() &&
+      body_text->elements()->at(0).text_type() == TextElement::CLASS_RANGES;
+  if (class_led) {
+    ClassRanges* cr = body_text->elements()->at(0).class_ranges();
+    if (!cr->is_negated()) {
+      // Work on a copy; Canonicalize mutates, and the ranges are shared with
+      // the AST.
+      ZoneList<CharacterRange>* ranges =
+          zone()->New<ZoneList<CharacterRange>>(2, zone());
+      ranges->AddAll(*cr->ranges(zone()), zone());
+      CharacterRange::Canonicalize(ranges);
+      base::uc32 chars[2];
+      int count = CollectSmallCharSet(ranges, max_char, chars);
+      if (count >= 1) {
+        TRACE("* Emit SkipUntil* search prelude (exact leading class)");
+        EmitSkipUntilSmallCharSet(masm, one_byte, kScanCpOffset, kScanAdvanceBy,
+                                  chars, count, kBoundsCheckOffset, &cont,
+                                  &cont);
+        masm->Bind(&cont);
+        return;
+      }
+    }
+  }
+
+  // (2) General: the body's 1-char quick check, mirroring EmitQuickCheck's
+  // masked/unmasked selection. Covers leading atoms and sub-loops (e.g. /a+/).
+  // The quick check is only a *necessary* condition for a match when the body
+  // must consume at least one character. If the body can match the empty string
+  // (e.g. /|z/), some match positions impose no first-char constraint, so a
+  // skip would wrongly jump over them; require EatsAtLeast >= 1. Within that,
+  // the check never skips a real match; false positives are filtered by the
+  // body re-check at `cont`.
+  constexpr bool kPossiblyAtStart = false;
+  if (body->EatsAtLeast(kPossiblyAtStart) >= 1) {
+    QuickCheckDetails qc(1);
+    body->GetQuickCheckDetails(&qc, compiler, 0, kPossiblyAtStart,
+                               kRecursionBudget);
+    if (!qc.cannot_match() && qc.Rationalize(one_byte)) {
+      const uint32_t char_mask = CharMask(one_byte);
+      const uint32_t mask = qc.mask() & char_mask;
+      const uint32_t value = qc.value() & char_mask;
+      if (mask != 0) {
+        TRACE("* Emit SkipUntil* search prelude (body quick check)");
+        if (mask == char_mask) {
+          masm->SkipUntilChar(kScanCpOffset, kScanAdvanceBy, value,
+                              kBoundsCheckOffset, &cont, &cont);
+        } else {
+          masm->SkipUntilCharAnd(kScanCpOffset, kScanAdvanceBy, value, mask,
+                                 kBoundsCheckOffset, &cont, &cont);
+        }
+        masm->Bind(&cont);
+        return;
+      }
+    }
+  } else {
+    TRACE("* SkipUntil* search: body may match empty; no quick-check prelude");
+  }
+
+  // (3) Fall back to a leading-class bit table. The 128-entry table is 1-byte
+  // only.
+  // TODO(jgruber): Support 2-byte (the (c & 0x7f) table stays valid; needs
+  // 2-byte loads in the lowerings).
+  if (!one_byte || !class_led) {
+    TRACE("* No SkipUntil* search prelude emitted");
+    return;
+  }
+  ClassRanges* cr = body_text->elements()->at(0).class_ranges();
+  Handle<ByteArray> table, nibble_table;
+  if (!BuildBitTableForClassPrefix(
+          cr, one_byte, masm->SkipUntilBitInTableUseSimd(kScanAdvanceBy),
+          masm->isolate()->factory(), zone(), &table, &nibble_table)) {
+    return;
+  }
+
+  // Emit the scan as a straight-line prelude, mirroring
+  // EmitOptimizedUnanchoredSearch: it advances to the next position whose first
+  // character is in the class and falls through to `cont`. The caller emits the
+  // body there via EmitChoices, and the loop's continue-alternative provides
+  // advance + rescan. At end-of-input the scan also falls through to `cont`,
+  // where the body fails its bounds check and the loop terminates.
+  TRACE("* Emit SkipUntilBitInTable scan prelude");
+  masm->SkipUntilBitInTable(kScanCpOffset, table, nibble_table, kScanAdvanceBy,
+                            kBoundsCheckOffset, &cont, &cont);
+  masm->Bind(&cont);
+}
+
+bool ChoiceNode::MaybeEmitFixedLengthConsumeScan(Compiler* compiler,
+                                                 Label* exit, int text_length) {
+  // Called from EmitFixedLengthLoop. If the greedy loop body is a character
+  // class [B], replace the per-iteration body + back-edge with a single forward
+  // scan over its exit set (the complement of B: the chars that end the loop),
+  // landing on |exit|; return true. The op follows the exit-set shape via
+  // EmitSkipUntilSmallCharSet (SkipUntilChar / SkipUntilCharAnd /
+  // SkipUntilCharOrChar). A larger exit set falls through to the generic loop.
+  //
+  // The caller keeps the fixed-length-loop frame (pushed start +
+  // CheckFixedLengthLoop step-back), so this replaces only the forward scan: no
+  // atomicity precondition on the continuation is needed.
+  if (!v8_flags.regexp_simd_in_rc) return false;
+  // The scan compares single code units and advances by one. Only a two-byte
+  // subject under /u or /v is unsafe: there a class can match a supplementary
+  // code point (a surrogate pair), so the loop's one-code-unit step-back could
+  // land mid-pair. One-byte subjects (latin1, all BMP) and non-unicode two-byte
+  // subjects (each code unit independent) are both fine.
+  if (!compiler->one_byte() && IsEitherUnicode(compiler->flags())) {
+    TRACE("* No consume scan (two-byte unicode: surrogate step-back unsafe)");
+    return false;
+  }
+
+  LoopChoiceNode* loop = AsLoopChoiceNode();
+  if (loop == nullptr || loop->read_backward()) return false;
+
+  // The body is alternative 0 (alternative 1 is the continuation). Counted
+  // quantifiers carry guards that need per-iteration bookkeeping.
+  GuardedAlternative body_alt = alternatives_->at(0);
+  if (body_alt.guards() != nullptr && body_alt.guards()->length() != 0) {
+    return false;
+  }
+  // Body must be a single character class, so "matches the body" is "in the
+  // class" and the loop ends on its complement.
+  TextNode* body = body_alt.node()->AsTextNode();
+  if (body == nullptr || body->read_backward()) return false;
+  if (body->elements()->length() != 1) return false;
+  TextElement el = body->elements()->at(0);
+  if (el.text_type() != TextElement::CLASS_RANGES) return false;
+  // The class must be the whole iteration. The check above only inspects the
+  // first node, so a body that keeps consuming past it (e.g. /(?:.z)+/) has a
+  // text_length above one and cannot be fused into a single-unit scan.
+  if (text_length != 1) return false;
+  ClassRanges* cr = el.class_ranges();
+
+  // The loop ends on the first char the body does not match, so the exit set is
+  // the complement of [B]'s match set. A class stores positive ranges plus a
+  // negate flag, so the complement is:
+  //   [c...]  (positive): body matches the ranges  -> exit = Negate(ranges)
+  //   [^c...] (negated):  body matches the rest    -> exit = ranges
+  // Work on a copy; Canonicalize/Negate mutate, and the ranges are shared with
+  // the AST.
+  ZoneList<CharacterRange>* exit_set =
+      zone()->New<ZoneList<CharacterRange>>(2, zone());
+  exit_set->AddAll(*cr->ranges(zone()), zone());
+  CharacterRange::Canonicalize(exit_set);
+  if (!cr->is_negated()) {
+    ZoneList<CharacterRange>* negated =
+        zone()->New<ZoneList<CharacterRange>>(2, zone());
+    CharacterRange::Negate(exit_set, negated, zone());
+    exit_set = negated;
+  }
+
+  // Collect up to two exit chars within the subject's code-unit range; a larger
+  // set has no single-op scan. Clamping to the code-unit max here subsumes a
+  // ClampToOneByte step and covers 2-byte subjects.
+  const base::uc32 max_char = MaxCodeUnit(compiler->one_byte());
+  base::uc32 chars[2];
+  int count = CollectSmallCharSet(exit_set, max_char, chars);
+  if (count == kCharSetTooLarge) {
+    TRACE("* No consume scan (exit set larger than two chars)");
+    return false;
+  }
+  if (count == 0) return false;  // Body matches everything: never stops.
+
+  // The scan reads the current position and steps forward one code unit; only
+  // that position must be in bounds.
+  constexpr int kScanCpOffset = 0;
+  constexpr int kScanAdvanceBy = 1;
+  constexpr int kBoundsCheckOffset = 0;
+  // Both exits target |exit|: on a stop char the position is left there for the
+  // continuation, at end-of-input at the greedy maximum; the caller's step-back
+  // walks back from either. See the SkipUntil* position contract in
+  // regexp-macro-assembler.h.
+  TRACE("* Emit SkipUntil* consume scan");
+  EmitSkipUntilSmallCharSet(compiler->macro_assembler(), compiler->one_byte(),
+                            kScanCpOffset, kScanAdvanceBy, chars, count,
+                            kBoundsCheckOffset, exit, exit);
+  return true;
 }
 
 EmitResult ChoiceNode::EmitChoices(Compiler* compiler,

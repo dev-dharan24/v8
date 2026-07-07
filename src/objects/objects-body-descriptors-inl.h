@@ -191,6 +191,23 @@ class JSAPIObjectWithEmbedderSlots::BodyDescriptor
   }
 };
 
+class JSGlobalProxy::BodyDescriptor
+    : public JSAPIObjectWithEmbedderSlotsOrJSSpecialObjectBodyDescriptor {
+ public:
+  template <typename ObjectVisitor>
+  static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
+                                 int object_size, ObjectVisitor* v) {
+    IterateJSAPIObjectWithEmbedderSlotsHeader(map, obj, object_size, v);
+    IterateJSAPIObjectWithEmbedderSlotsTail<
+        JSAPIObjectWithEmbedderSlotsOrJSSpecialObjectBodyDescriptor>(
+        map, obj, object_size, v);
+  }
+
+  static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {
+    return map->instance_size();
+  }
+};
+
 class CppHeapExternalObject::BodyDescriptor final : public BodyDescriptorBase {
  public:
   template <typename ObjectVisitor>
@@ -1823,9 +1840,14 @@ class NativeContext::BodyDescriptor final : public BodyDescriptorBase {
                     NativeContext::kEndOfStrongFieldsOffset, v);
     IterateCustomWeakPointers(obj, NativeContext::kStartOfWeakFieldsOffset,
                               NativeContext::kEndOfWeakFieldsOffset, v);
+#ifdef V8_CPPGC_MICROTASK_QUEUE
+    v->VisitCppHeapPointer(obj,
+                           obj->RawCppHeapPointerField(kMicrotaskQueueOffset));
+#else
     v->VisitExternalPointer(
         obj, obj->RawExternalPointerField(kMicrotaskQueueOffset,
                                           kNativeContextMicrotaskQueueTag));
+#endif  // V8_CPPGC_MICROTASK_QUEUE
   }
 
   static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {

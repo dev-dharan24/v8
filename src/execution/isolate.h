@@ -26,6 +26,7 @@
 #include "src/base/macros.h"
 #include "src/base/platform/mutex.h"
 #include "src/base/platform/platform-posix.h"
+#include "src/base/strong-alias.h"
 #include "src/builtins/builtins.h"
 #include "src/common/globals.h"
 #include "src/common/ptr-compr.h"
@@ -965,9 +966,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
                                   should_include_frame_callback = nullptr);
   void PrintStack(StringStream* accumulator,
                   PrintStackMode mode = kPrintStackVerbose,
-                  AllowAllocation allow_allocation = AllowAllocation::kYes);
+                  AllowAllocation allow_allocation = AllowAllocation{true});
   void PrintStack(FILE* out, PrintStackMode mode = kPrintStackVerbose,
-                  AllowAllocation allow_allocation = AllowAllocation::kYes);
+                  AllowAllocation allow_allocation = AllowAllocation{true});
 
   // Prints minimal stack trace without allocating on the V8 heap (native
   // allocations are allowed). Used for printing the JS stack on OOM errors.
@@ -1055,7 +1056,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void set_console_delegate(debug::ConsoleDelegate* delegate) {
     console_delegate_ = delegate;
   }
-  debug::ConsoleDelegate* console_delegate() { return console_delegate_; }
+  debug::ConsoleDelegate* console_delegate() { return console_delegate_.Get(); }
 
   void set_async_event_delegate(debug::AsyncEventDelegate* delegate) {
     async_event_delegate_ = delegate;
@@ -1064,7 +1065,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   // Async function and promise instrumentation support.
   void OnAsyncFunctionSuspended(DirectHandle<JSPromise> promise,
-                                DirectHandle<JSPromise> parent);
+                                DirectHandle<JSPromise> parent,
+                                int skip_frame_count);
   void OnPromiseThen(DirectHandle<JSPromise> promise);
   void OnPromiseBefore(DirectHandle<JSPromise> promise);
   void OnPromiseAfter(DirectHandle<JSPromise> promise);
@@ -1908,6 +1910,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return reinterpret_cast<Address>(&promise_hook_flags_);
   }
 
+  static constexpr int promise_hook_flags_offset() {
+    return offsetof(Isolate, promise_hook_flags_);
+  }
+
   Address promise_hook_address() {
     return reinterpret_cast<Address>(&promise_hook_);
   }
@@ -2400,7 +2406,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // Returns true when this isolate supports allocation in shared spaces.
   bool has_shared_space() const { return shared_space_isolate_.value(); }
 
-  GlobalSafepoint* global_safepoint() const { return global_safepoint_.get(); }
+  GlobalSafepoint* global_safepoint() const {
+    return isolate_group()->global_safepoint();
+  }
 
 #if V8_ENABLE_DRUMBRAKE
   void initialize_wasm_execution_timer();
@@ -2912,7 +2920,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   CancelableTaskManager* cancelable_task_manager_ = nullptr;
 
-  debug::ConsoleDelegate* console_delegate_ = nullptr;
+  cppgc::Persistent<debug::ConsoleDelegate> console_delegate_;
 
   debug::AsyncEventDelegate* async_event_delegate_ = nullptr;
   uint32_t promise_hook_flags_ = 0;
@@ -2983,9 +2991,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   TrustedPointerTable::Space* shared_trusted_pointer_space_ = nullptr;
 #endif  // V8_ENABLE_SANDBOX
 
-  // Used to track and safepoint all client isolates attached to this shared
-  // isolate.
-  std::unique_ptr<GlobalSafepoint> global_safepoint_;
   // Client isolates list managed by GlobalSafepoint.
   Isolate* global_safepoint_prev_client_isolate_ = nullptr;
   Isolate* global_safepoint_next_client_isolate_ = nullptr;
@@ -3151,11 +3156,13 @@ class StackLimitCheck {
   // Use this to check for stack-overflow when entering runtime from JS code.
   bool JsHasOverflowed(uintptr_t gap = 0) const;
 
+#if V8_ENABLE_WEBASSEMBLY
   // Use this to check for stack-overflow when entering runtime from Wasm code.
   // If it is called from the central stack, while a switch was performed,
   // it checks logical stack limit of a secondary stack stored in the isolate,
   // instead checking actual one.
   bool WasmHasOverflowed(uintptr_t gap = 0) const;
+#endif
 
   // Use this to check for interrupt request in C++ code.
   V8_INLINE bool InterruptRequested() {

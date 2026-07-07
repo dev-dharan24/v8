@@ -686,6 +686,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(TraceEnter, 0, 1)                                                    \
   F(TraceExit, 1, 1)                                                     \
   F(TurbofanStaticAssert, 1, 1)                                          \
+  F(AssertEscapeAnalysisElided, 1, 1)                                    \
   F(TypedArraySpeciesProtector, 0, 1)                                    \
   F(WaitForBackgroundOptimization, 0, 1)                                 \
   F(WaitUntilBlocked, 2, 1)                                              \
@@ -755,6 +756,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(WasmArrayNewSegment, 5, 1)                                   \
   F(WasmArrayInitSegment, 6, 1)                                  \
   F(WasmAllocateSuspender, 0, 1)                                 \
+  F(WasmSuspended, 2, 1)                                         \
   F(WasmAllocateContinuation, 3, 1)                              \
   F(ClearWasmSuspenderResumeField, 1, 1)                         \
   F(WasmCastToSpecialPrimitiveArray, 2, 1)                       \

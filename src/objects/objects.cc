@@ -4068,20 +4068,15 @@ template Handle<DescriptorArray> DescriptorArray::Allocate(
 
 void DescriptorArray::Initialize(Tagged<EnumCache> empty_enum_cache,
                                  Tagged<HeapObject> undefined_value,
-                                 int nof_descriptors, int slack,
-                                 uint32_t raw_gc_state) {
+                                 int nof_descriptors, int slack) {
   DCHECK_GE(nof_descriptors, 0);
   DCHECK_GE(slack, 0);
   DCHECK_LE(nof_descriptors + slack, kMaxNumberOfDescriptors);
   set_number_of_all_descriptors(nof_descriptors + slack, kReleaseStore);
   set_number_of_descriptors(nof_descriptors);
-  set_raw_gc_state(raw_gc_state, kRelaxedStore);
   set_enum_cache(empty_enum_cache, SKIP_WRITE_BARRIER);
   set_flags(FastIterableBits::encode(FastIterableState::kUnknown),
             kRelaxedStore);
-#if TAGGED_SIZE_8_BYTES
-  optional_padding_ = 0;
-#endif
   MemsetTagged(GetDescriptorSlot(0), undefined_value,
                number_of_all_descriptors() * kEntrySize);
 }
@@ -4914,8 +4909,8 @@ Handle<Object> JSPromise::TriggerPromiseReactions(
     // https://html.spec.whatwg.org/C/#enqueuejob(queuename,-job,-arguments)
     DirectHandle<NativeContext> handler_context;
 
-    DirectHandle<UnionOf<Undefined, JSCallable>> primary_handler;
-    DirectHandle<UnionOf<Undefined, JSCallable>> secondary_handler;
+    DirectHandle<PromiseReactionHandler> primary_handler;
+    DirectHandle<PromiseReactionHandler> secondary_handler;
     if (type == PromiseReaction::kFulfill) {
       primary_handler = direct_handle(reaction->fulfill_handler(), isolate);
       secondary_handler = direct_handle(reaction->reject_handler(), isolate);
@@ -4926,14 +4921,28 @@ Handle<Object> JSPromise::TriggerPromiseReactions(
 
     bool has_handler_context = false;
     if (IsJSReceiver(*primary_handler)) {
-      has_handler_context =
-          JSReceiver::GetContextForMicrotask(Cast<JSReceiver>(primary_handler))
-              .ToHandle(&handler_context);
+      if (IsJSGeneratorObject(*primary_handler)) {
+        Tagged<Context> context =
+            Cast<JSGeneratorObject>(*primary_handler)->context();
+        handler_context = direct_handle(context->native_context(), isolate);
+        has_handler_context = true;
+      } else {
+        has_handler_context = JSReceiver::GetContextForMicrotask(
+                                  Cast<JSReceiver>(primary_handler))
+                                  .ToHandle(&handler_context);
+      }
     }
     if (!has_handler_context && IsJSReceiver(*secondary_handler)) {
-      has_handler_context = JSReceiver::GetContextForMicrotask(
-                                Cast<JSReceiver>(secondary_handler))
-                                .ToHandle(&handler_context);
+      if (IsJSGeneratorObject(*secondary_handler)) {
+        Tagged<Context> context =
+            Cast<JSGeneratorObject>(*secondary_handler)->context();
+        handler_context = direct_handle(context->native_context(), isolate);
+        has_handler_context = true;
+      } else {
+        has_handler_context = JSReceiver::GetContextForMicrotask(
+                                  Cast<JSReceiver>(secondary_handler))
+                                  .ToHandle(&handler_context);
+      }
     }
     if (!has_handler_context) handler_context = isolate->native_context();
 
@@ -4968,7 +4977,8 @@ Handle<Object> JSPromise::TriggerPromiseReactions(
           kReleaseStore);
       Cast<PromiseRejectReactionJobTask>(task)->set_argument(*argument);
       Cast<PromiseRejectReactionJobTask>(task)->set_context(*handler_context);
-      Cast<PromiseRejectReactionJobTask>(task)->set_handler(*primary_handler);
+      Cast<PromiseRejectReactionJobTask>(task)->set_handler(
+          *primary_handler);
       static_assert(
           static_cast<int>(offsetof(PromiseReaction, promise_or_capability_)) ==
           static_cast<int>(

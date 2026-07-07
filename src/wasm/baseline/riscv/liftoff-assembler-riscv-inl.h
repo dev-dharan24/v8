@@ -159,7 +159,7 @@ void LiftoffAssembler::PatchPrepareStackFrame(
   // assembler to try to grow the buffer.
   constexpr int kAvailableSpace = 256;
   MacroAssembler patching_assembler(
-      zone(), AssemblerOptions{}, CodeObjectRequired::kNo,
+      zone(), AssemblerOptions{}, CodeObjectRequired{false},
       ExternalAssemblerBuffer(buffer_start_ + offset, kAvailableSpace));
   Assembler::BlockPoolsScope block_pools_patch(&patching_assembler);
 
@@ -2639,19 +2639,31 @@ bool LiftoffAssembler::emit_f16x8_sqrt(LiftoffRegister dst,
 }
 bool LiftoffAssembler::emit_f16x8_ceil(LiftoffRegister dst,
                                        LiftoffRegister src) {
-  return false;
+  if (!CpuFeatures::IsSupported(ZVFH)) return false;
+  VU.SetSimd128(E16);
+  Ceil(dst.simd128(), src.simd128(), kScratchReg, kSimd128ScratchReg);
+  return true;
 }
 bool LiftoffAssembler::emit_f16x8_floor(LiftoffRegister dst,
                                         LiftoffRegister src) {
-  return false;
+  if (!CpuFeatures::IsSupported(ZVFH)) return false;
+  VU.SetSimd128(E16);
+  Floor(dst.simd128(), src.simd128(), kScratchReg, kSimd128ScratchReg);
+  return true;
 }
 bool LiftoffAssembler::emit_f16x8_trunc(LiftoffRegister dst,
                                         LiftoffRegister src) {
-  return false;
+  if (!CpuFeatures::IsSupported(ZVFH)) return false;
+  VU.SetSimd128(E16);
+  Trunc(dst.simd128(), src.simd128(), kScratchReg, kSimd128ScratchReg);
+  return true;
 }
 bool LiftoffAssembler::emit_f16x8_nearest_int(LiftoffRegister dst,
                                               LiftoffRegister src) {
-  return false;
+  if (!CpuFeatures::IsSupported(ZVFH)) return false;
+  VU.SetSimd128(E16);
+  Round(dst.simd128(), src.simd128(), kScratchReg, kSimd128ScratchReg);
+  return true;
 }
 
 bool LiftoffAssembler::emit_f16x8_add(LiftoffRegister dst, LiftoffRegister lhs,

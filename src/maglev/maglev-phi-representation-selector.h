@@ -68,7 +68,7 @@ class MaglevPhiRepresentationSelector {
     }
   }
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block);
-  void PostProcessBasicBlock(BasicBlock* block);
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block);
   void PostPhiProcessing() {}
 
   enum ProcessPhiResult { kNone, kRetryOnChange, kChanged };
@@ -243,7 +243,9 @@ class MaglevPhiRepresentationSelector {
                                    const ProcessingState* state);
   ProcessResult UpdateNodePhiInput(CheckNumber* node, Phi* phi, int input_index,
                                    const ProcessingState* state);
-
+  ProcessResult UpdateNodePhiInput(AssumeTaggedType* node, Phi* phi,
+                                   int input_index,
+                                   const ProcessingState* state);
   ProcessResult UpdateNodePhiInput(BranchIfToBooleanTrue* node, Phi* phi,
                                    int input_index,
                                    const ProcessingState* state);

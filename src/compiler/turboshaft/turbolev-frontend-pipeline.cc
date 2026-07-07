@@ -7,11 +7,11 @@
 #include <iomanip>
 
 #include "src/base/logging.h"
+#include "src/common/synchronization-point-support.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/pipeline-statistics.h"
 #include "src/flags/flags.h"
 #include "src/heap/read-only-heap.h"
-#include "src/init/isolate-group.h"
 #include "src/maglev/maglev-compilation-info.h"
 #include "src/maglev/maglev-compilation-unit.h"
 #include "src/maglev/maglev-graph-builder.h"
@@ -32,6 +32,7 @@
 #include "src/maglev/maglev-range-analysis.h"
 #include "src/maglev/maglev-range-verification.h"
 #include "src/maglev/maglev-truncation.h"
+#include "src/maglev/turbolev-escape-analysis.h"
 
 namespace v8::internal::compiler::turboshaft {
 
@@ -225,6 +226,18 @@ struct PhiUntaggingPhase {
   }
 };
 
+struct EscapeAnalysisPhase {
+  DECL_TURBOLEV_PHASE_CONSTANTS(EscapeAnalysis)
+
+  bool Run(maglev::Graph* graph) {
+    maglev::MaglevCompilationInfo* compilation_info = graph->compilation_info();
+    // TODO(dmercadier): use a proper temporary zone.
+    Zone* temp_zone = graph->zone();
+    maglev::EscapeAnalysis::Run(graph, compilation_info, temp_zone);
+    return true;
+  }
+};
+
 struct RangeAnalysisPhase {
   DECL_TURBOLEV_PHASE_CONSTANTS(RangeAnalysis)
 
@@ -253,10 +266,35 @@ struct PostOptimizerPhase {
     maglev::MaglevGraphOptimizer optimizer(graph, kna_processor, ranges);
     maglev::GraphMultiProcessor<maglev::MaglevGraphOptimizer&,
                                 maglev::ReachableExceptionHandlerTracker&,
+                                maglev::RecomputeKnownNodeAspectsProcessor&>
+        optimization_pass(optimizer, exception_handler_tracker, kna_processor);
+    optimization_pass.ProcessGraph(graph);
+
+    // Remove unreachable blocks if we have any.
+    if (graph->may_have_unreachable_blocks()) {
+      graph->RemoveUnreachableBlocks();
+    }
+    return true;
+  }
+};
+
+struct PrePhiUntaggingPhase {
+  DECL_TURBOLEV_PHASE_CONSTANTS(PrePhiUntagging)
+
+  bool Run(maglev::Graph* graph) {
+    maglev::ReachableExceptionHandlerTracker exception_handler_tracker(graph);
+    maglev::RecomputeKnownNodeAspectsProcessor kna_processor(
+        graph, exception_handler_tracker);
+    maglev::MaglevGraphOptimizer optimizer(graph, kna_processor,
+                                           /*ranges=*/nullptr);
+    maglev::GraphMultiProcessor<maglev::MaglevGraphOptimizer&,
+                                maglev::ReachableExceptionHandlerTracker&,
                                 maglev::RecomputeKnownNodeAspectsProcessor&,
-                                maglev::RecomputePhiUseHintsProcessor>
+                                maglev::RecomputePhiUseHintsProcessor,
+                                maglev::BoundsCheckEliminationProcessor>
         optimization_pass(optimizer, exception_handler_tracker, kna_processor,
-                          maglev::RecomputePhiUseHintsProcessor{graph->zone()});
+                          maglev::RecomputePhiUseHintsProcessor{graph->zone()},
+                          maglev::BoundsCheckEliminationProcessor{graph});
     optimization_pass.ProcessGraph(graph);
 
     // Remove unreachable blocks if we have any.
@@ -271,12 +309,15 @@ struct PostHocPhase {
   DECL_TURBOLEV_PHASE_CONSTANTS(AnyUseMarking)
 
   bool Run(maglev::Graph* graph) {
-    // Unwrap deopt frames before escape analysis.
-    graph->UnwrapDeoptFrames();
+    if (!v8_flags.turbolev_escape_analysis) {
+      // Unwrap deopt frames before escape analysis.
+      graph->UnwrapDeoptFrames();
+    }
     // Escape analysis.
     maglev::GraphMultiProcessor<maglev::ReturnedValueRepresentationSelector,
                                 maglev::AnyUseMarkingProcessor>
-        processor;
+        processor(
+            maglev::AnyUseMarkingProcessor{!v8_flags.turbolev_escape_analysis});
     processor.ProcessGraph(graph);
     return true;
   }
@@ -288,7 +329,7 @@ struct DeadNodeSweepingPhase {
   bool Run(maglev::Graph* graph) {
     // Dead nodes elimination (which, amongst other things, cleans up the left
     // overs of escape analysis).
-    maglev::GraphMultiProcessor<maglev::DeadNodeSweepingProcessor> processor;
+    maglev::GraphProcessor<maglev::DeadNodeSweepingProcessor> processor;
     processor.ProcessGraph(graph);
     return true;
   }
@@ -305,7 +346,7 @@ auto TurbolevFrontendPipeline::Run(Args&&... args) {
                                                  Phase::kCounterMode);
 #endif
   Phase phase;
-  SYNCHRONIZATION_POINT_FOR_TESTING(Phase::synchronization_point_name());
+  SYNCHRONIZATION_POINT(Phase::synchronization_point_name());
   bool result = phase.Run(graph_, std::forward<Args>(args)...);
   if (V8_UNLIKELY(ShouldPrintMaglevGraph())) {
     PrintMaglevGraph(Phase::phase);
@@ -331,29 +372,20 @@ std::optional<maglev::Graph*> TurbolevFrontendPipeline::Run() {
   if (v8_flags.turbolev_non_eager_inlining) {
     if (!Run<InlinerPhase>()) return {};
   }
-  // TODO(victorgomes): Re-evaluate pipeline. Running the PostOptimizerPhase
-  // before the Truncation phase would make sense to make truncations better
-  // based on the optimizations that loop peeling enabled.
-  bool rerun_postoptimizer_phase = false;
   if (v8_flags.turbolev_non_eager_loop_peeling) {
     if (Run<LoopPeelerPhase>()) {
-      rerun_postoptimizer_phase = true;
+      Run<PostOptimizerPhase>(nullptr);
     }
   }
   if (v8_flags.maglev_truncation && graph_->may_have_truncation()) {
     Run<TruncationPhase>();
-    rerun_postoptimizer_phase = true;
   }
-  if (graph_->compilation_info()->flags().enable_truncated_int32_phis) {
-    // This only needs to run unless we have accurate usage hints.
-    // TODO(turbolev): sort out perf problems blocking
-    // https://chromium-review.git.corp.google.com/c/v8/v8/+/7595239 from
-    // landing.
-    rerun_postoptimizer_phase = true;
+  // TODO(turbolev): sort out perf problems blocking
+  // https://chromium-review.git.corp.google.com/c/v8/v8/+/7595239 from landing.
+  if (v8_flags.turbolev_untagged_phis) {
+    Run<PrePhiUntaggingPhase>();
   }
-  if (rerun_postoptimizer_phase) {
-    Run<PostOptimizerPhase>(nullptr);
-  }
+  graph_->UnwrapDeoptFrames();
   if (v8_flags.turbolev_untagged_phis) {
     Run<PhiUntaggingPhase>();
   }
@@ -361,6 +393,11 @@ std::optional<maglev::Graph*> TurbolevFrontendPipeline::Run() {
     maglev::NodeRanges ranges(graph_);
     Run<RangeAnalysisPhase>(ranges);
     Run<PostOptimizerPhase>(&ranges);
+  }
+  if (v8_flags.turbolev_escape_analysis) {
+    // TODO(dmercadier): it would make sense to run this before Phi untagging so
+    // that Phi untagging can untag the Phis created by Escape Analysis.
+    Run<EscapeAnalysisPhase>();
   }
   Run<PostHocPhase>();
   Run<DeadNodeSweepingPhase>();

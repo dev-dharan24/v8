@@ -91,7 +91,7 @@ RegExpMacroAssemblerLOONG64::RegExpMacroAssemblerLOONG64(Isolate* isolate,
                                                          int registers_to_save)
     : NativeRegExpMacroAssembler(isolate, zone, mode),
       masm_(std::make_unique<MacroAssembler>(
-          isolate, CodeObjectRequired::kYes,
+          isolate, CodeObjectRequired{true},
           NewAssemblerBuffer(kInitialBufferSize))),
       no_root_array_scope_(masm_.get()),
       num_registers_(registers_to_save),
@@ -1347,12 +1347,6 @@ void RegExpMacroAssemblerLOONG64::AssertAboveStackLimitMinusSlack() {
 void RegExpMacroAssemblerLOONG64::LoadCurrentCharacterUnchecked(
     int cp_offset, int characters) {
   Register offset = current_input_offset();
-
-  // If unaligned load/stores are not supported then this function must only
-  // be used to load a single character at a time.
-  if (!CanReadUnaligned()) {
-    DCHECK_EQ(1, characters);
-  }
 
   if (cp_offset != 0) {
     // t3 is not being used to store the capture start index at this point.

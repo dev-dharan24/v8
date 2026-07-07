@@ -11,10 +11,12 @@
 #include "src/codegen/tick-counter.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
+#include "src/compiler/access-builder.h"
 #include "src/compiler/bytecode-analysis.h"
 #include "src/compiler/common-operator.h"
 #include "src/compiler/compilation-dependencies.h"
 #include "src/compiler/compiler-source-position-table.h"
+#include "src/compiler/frame-states.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/js-type-hint-lowering.h"
 #include "src/compiler/linkage.h"
@@ -2538,6 +2540,22 @@ void BytecodeGraphBuilder::VisitCreateArrayFromIterable() {
   environment()->BindAccumulator(iterable, Environment::kAttachFrameState);
 }
 
+void BytecodeGraphBuilder::VisitArrayDestructure() {
+  Node* receiver = environment()->LookupAccumulator();
+  uint32_t count = bytecode_iterator().GetRegisterCountOperand(1);
+  interpreter::RegisterList outputs =
+      bytecode_iterator().GetRegisterListOperand(0);
+  int first_reg = outputs.first_register().index();
+  Node* result =
+      NewNode(javascript()->ArrayDestructure(count, first_reg), receiver);
+  if (count == 0) {
+    environment()->RecordAfterState(result, Environment::kAttachFrameState);
+  } else {
+    environment()->BindRegistersToProjections(outputs.first_register(), result,
+                                              Environment::kAttachFrameState);
+  }
+}
+
 void BytecodeGraphBuilder::VisitCreateObjectLiteral() {
   ObjectBoilerplateDescriptionRef constant_properties =
       MakeRefForConstantPoolOperand<ObjectBoilerplateDescription>(0);
@@ -4226,6 +4244,7 @@ void BytecodeGraphBuilder::SwitchToMergeEnvironment(int current_offset) {
 void BytecodeGraphBuilder::BuildLoopHeaderEnvironment(int current_offset) {
   if (bytecode_analysis().IsLoopHeader(current_offset)) {
     mark_as_needing_eager_checkpoint(true);
+    PrepareEagerCheckpoint();
     const LoopInfo& loop_info =
         bytecode_analysis().GetLoopInfoFor(current_offset);
     const BytecodeLivenessState* liveness =
@@ -4254,10 +4273,16 @@ void BytecodeGraphBuilder::BuildLoopHeaderEnvironment(int current_offset) {
       environment()->BindGeneratorState(
           jsgraph()->SmiConstant(JSGeneratorObject::kGeneratorExecuting));
     }
+    mark_as_needing_eager_checkpoint(true);
   }
 }
 
 void BytecodeGraphBuilder::MergeIntoSuccessorEnvironment(int target_offset) {
+  if (bytecode_analysis().IsLoopHeader(target_offset) &&
+      bytecode_iterator().current_offset() > target_offset) {
+    mark_as_needing_eager_checkpoint(true);
+    PrepareEagerCheckpoint();
+  }
   BuildLoopExitsForBranch(target_offset);
   Environment*& merge_environment = merge_environments_[target_offset];
 

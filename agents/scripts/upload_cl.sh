@@ -3,6 +3,8 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 MODE="$1"
 CHECK_MODE="$2"
 PATCH_MSG="${3:-Update patchset}"
@@ -22,6 +24,59 @@ if [ "$CHECK_MODE" != "check" ] && [ "$CHECK_MODE" != "nocheck" ]; then
   echo "Error: Second argument must be 'check' or 'nocheck'."
   echo "Usage: upload_cl.sh <new|cur> <check|nocheck> [patchset_message]"
   exit 1
+fi
+
+# Shift positional parameters so "$@" contains any additional flags passed to upload_cl.sh
+if [ $# -ge 3 ]; then
+  shift 3
+else
+  shift $#
+fi
+
+# Guardrail: Check commit description line lengths (max 78 chars, ignoring lines with URLs)
+DESC_TO_CHECK=""
+CHECK_DESC=false
+HAS_CUSTOM_DESC=false
+
+prev_arg=""
+for arg in "$@"; do
+  if [[ "$arg" == --commit-description=* ]] || [[ "$arg" == --message=* ]] || [[ "$arg" == -m=* ]]; then
+    HAS_CUSTOM_DESC=true
+    val="${arg#*=}"
+    if [ "$val" != "+" ]; then
+      DESC_TO_CHECK="$val"
+      CHECK_DESC=true
+    else
+      DESC_TO_CHECK=$(git log -1 --pretty=%B 2>/dev/null)
+      CHECK_DESC=true
+    fi
+  elif [ "$arg" == "-m+" ]; then
+    HAS_CUSTOM_DESC=true
+    DESC_TO_CHECK=$(git log -1 --pretty=%B 2>/dev/null)
+    CHECK_DESC=true
+  elif [ "$prev_arg" == "--commit-description" ] || [ "$prev_arg" == "--message" ] || [ "$prev_arg" == "-m" ]; then
+    HAS_CUSTOM_DESC=true
+    if [ "$arg" != "+" ]; then
+      DESC_TO_CHECK="$arg"
+      CHECK_DESC=true
+    else
+      DESC_TO_CHECK=$(git log -1 --pretty=%B 2>/dev/null)
+      CHECK_DESC=true
+    fi
+  elif [ "$arg" == "--commit-description" ] || [ "$arg" == "--message" ] || [ "$arg" == "-m" ]; then
+    HAS_CUSTOM_DESC=true
+  fi
+  prev_arg="$arg"
+done
+
+# If uploading a new CL and no explicit commit description flag was passed, check local commit message
+if [ "$CHECK_DESC" = false ] && [ "$MODE" = "new" ]; then
+  DESC_TO_CHECK=$(git log -1 --pretty=%B 2>/dev/null)
+  CHECK_DESC=true
+fi
+
+if [ "$CHECK_DESC" = true ] && [ -n "$DESC_TO_CHECK" ]; then
+  echo "$DESC_TO_CHECK" | "$SCRIPT_DIR/validate_cl_description.py" || exit 1
 fi
 
 # Guardrail: Early authentication check
@@ -60,7 +115,6 @@ fi
 
 # Guardrail: Ensure gm.py release checks pass if check requested
 if [ "$CHECK_MODE" = "check" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   V8_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
   ARCH=$(uname -m)
@@ -93,14 +147,18 @@ if [ "$MODE" = "new" ]; then
     echo "Error: Mode 'new' specified, but git cl issue reports this branch is already associated with an issue."
     exit 1
   fi
-  UPLOAD_OUTPUT=$(SKIP_GCE_AUTH_FOR_GIT=1 EDITOR=cat git cl upload --commit-description=+ -t "Initial upload" 2>&1)
+  if [ "$HAS_CUSTOM_DESC" = true ]; then
+    UPLOAD_OUTPUT=$(SKIP_GCE_AUTH_FOR_GIT=1 EDITOR=cat git cl upload -t "Initial upload" "$@" 2>&1)
+  else
+    UPLOAD_OUTPUT=$(SKIP_GCE_AUTH_FOR_GIT=1 EDITOR=cat git cl upload --commit-description=+ -t "Initial upload" "$@" 2>&1)
+  fi
   UPLOAD_STATUS=$?
 else
   if [ "$HAS_ISSUE" = false ]; then
-    echo "Error: Mode 'cur' specified, but git cl issue reports no issue associated with this branch. Link with the existing issue using `git cl issue <issue-id>`."
+    echo "Error: Mode 'cur' specified, but git cl issue reports no issue associated with this branch. Link with the existing issue using \`git cl issue <issue-id>\`."
     exit 1
   fi
-  UPLOAD_OUTPUT=$(SKIP_GCE_AUTH_FOR_GIT=1 EDITOR=cat git cl upload -t "$PATCH_MSG" 2>&1)
+  UPLOAD_OUTPUT=$(SKIP_GCE_AUTH_FOR_GIT=1 EDITOR=cat git cl upload -t "$PATCH_MSG" "$@" 2>&1)
   UPLOAD_STATUS=$?
 fi
 

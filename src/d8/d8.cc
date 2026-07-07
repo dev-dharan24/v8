@@ -27,6 +27,7 @@
 #include "third_party/vtune/v8-vtune.h"
 #endif
 
+#include "include/cppgc/allocation.h"
 #include "include/libplatform/libplatform.h"
 #include "include/libplatform/v8-tracing.h"
 #include "include/v8-data.h"
@@ -37,6 +38,7 @@
 #include "include/v8-isolate.h"
 #include "include/v8-json.h"
 #include "include/v8-locker.h"
+#include "include/v8-platform.h"
 #include "include/v8-profiler.h"
 #include "include/v8-wasm.h"
 #include "src/api/api-inl.h"
@@ -95,6 +97,7 @@
 #endif  // V8_ENABLE_MAGLEV
 
 #ifdef V8_ENABLE_PARTITION_ALLOC
+#include "third_party/partition_alloc/src/partition_alloc/partition_alloc.h"
 #include "third_party/partition_alloc/src/partition_alloc/partition_root.h"
 #include "third_party/partition_alloc/src/partition_alloc/shim/allocator_shim_default_dispatch_to_partition_alloc.h"
 #endif  // V8_ENABLE_PARTITION_ALLOC
@@ -415,25 +418,7 @@ class MultiMappedAllocator : public ArrayBufferAllocatorBase {
 v8::Platform* g_default_platform;
 std::unique_ptr<v8::Platform> g_platform;
 
-template <int N>
-void ThrowError(Isolate* isolate, const char (&message)[N]) {
-  if (isolate->IsExecutionTerminating()) return;
-  isolate->ThrowError(message);
-}
 
-void ThrowError(Isolate* isolate, std::string_view message) {
-  if (isolate->IsExecutionTerminating()) return;
-  Local<String> exception =
-      String::NewFromUtf8(
-          isolate, std::string(message.substr(0, String::kMaxLength)).c_str())
-          .ToLocalChecked();
-  isolate->ThrowError(exception);
-}
-
-void ThrowException(Isolate* isolate, Local<Value> exception) {
-  if (isolate->IsExecutionTerminating()) return;
-  isolate->ThrowException(exception);
-}
 
 static MaybeLocal<Value> TryGetValue(v8::Isolate* isolate,
                                      Local<Context> context,
@@ -475,6 +460,99 @@ base::Thread::Options GetThreadOptions(const char* name) {
 }
 
 }  // namespace
+
+#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_ENABLE_PARTITION_ALLOC
+
+class PAInSandboxAllocator final : public v8::Allocator {
+ public:
+  explicit PAInSandboxAllocator(i::Sandbox* sandbox) {
+    const size_t max_pool_size = partition_alloc::internal::
+        PartitionAddressSpace::ConfigurablePoolMaxSize();
+    const size_t min_pool_size = partition_alloc::internal::
+        PartitionAddressSpace::ConfigurablePoolMinSize();
+    size_t pool_size = max_pool_size;
+    // Try to reserve the maximum size of the pool at first, then keep halving
+    // the size on failure until it succeeds.
+    uintptr_t pool_base = 0;
+    while (!pool_base && pool_size >= min_pool_size) {
+      pool_base = sandbox->address_space()->AllocatePages(
+          VirtualAddressSpace::kNoHint, pool_size, pool_size,
+          v8::PagePermissions::kNoAccess);
+      if (!pool_base) {
+        pool_size /= 2;
+      }
+    }
+    // The V8 sandbox is guaranteed to be large enough to host the pool.
+    CHECK(pool_base);
+    // Call PartitionAddressSpace::Init() first just to make sure metadata
+    // region start is initialized and the configurable pool allocations do have
+    // out-of-line metadata.
+    partition_alloc::internal::PartitionAddressSpace::Init();
+    partition_alloc::internal::PartitionAddressSpace::InitConfigurablePool(
+        pool_base, pool_size);
+
+    partition_alloc::PartitionOptions opts;
+    opts.backup_ref_ptr = partition_alloc::PartitionOptions::kDisabled;
+    opts.use_configurable_pool = partition_alloc::PartitionOptions::kAllowed;
+    partition_.init(std::move(opts));
+
+    // Also adjust the limits for dirty bytes and slot span ring size in the
+    // ArrayBuffer partition root assuming we are running foregrounded.
+    constexpr int kForegroundMaxEmptySlotSpansDirtyBytesShift = 2;
+    partition_.root()->AdjustSlotSpanRing(
+        partition_alloc::internal::kMaxEmptySlotSpanRingSize,
+        kForegroundMaxEmptySlotSpansDirtyBytesShift);
+  }
+
+  ~PAInSandboxAllocator() {
+    // Intentionally leak pages here. The sandbox is never destroyed in d8.
+  }
+
+  PAInSandboxAllocator(const PAInSandboxAllocator&) = delete;
+  PAInSandboxAllocator& operator=(const PAInSandboxAllocator&) = delete;
+
+  void* Allocate(size_t size) override {
+    constexpr partition_alloc::AllocFlags flags =
+        partition_alloc::AllocFlags::kZeroFill |
+        partition_alloc::AllocFlags::kReturnNull;
+    return AllocateInternal<flags>(size);
+  }
+
+  void* AllocateUninitialized(size_t size) override {
+    constexpr partition_alloc::AllocFlags flags =
+        partition_alloc::AllocFlags::kReturnNull;
+    return AllocateInternal<flags>(size);
+  }
+
+  void* AllocateUninitializedOrCrash(size_t size) override {
+    return AllocateInternal<partition_alloc::AllocFlags::kNone>(size);
+  }
+
+  void Free(void* ptr) override {
+    partition_.root()->Free<partition_alloc::FreeFlags::kNoMemoryToolOverride>(
+        ptr);
+  }
+
+ private:
+  template <partition_alloc::AllocFlags flags>
+  void* AllocateInternal(size_t length) {
+    // The V8 sandbox requires all ArrayBuffer backing stores to be allocated
+    // inside the sandbox address space. This isn't guaranteed if allocation
+    // override hooks (which are e.g. used by GWP-ASan) are enabled or if a
+    // memory tool (e.g. ASan) overrides malloc, so disable both.
+    constexpr auto new_flags =
+        flags | partition_alloc::AllocFlags::kNoOverrideHooks |
+        partition_alloc::AllocFlags::kNoMemoryToolOverride;
+    return partition_.root()->AllocInline<new_flags>(length,
+                                                     "PAInSandboxAllocator");
+  }
+
+  partition_alloc::PartitionAllocator partition_;
+};
+
+#endif  // V8_ENABLE_PARTITION_ALLOC
+#endif  // V8_ENABLE_SANDBOX
 
 namespace tracing {
 
@@ -1081,7 +1159,7 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
     i::Handle<i::Script> script = parse_info.CreateScript(
         i_isolate, str, i::kNullMaybeHandle, ScriptOriginOptions());
     if (!i::parsing::ParseProgram(&parse_info, script, i_isolate,
-                                  i::parsing::ReportStatisticsMode::kYes)) {
+                                  i::parsing::ReportStatisticsMode{true})) {
       parse_info.pending_error_handler()->PrepareErrors(
           i_isolate, parse_info.ast_value_factory());
       parse_info.pending_error_handler()->ReportErrors(i_isolate, script);
@@ -1106,7 +1184,7 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
 
   PerIsolateData* data = PerIsolateData::Get(isolate);
   Local<Context> realm =
-      Local<Context>::New(isolate, data->realms_[data->realm_current_]);
+      Local<Context>::New(isolate, data->realms_[data->realm_current_].context);
   Context::Scope context_scope(realm);
   Local<Context> context(isolate->GetCurrentContext());
   ScriptOrigin origin = CreateScriptOrigin(isolate, name, ScriptType::kClassic);
@@ -1723,7 +1801,8 @@ void Shell::ModuleResolutionSuccessCallback(
           .ToLocalChecked());
 
   PerIsolateData* data = PerIsolateData::Get(isolate);
-  Local<Context> realm = data->realms_[data->realm_current_].Get(isolate);
+  Local<Context> realm =
+      data->realms_[data->realm_current_].context.Get(isolate);
   Context::Scope context_scope(realm);
 
   resolver->Resolve(realm, namespace_or_source).ToChecked();
@@ -1743,7 +1822,8 @@ void Shell::ModuleResolutionFailureCallback(
           .As<Promise::Resolver>());
 
   PerIsolateData* data = PerIsolateData::Get(isolate);
-  Local<Context> realm = data->realms_[data->realm_current_].Get(isolate);
+  Local<Context> realm =
+      data->realms_[data->realm_current_].context.Get(isolate);
   Context::Scope context_scope(realm);
 
   DCHECK_EQ(info.Length(), 1);
@@ -2067,7 +2147,8 @@ bool Shell::ExecuteModule(Isolate* isolate, const char* file_name) {
 
   {
     PerIsolateData* data = PerIsolateData::Get(isolate);
-    Local<Context> realm = data->realms_[data->realm_current_].Get(isolate);
+    Local<Context> realm =
+        data->realms_[data->realm_current_].context.Get(isolate);
     Context::Scope context_scope(realm);
 
     std::string absolute_path =
@@ -2146,7 +2227,7 @@ bool Shell::ExecuteModule(Isolate* isolate, const char* file_name) {
       // TODO(cbruni): Clean this up after we create a new API for the case
       // where TLA is enabled.
       if (!try_catch.HasCaught()) {
-        isolate->ThrowException(result_promise->Result());
+        ThrowException(isolate, result_promise->Result());
       } else {
         DCHECK_EQ(try_catch.Exception(), result_promise->Result());
       }
@@ -2178,7 +2259,7 @@ bool Shell::LoadJSON(Isolate* isolate, const char* file_name) {
   HandleScope handle_scope(isolate);
   PerIsolateData* isolate_data = PerIsolateData::Get(isolate);
   Local<Context> realm =
-      isolate_data->realms_[isolate_data->realm_current_].Get(isolate);
+      isolate_data->realms_[isolate_data->realm_current_].context.Get(isolate);
   Context::Scope context_scope(realm);
   TryCatch try_catch(isolate);
 
@@ -2208,8 +2289,7 @@ bool Shell::LoadJSON(Isolate* isolate, const char* file_name) {
   return true;
 }
 
-PerIsolateData::PerIsolateData(Isolate* isolate)
-    : isolate_(isolate), realms_(nullptr) {
+PerIsolateData::PerIsolateData(Isolate* isolate) : isolate_(isolate) {
   isolate->SetData(0, this);
   if (i::v8_flags.expose_async_hooks) {
     async_hooks_wrapper_ = new AsyncHooks(isolate);
@@ -2348,11 +2428,10 @@ PerIsolateData::RealmScope::RealmScope(Isolate* isolate,
   CHECK_EQ(0, reinterpret_cast<i::Isolate*>(isolate)
                   ->default_microtask_queue()
                   ->size());
-  data_->realm_count_ = 1;
   data_->realm_current_ = 0;
   data_->realm_switch_ = 0;
-  data_->realms_ = new Global<Context>[1];
-  data_->realms_[0].Reset(data_->isolate_, context);
+  data_->realms_.clear();
+  data_->realms_.emplace_back(data_->isolate_, context);
 }
 
 PerIsolateData::RealmScope::~RealmScope() {
@@ -2362,14 +2441,13 @@ PerIsolateData::RealmScope::~RealmScope() {
       ->default_microtask_queue()
       ->ClearMicrotasks();
   // Drop realms to avoid keeping them alive.
-  data_->realm_count_ = 0;
-  delete[] data_->realms_;
+  data_->realms_.clear();
 }
 
 PerIsolateData::ExplicitRealmScope::ExplicitRealmScope(PerIsolateData* data,
                                                        int index)
     : data_(data), index_(index) {
-  realm_ = Local<Context>::New(data->isolate_, data->realms_[index_]);
+  realm_ = Local<Context>::New(data->isolate_, data->realms_[index_].context);
   realm_->Enter();
   previous_index_ = data->realm_current_;
   data->realm_stack_.push_back(previous_index_);
@@ -2388,8 +2466,8 @@ Local<Context> PerIsolateData::ExplicitRealmScope::context() const {
 }
 
 int PerIsolateData::RealmFind(Local<Context> context) {
-  for (int i = 0; i < realm_count_; ++i) {
-    if (realms_[i] == context) return i;
+  for (size_t i = 0; i < realms_.size(); ++i) {
+    if (realms_[i].context == context) return static_cast<int>(i);
   }
   return -1;
 }
@@ -2403,7 +2481,8 @@ int PerIsolateData::RealmIndexOrThrow(
   }
   int index =
       info[arg_offset]->Int32Value(isolate->GetCurrentContext()).FromMaybe(-1);
-  if (index < 0 || index >= realm_count_ || realms_[index].IsEmpty()) {
+  if (index < 0 || static_cast<size_t>(index) >= realms_.size() ||
+      realms_[index].context.IsEmpty()) {
     ThrowError(isolate, "Invalid realm index");
     return -1;
   }
@@ -2719,8 +2798,8 @@ void Shell::RealmOwner(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 bool Shell::ValidateRealmIndex(Isolate* isolate, PerIsolateData* data,
                                int index) {
-  if (index >= 0 && index < data->realm_count_ &&
-      !data->realms_[index].IsEmpty()) {
+  if (index >= 0 && static_cast<size_t>(index) < data->realms_.size() &&
+      !data->realms_[index].context.IsEmpty()) {
     return true;
   }
   ThrowError(isolate, "Invalid realm index");
@@ -2751,7 +2830,7 @@ void Shell::RealmGlobal(const v8::FunctionCallbackInfo<v8::Value>& info) {
   int index = data->RealmIndexOrThrow(info, 0);
   if (index == -1) return;
   Local<Object> global =
-      Local<Context>::New(isolate, data->realms_[index])->Global();
+      Local<Context>::New(isolate, data->realms_[index].context)->Global();
   // Sanity check that v8::Context::Global() returned global proxy.
   CHECK(IsJSGlobalProxy(*Utils::OpenDirectHandle(*global)));
   info.GetReturnValue().Set(global);
@@ -2759,7 +2838,7 @@ void Shell::RealmGlobal(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 MaybeLocal<Context> Shell::CreateRealm(
     const v8::FunctionCallbackInfo<v8::Value>& info, int index,
-    v8::MaybeLocal<Value> global_object) {
+    v8::MaybeLocal<Value> global_object, bool create_own_microtask_queue) {
   DCHECK(i::ValidateCallbackInfo(info));
   const char* kGlobalHandleLabel = "d8::realm";
   Isolate* isolate = info.GetIsolate();
@@ -2767,28 +2846,47 @@ MaybeLocal<Context> Shell::CreateRealm(
 
   TryCatch try_catch(isolate);
   PerIsolateData* data = PerIsolateData::Get(isolate);
-  if (index < 0) {
-    Global<Context>* old_realms = data->realms_;
-    index = data->realm_count_;
-    data->realms_ = new Global<Context>[++data->realm_count_];
-    for (int i = 0; i < index; ++i) {
-      Global<Context>& realm = data->realms_[i];
-      realm.Reset(isolate, old_realms[i]);
-      if (!realm.IsEmpty()) {
-        realm.AnnotateStrongRetainer(kGlobalHandleLabel);
-      }
-      old_realms[i].Reset();
-    }
-    delete[] old_realms;
-  }
+
   Local<ObjectTemplate> global_template = CreateGlobalTemplate(isolate);
+
+  v8::MicrotaskQueue* microtask_queue = nullptr;
+#ifdef V8_CPPGC_MICROTASK_QUEUE
+  if (create_own_microtask_queue) {
+    microtask_queue = v8::MicrotaskQueue::New(isolate);
+  }
+#else
+  std::unique_ptr<v8::MicrotaskQueue> new_mq;
+  if (create_own_microtask_queue) {
+    START_ALLOW_USE_DEPRECATED()
+    new_mq = v8::MicrotaskQueue::New(isolate);
+    END_ALLOW_USE_DEPRECATED()
+    microtask_queue = new_mq.get();
+  }
+#endif  // V8_CPPGC_MICROTASK_QUEUE
+
   Local<Context> context =
-      Context::New(isolate, nullptr, global_template, global_object);
+      Context::New(isolate, nullptr, global_template, global_object,
+                   DeserializeInternalFieldsCallback(), microtask_queue);
   if (context.IsEmpty()) return MaybeLocal<Context>();
   DCHECK(!try_catch.HasCaught());
   InitializeModuleEmbedderData(context);
-  data->realms_[index].Reset(isolate, context);
-  data->realms_[index].AnnotateStrongRetainer(kGlobalHandleLabel);
+
+  if (index < 0) {
+    index = static_cast<int>(data->realms_.size());
+#ifdef V8_CPPGC_MICROTASK_QUEUE
+    data->realms_.emplace_back(isolate, context);
+#else
+    data->realms_.emplace_back(isolate, context, std::move(new_mq));
+#endif
+  } else {
+    data->realms_[index].context.Reset(isolate, context);
+#ifndef V8_CPPGC_MICROTASK_QUEUE
+    data->realms_[index].microtask_queue = std::move(new_mq);
+#endif
+  }
+
+  data->realms_[index].context.AnnotateStrongRetainer(kGlobalHandleLabel);
+
   info.GetReturnValue().Set(index);
   return context;
 }
@@ -2798,8 +2896,11 @@ void Shell::DisposeRealm(const v8::FunctionCallbackInfo<v8::Value>& info,
   DCHECK(i::ValidateCallbackInfo(info));
   Isolate* isolate = info.GetIsolate();
   PerIsolateData* data = PerIsolateData::Get(isolate);
-  Local<Context> context = data->realms_[index].Get(isolate);
-  data->realms_[index].Reset();
+  Local<Context> context = data->realms_[index].context.Get(isolate);
+  data->realms_[index].context.Reset();
+#ifndef V8_CPPGC_MICROTASK_QUEUE
+  data->realms_[index].microtask_queue.reset();
+#endif
   context->DetachGlobal();
   // ContextDisposedNotification expects the disposed context to be entered.
   v8::Context::Scope scope(context);
@@ -2820,7 +2921,20 @@ void Shell::RealmCreate(const v8::FunctionCallbackInfo<v8::Value>& info) {
     return;
   }
 
-  CreateRealm(info, -1, v8::MaybeLocal<Value>());
+  bool create_own_microtask_queue = false;
+  if (info.Length() > 0 && info[0]->IsObject()) {
+    Local<Object> realm_options = info[0].As<Object>();
+    Local<Context> context = info.GetIsolate()->GetCurrentContext();
+    Local<Value> value;
+    if (realm_options
+            ->Get(context, String::NewFromUtf8Literal(
+                               info.GetIsolate(), "create_own_microtask_queue"))
+            .ToLocal(&value)) {
+      create_own_microtask_queue = value->BooleanValue(info.GetIsolate());
+    }
+  }
+
+  CreateRealm(info, -1, v8::MaybeLocal<Value>(), create_own_microtask_queue);
 }
 
 // Realm.createAllowCrossRealmAccess() creates a new realm with the same
@@ -2857,7 +2971,8 @@ void Shell::RealmNavigate(const v8::FunctionCallbackInfo<v8::Value>& info) {
   // realm we are currently switching to.
   if (!ValidateRestrictedRealmIndex(isolate, data, index)) return;
 
-  Local<Context> context = Local<Context>::New(isolate, data->realms_[index]);
+  Local<Context> context =
+      Local<Context>::New(isolate, data->realms_[index].context);
   v8::Local<Value> global = context->Global();
   CHECK(!global.IsEmpty());
 
@@ -2879,7 +2994,8 @@ void Shell::RealmNavigateSameOrigin(
   // realm we are currently switching to.
   if (!ValidateRestrictedRealmIndex(isolate, data, index)) return;
 
-  Local<Context> context = Local<Context>::New(isolate, data->realms_[index]);
+  Local<Context> context =
+      Local<Context>::New(isolate, data->realms_[index].context);
   v8::Local<Value> global = context->Global();
   context->DetachGlobal();
   CHECK(!global.IsEmpty());
@@ -2903,7 +3019,8 @@ void Shell::RealmDetachGlobal(const v8::FunctionCallbackInfo<v8::Value>& info) {
   if (!ValidateRestrictedRealmIndex(isolate, data, index)) return;
 
   HandleScope scope(isolate);
-  Local<Context> realm = Local<Context>::New(isolate, data->realms_[index]);
+  Local<Context> realm =
+      Local<Context>::New(isolate, data->realms_[index].context);
   realm->DetachGlobal();
 }
 
@@ -4650,16 +4767,16 @@ void Shell::ChangeDirectoryCallback(
   DCHECK(i::ValidateCallbackInfo(info));
   Isolate* isolate = info.GetIsolate();
   if (info.Length() != 1) {
-    isolate->ThrowError("chdir() takes one argument");
+    ThrowError(isolate, "chdir() takes one argument");
     return;
   }
   String::Utf8Value directory(isolate, info[0]);
   if (*directory == nullptr) {
-    isolate->ThrowError("os.chdir(): String conversion of argument failed.");
+    ThrowError(isolate, "os.chdir(): String conversion of argument failed.");
     return;
   }
   if (!Shell::ChangeWorkingDirectory(*directory, /*print_error=*/false)) {
-    isolate->ThrowError("os.chdir(): Failed to change directory");
+    ThrowError(isolate, "os.chdir(): Failed to change directory");
     return;
   }
 }
@@ -5054,7 +5171,12 @@ void Shell::Initialize(Isolate* isolate, D8Console* console,
 
 Local<String> Shell::WasmLoadSourceMapCallback(Isolate* isolate,
                                                const char* path) {
-  return Shell::ReadFile(isolate, path, false).ToLocalChecked();
+  MaybeLocal<String> result = Shell::ReadFile(isolate, path, false);
+  if (result.IsEmpty()) {
+    fprintf(stderr, "Error loading Wasm source map file '%s'\n", path);
+    return Local<String>();
+  }
+  return result.ToLocalChecked();
 }
 
 MaybeLocal<Context> Shell::CreateEvaluationContext(Isolate* isolate) {
@@ -6178,8 +6300,9 @@ void SourceGroup::ExecuteInThread() {
 
   {
     Isolate::Scope isolate_scope(isolate);
-    D8Console console(isolate);
-    Shell::Initialize(isolate, &console, false);
+    D8Console* console = cppgc::MakeGarbageCollected<D8Console>(
+        isolate->GetCppHeap()->GetAllocationHandle(), isolate);
+    Shell::Initialize(isolate, console, false);
     PerIsolateData data(isolate);
 
     for (int i = 0; i < Shell::options.stress_runs; ++i) {
@@ -6511,8 +6634,9 @@ void Worker::ExecuteInThread() {
 
   {
     Isolate::Scope isolate_scope(isolate_);
-    D8Console console(isolate_);
-    Shell::Initialize(isolate_, &console, false);
+    D8Console* console = cppgc::MakeGarbageCollected<D8Console>(
+        isolate_->GetCppHeap()->GetAllocationHandle(), isolate_);
+    Shell::Initialize(isolate_, console, false);
     PerIsolateData data(isolate_);
 
     CHECK(context_.IsEmpty());
@@ -6803,8 +6927,6 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       }
     } else if (FlagMatches("--ignore-unhandled-promises", &argv[i])) {
       options.ignore_unhandled_promises = true;
-    } else if (FlagMatches("--isolate", &argv[i], /*keep_flag=*/true)) {
-      options.num_isolates++;
     } else if (FlagMatches("--throws", &argv[i])) {
       options.expected_to_throw = true;
     } else if (FlagMatches("--no-fail", &argv[i])) {
@@ -6881,7 +7003,9 @@ bool Shell::SetOptions(int argc, char* argv[]) {
                FlagMatches("--memory-corruption-via-watchpoints", &argv[i])) {
       // The tracing flag also implies enabling the API.
       options.memory_corruption_via_watchpoints = true;
-      options.trace_memory_corruption_via_watchpoints = enable_tracing;
+      if (enable_tracing) {
+        options.trace_memory_corruption_via_watchpoints = true;
+      }
       // Imply --expose-memory-corruption-api.
       i::v8_flags.expose_memory_corruption_api = true;
 #endif  // V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
@@ -7052,6 +7176,12 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   }
 
   // Set up isolated source groups.
+  options.num_isolates = 1;
+  for (int i = 1; i < argc; i++) {
+    if (argv[i] != nullptr && strcmp(argv[i], "--isolate") == 0) {
+      options.num_isolates++;
+    }
+  }
   options.isolate_sources = new SourceGroup[options.num_isolates];
   internal::g_num_isolates_for_testing = options.num_isolates;
   SourceGroup* current = options.isolate_sources;
@@ -7360,7 +7490,7 @@ class Serializer : public ValueSerializer::Delegate {
  protected:
   // Implements ValueSerializer::Delegate.
   void ThrowDataCloneError(Local<String> message) override {
-    isolate_->ThrowException(Exception::Error(message));
+    ThrowException(isolate_, Exception::Error(message));
   }
 
   Maybe<uint32_t> GetSharedArrayBufferId(
@@ -7425,8 +7555,8 @@ class Serializer : public ValueSerializer::Delegate {
         Local<Value> element;
         if (transfer_array->Get(context, i).ToLocal(&element)) {
           if (!element->IsArrayBuffer()) {
-            isolate_->ThrowError(
-                "Transfer array elements must be an ArrayBuffer");
+            ThrowError(isolate_,
+                       "Transfer array elements must be an ArrayBuffer");
             return Nothing<bool>();
           }
 
@@ -7434,7 +7564,8 @@ class Serializer : public ValueSerializer::Delegate {
 
           if (std::find(array_buffers_.begin(), array_buffers_.end(),
                         array_buffer) != array_buffers_.end()) {
-            isolate_->ThrowError(
+            ThrowError(
+                isolate_,
                 "ArrayBuffer occurs in the transfer array more than once");
             return Nothing<bool>();
           }
@@ -7450,7 +7581,7 @@ class Serializer : public ValueSerializer::Delegate {
     } else if (transfer->IsUndefined()) {
       return Just(true);
     } else {
-      isolate_->ThrowError("Transfer list must be an Array or undefined");
+      ThrowError(isolate_, "Transfer list must be an Array or undefined");
       return Nothing<bool>();
     }
   }
@@ -7460,7 +7591,8 @@ class Serializer : public ValueSerializer::Delegate {
       Local<ArrayBuffer> array_buffer =
           Local<ArrayBuffer>::New(isolate_, global_array_buffer);
       if (!array_buffer->IsDetachable()) {
-        isolate_->ThrowError(
+        ThrowError(
+            isolate_,
             "ArrayBuffer is not detachable and could not be transferred");
         return Nothing<bool>();
       }
@@ -7820,6 +7952,13 @@ int Shell::Main(int argc, char* argv[]) {
   } else {
     v8::V8::InitializeExternalStartupData(argv[0]);
   }
+#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_ENABLE_PARTITION_ALLOC
+  v8::V8::SetInSandboxAllocator(
+      std::make_shared<PAInSandboxAllocator>(i::Sandbox::current()));
+#endif  // V8_ENABLE_PARTITION_ALLOC
+#endif  // V8_ENABLE_SANDBOX
+
   int result = 0;
   Isolate::CreateParams create_params = GetDefaultIsolateCreateParams();
   ShellArrayBufferAllocator shell_array_buffer_allocator;
@@ -7924,8 +8063,9 @@ int Shell::Main(int argc, char* argv[]) {
 
   {
     Isolate::Scope scope(isolate);
-    D8Console console(isolate);
-    Initialize(isolate, &console);
+    D8Console* console = cppgc::MakeGarbageCollected<D8Console>(
+        isolate->GetCppHeap()->GetAllocationHandle(), isolate);
+    Initialize(isolate, console);
     PerIsolateData data(isolate);
 
     if (i::v8_flags.sandbox_trap_fuzzing) {
@@ -8010,8 +8150,9 @@ int Shell::Main(int argc, char* argv[]) {
               i::v8_flags.hash_seed = i::v8_flags.hash_seed ^ 1337;
               {
                 Isolate::Scope isolate_scope(isolate2);
-                D8Console console2(isolate2);
-                Initialize(isolate2, &console2);
+                D8Console* console2 = cppgc::MakeGarbageCollected<D8Console>(
+                    isolate2->GetCppHeap()->GetAllocationHandle(), isolate2);
+                Initialize(isolate2, console2);
                 PerIsolateData data2(isolate2);
 
                 result = RunMain(isolate2, false);

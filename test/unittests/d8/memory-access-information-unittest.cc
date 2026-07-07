@@ -89,6 +89,33 @@ TEST(MemoryAccessInformationTest, ParseInstructionWidthAndExtension) {
     EXPECT_EQ(MemoryAccessInformation::kRead, info.kind);
     EXPECT_EQ(1, info.xmm_reg_index);
   }
+
+  // Test lddqu instruction.
+  {
+    MemoryAccessInformation info =
+        ParseMemoryAccessInformationFromInstruction("lddqu xmm0,[rdi]", regs);
+    EXPECT_EQ(MemoryAccessInformation::kRead, info.kind);
+    EXPECT_EQ(0, info.xmm_reg_index);
+    EXPECT_EQ(16, info.access_width);
+  }
+
+  // Test vlddqu instruction.
+  {
+    MemoryAccessInformation info =
+        ParseMemoryAccessInformationFromInstruction("vlddqu xmm1,[rsi]", regs);
+    EXPECT_EQ(MemoryAccessInformation::kRead, info.kind);
+    EXPECT_EQ(1, info.xmm_reg_index);
+    EXPECT_EQ(16, info.access_width);
+  }
+
+  // Test 3-operand SIMD instruction reading memory.
+  {
+    MemoryAccessInformation info = ParseMemoryAccessInformationFromInstruction(
+        "vpcmpeqb ymm1,ymm0,[rdi]", regs);
+    EXPECT_EQ(MemoryAccessInformation::kRead, info.kind);
+    EXPECT_EQ(1, info.xmm_reg_index);
+    EXPECT_EQ(1, info.access_width);
+  }
 }
 
 }  // namespace

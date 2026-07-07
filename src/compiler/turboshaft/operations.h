@@ -19,6 +19,7 @@
 #include "src/base/platform/mutex.h"
 #include "src/base/small-vector.h"
 #include "src/base/string-format.h"
+#include "src/base/strong-alias.h"
 #include "src/base/template-utils.h"
 #include "src/base/vector.h"
 #include "src/codegen/external-reference.h"
@@ -291,7 +292,8 @@ using Variable = SnapshotTable<OpIndex, VariableData>::Key;
   V(DebugPrint)                                 \
   V(CheckTurboshaftTypeOf)                      \
   V(CheckMaglevType)                            \
-  V(TypeHint)
+  V(TypeHint)                                   \
+  V(PrepareForLoop)
 
 // These Operations are the lowest level handled by Turboshaft, and are
 // supported by the InstructionSelector.
@@ -4163,6 +4165,24 @@ struct DeoptimizeIfOp : FixedArityOperationT<2, DeoptimizeIfOp> {
   auto options() const { return std::tuple{negated, parameters}; }
   void PrintOptions(std::ostream& os) const;
 };
+struct PrepareForLoopOp : FixedArityOperationT<1, PrepareForLoopOp> {
+  static constexpr OpEffects effects = OpEffects().RequiredWhenUnused();
+  base::Vector<const RegisterRepresentation> outputs_rep() const { return {}; }
+
+  base::Vector<const MaybeRegisterRepresentation> inputs_rep(
+      ZoneVector<MaybeRegisterRepresentation>& storage) const {
+    return {};
+  }
+
+  V<EagerFrameState> frame_state() const { return input<EagerFrameState>(0); }
+
+  PrepareForLoopOp(V<EagerFrameState> frame_state) : Base(frame_state) {}
+
+  void Validate(const Graph& graph) const {
+    DCHECK(Get(graph, frame_state()).Is<FrameStateOp>());
+  }
+  auto options() const { return std::tuple{}; }
+};
 
 #if V8_ENABLE_WEBASSEMBLY
 
@@ -4577,8 +4597,7 @@ struct TSCallDescriptor : public NON_EXPORTED_BASE(ZoneObject) {
       const CallDescriptor* descriptor, CanThrow can_throw,
       LazyDeoptOnThrow lazy_deopt_on_throw, Zone* graph_zone,
       const JSWasmCallParameters* js_wasm_call_parameters = nullptr) {
-    DCHECK_IMPLIES(can_throw == CanThrow::kNo,
-                   lazy_deopt_on_throw == LazyDeoptOnThrow::kNo);
+    DCHECK_IMPLIES(!can_throw, !lazy_deopt_on_throw);
     base::Vector<RegisterRepresentation> in_reps =
         graph_zone->AllocateVector<RegisterRepresentation>(
             descriptor->ParameterCount());
@@ -7315,7 +7334,7 @@ struct FastApiCallOp : OperationT<FastApiCallOp> {
       : Base(kNumNonParamInputs + arguments.size()),
         parameters(parameters),
         out_reps(out_reps),
-        lazy_deopt_on_throw(LazyDeoptOnThrow::kNo) {
+        lazy_deopt_on_throw(LazyDeoptOnThrow{false}) {
     base::Vector<OpIndex> inputs = this->inputs();
     inputs[0] = frame_state;
     inputs[1] = data_argument;
@@ -7994,8 +8013,8 @@ struct AnyConvertExternOp : FixedArityOperationT<1, AnyConvertExternOp> {
       : Base(object), is_shared(is_shared), is_nullable(is_nullable) {}
 
   void PrintOptions(std::ostream& os) const {
-    os << "[" << (is_shared == SharedFlag::kYes ? "shared" : "non-shared")
-       << ", " << (is_nullable ? "nullable" : "non-nullable") << "]";
+    os << "[" << is_shared << ", "
+       << (is_nullable ? "nullable" : "non-nullable") << "]";
   }
 
   V<Object> object() const { return Base::input<Object>(0); }
@@ -8870,7 +8889,8 @@ struct Simd128ConstantOp : FixedArityOperationT<0, Simd128ConstantOp> {
   V(F16x8Ne)                                       \
   V(F16x8Lt)                                       \
   V(F16x8Le)                                       \
-  V(I32x4AddPairwise)
+  V(I32x4AddPairwise)                              \
+  V(I32x4DotI8x16S)
 
 #define FOREACH_SIMD_128_BINARY_OPCODE(V)     \
   FOREACH_SIMD_128_BINARY_MANDATORY_OPCODE(V) \
@@ -10677,7 +10697,7 @@ constexpr size_t input_count() { return 0; }
 template <typename T>
 constexpr size_t input_count(T)
   requires(std::is_enum_v<T> || std::is_integral_v<T> ||
-           std::is_floating_point_v<T>)
+           std::is_floating_point_v<T> || base::is_strong_alias_v<T>)
 {
   return 0;
 }

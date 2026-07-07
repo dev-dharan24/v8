@@ -3553,10 +3553,13 @@ void MaybeReplaceCmpZeroWithFlagSettingBinop(InstructionSelector* selector,
     *opcode = no_output_opcode;
     *node = binop;
     *immediate_mode = binop_immediate_mode;
-  } else if (selector->IsOnlyUserOfNodeInSameBlock(*node, binop)) {
+  } else if ((cont->IsBranch() || cont->IsSet()) &&
+             selector->IsOnlyUserOfNodeInSameBlock(*node, binop)) {
     // We can also handle the case where the add and the compare are in the
     // same basic block, and the compare is the only use of add in this basic
-    // block (the add has users in other basic blocks).
+    // block (the add has users in other basic blocks). We only do this for
+    // branches and sets as they can't end up breaking the schedule by pulling
+    // the flag-setting instruction past its users.
     cont->Overwrite(MapForFlagSettingBinop(cond));
     *opcode = binop_opcode;
     *node = binop;
@@ -5522,6 +5525,18 @@ void InstructionSelector::VisitI32x4DotI8x16I7x16AddS(OpIndex node) {
   }
 }
 
+void InstructionSelector::VisitI32x4DotI8x16S(OpIndex node) {
+  DCHECK(CpuFeatures::IsSupported(DOTPROD));
+  Arm64OperandGenerator g(this);
+  const Simd128BinopOp& op = Cast<Simd128BinopOp>(node);
+  InstructionOperand left = g.UseUniqueRegister(op.left());
+  InstructionOperand right = g.UseUniqueRegister(op.right());
+  InstructionOperand acc = g.TempSimd128Register();
+  Emit(kArm64S128Const, acc, g.UseImmediate(0), g.UseImmediate(0),
+       g.UseImmediate(0), g.UseImmediate(0));
+  Emit(kArm64I32x4DotI8x16AddS, g.DefineSameAsInput(node, 2), left, right, acc);
+}
+
 void VisitDot(InstructionSelector* selector, OpIndex node, int lane_size) {
   Arm64OperandGenerator g(selector);
   const Simd128BinopOp& op = selector->Cast<Simd128BinopOp>(node);
@@ -6145,6 +6160,32 @@ void InstructionSelector::VisitI32x4Add(OpIndex node) {
                  this, node, LaneSize::kL32)) {
     return;
   } else {
+    Arm64OperandGenerator g(this);
+    const Simd128BinopOp& binop = Get(node).Cast<Simd128BinopOp>();
+    if (CanCover(node, binop.left())) {
+      if (auto dot = Get(binop.left()).TryCast<Simd128BinopOp>()) {
+        if (dot->kind == Simd128BinopOp::Kind::kI32x4DotI8x16S) {
+          InstructionOperand left = g.UseRegister(dot->left());
+          InstructionOperand right = g.UseRegister(dot->right());
+          InstructionOperand acc = g.UseRegister(binop.right());
+          Emit(kArm64I32x4DotI8x16AddS, g.DefineSameAsInput(node, 2), left,
+               right, acc);
+          return;
+        }
+      }
+    }
+    if (CanCover(node, binop.right())) {
+      if (auto dot = Get(binop.right()).TryCast<Simd128BinopOp>()) {
+        if (dot->kind == Simd128BinopOp::Kind::kI32x4DotI8x16S) {
+          InstructionOperand left = g.UseRegister(dot->left());
+          InstructionOperand right = g.UseRegister(dot->right());
+          InstructionOperand acc = g.UseRegister(binop.left());
+          Emit(kArm64I32x4DotI8x16AddS, g.DefineSameAsInput(node, 2), left,
+               right, acc);
+          return;
+        }
+      }
+    }
     VISIT_SIMD_ADD(I32x4, I16x8, LaneSize::kL32)
   }
 }

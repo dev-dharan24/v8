@@ -262,6 +262,10 @@ declare_args() {
   # Enables various testing features.
   v8_enable_test_features = ""
 
+  # Enables testing-only synchronization points via the
+  # `SYNCHRONIZATION_POINT_TEST_ONLY` macro.
+  v8_enable_test_only_sync_points = ""
+
   # Enable short builtins call instruction sequences by un-embedding builtins.
   # Sets -DV8_SHORT_BUILTIN_CALLS
   v8_enable_short_builtin_calls = ""
@@ -490,11 +494,11 @@ declare_args() {
   # Experimental testing mode where various limits are artificially set lower.
   v8_lower_limits_mode = false
 
-  # Enables the use of partition_alloc as the default allocator for standalone
-  # V8. This should be used for benchmarking and testing purposes to more
+  # Enables the use of PartitionAlloc as the default allocator for standalone
+  # d8. This should be used for benchmarking and testing purposes to more
   # closely mimic in-browser behavior.
   #
-  # Currently used in d8.
+  # Note that this has no effect on V8 when it is embedded elsewhere
   v8_enable_partition_alloc = ""
 
   # V8 uses Chrome's blink-gc clang plugin for checking V8's internal cppgc
@@ -564,6 +568,9 @@ if (v8_enable_regexp_diagnostics == "") {
 if (v8_enable_test_features == "") {
   v8_enable_test_features =
       v8_enable_verification_features || v8_dcheck_always_on
+}
+if (v8_enable_test_only_sync_points == "") {
+  v8_enable_test_only_sync_points = v8_enable_test_features
 }
 if (v8_enable_v8_checks == "") {
   v8_enable_v8_checks = v8_enable_verification_features
@@ -1358,6 +1365,9 @@ config("features") {
     # hash collisions all the time).
     defines += [ "V8_HASHES_COLLIDE" ]
   }
+  if (v8_enable_test_only_sync_points) {
+    defines += [ "V8_ENABLE_TEST_ONLY_SYNC_POINTS" ]
+  }
   if (v8_enable_i18n_support) {
     defines += [ "V8_INTL_SUPPORT" ]
   }
@@ -1538,9 +1548,6 @@ config("features") {
   }
   if (v8_use_zlib) {
     defines += [ "V8_USE_ZLIB" ]
-  }
-  if (v8_use_libm_trig_functions) {
-    defines += [ "V8_USE_LIBM_TRIG_FUNCTIONS" ]
   }
   if (v8_value_deserializer_hard_fail) {
     defines += [ "V8_VALUE_DESERIALIZER_HARD_FAIL" ]
@@ -3165,6 +3172,8 @@ action("v8_dump_build_config") {
     "wasm_random_fuzzers=$v8_wasm_random_fuzzers",
     "memory_corruption_api=$v8_enable_memory_corruption_api",
     "lower_limits_mode=$v8_lower_limits_mode",
+    "cppgc_microtask_queue=$v8_cppgc_microtask_queue",
+    "test_only_sync_points=$v8_enable_test_only_sync_points",
 
     # Please add new switches also in `build_config_content` in `bazel/defs.bzl`
     # so that the switches also work for tests triggered by bazel.
@@ -3787,6 +3796,7 @@ v8_header_set("v8_internal_headers") {
     "src/common/segmented-table-inl.h",
     "src/common/segmented-table.h",
     "src/common/simd128.h",
+    "src/common/synchronization-point-support.h",
     "src/common/thread-local-storage.h",
     "src/compiler-dispatcher/lazy-compile-dispatcher.h",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.h",
@@ -4824,6 +4834,7 @@ v8_header_set("v8_internal_headers") {
       "src/maglev/maglev-tracer.h",
       "src/maglev/maglev-truncation.h",
       "src/maglev/maglev.h",
+      "src/maglev/turbolev-escape-analysis.h",
     ]
     if (v8_current_cpu == "arm") {
       sources += [ "src/maglev/arm/maglev-assembler-arm-inl.h" ]
@@ -4887,6 +4898,7 @@ v8_header_set("v8_internal_headers") {
       "src/wasm/baseline/liftoff-assembler-defs.h",
       "src/wasm/baseline/liftoff-assembler-inl.h",
       "src/wasm/baseline/liftoff-assembler.h",
+      "src/wasm/baseline/liftoff-bailout-reasons.h",
       "src/wasm/baseline/liftoff-compiler.h",
       "src/wasm/baseline/liftoff-register.h",
       "src/wasm/baseline/liftoff-varstate.h",
@@ -5621,6 +5633,8 @@ if (!v8_enable_maglev) {
     "src/maglev/maglev-phi-representation-selector.cc",
     "src/maglev/maglev-range-verification.cc",
     "src/maglev/maglev-truncation.cc",
+    "src/maglev/turbolev-escape-analysis.cc",
+    "src/maglev/turbolev-escape-analysis.h",
   ]
 }
 
@@ -5971,6 +5985,7 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/common/assert-scope.cc",
     "src/common/code-memory-access.cc",
     "src/common/ptr-compr.cc",
+    "src/common/synchronization-point-support.cc",
     "src/compiler-dispatcher/lazy-compile-dispatcher.cc",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.cc",
     "src/compiler/linkage.cc",
@@ -6431,6 +6446,7 @@ v8_cluster_source_set("v8_base_without_compiler") {
       "src/maglev/maglev-regalloc.cc",
       "src/maglev/maglev-truncation.cc",
       "src/maglev/maglev.cc",
+      "src/maglev/turbolev-escape-analysis.cc",
     ]
     if (v8_current_cpu == "arm") {
       sources += [
@@ -6512,7 +6528,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
       "src/wasm/pgo.cc",
       "src/wasm/stacks.cc",
       "src/wasm/streaming-decoder.cc",
-      "src/wasm/sync-streaming-decoder.cc",
       "src/wasm/value-type.cc",
       "src/wasm/wasm-code-manager.cc",
       "src/wasm/wasm-code-pointer-table.cc",
@@ -7448,35 +7463,9 @@ v8_component("v8_libbase") {
     }
   }
 
-  if (v8_use_libm_trig_functions) {
-    deps += [ ":libm" ]
-  }
-
   deps += [ "//third_party/llvm-libc:headers" ]
 
   # TODO(infra): Add support for qnx, freebsd, openbsd, netbsd, and solaris.
-}
-
-if (v8_use_libm_trig_functions) {
-  source_set("libm") {
-    sources = [
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/branred.c",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/branred.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/dla.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/endian.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/mydefs.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/s_sin.c",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/sincostab.c",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/trig.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/usncs.h",
-    ]
-    configs += [ "//build/config/compiler:no_chromium_code" ]
-    configs -= [ "//build/config/compiler:chromium_code" ]
-    if (!is_debug) {
-      # Build code using -O3, see: crbug.com/1084371.
-      configs += [ "//build/config/compiler:optimize_speed" ]
-    }
-  }
 }
 
 v8_component("v8_libplatform") {

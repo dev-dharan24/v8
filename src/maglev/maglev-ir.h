@@ -221,6 +221,7 @@ class ExceptionHandlerInfo;
   V(TransitionAndStoreArrayElement)     \
   V(TurbofanStaticAssert)               \
   V(AssertPeeled)                       \
+  V(AssertEscapeAnalysisElided)         \
   V(AssumeMap)                          \
   V(AssumeTaggedType)                   \
   V(AssumeInt32Type)                    \
@@ -712,6 +713,7 @@ constexpr bool IsSimpleFieldStore(Opcode opcode) {
          opcode == Opcode::kStoreFixedArrayElementWithWriteBarrier ||
          opcode == Opcode::kStoreFixedArrayElementNoWriteBarrier ||
          opcode == Opcode::kStoreFixedDoubleArrayElement ||
+         opcode == Opcode::kStoreFixedHoleyDoubleArrayElement ||
          opcode == Opcode::kStoreTrustedPointerFieldWithWriteBarrier ||
          opcode == Opcode::kStoreContextSlotWithWriteBarrier ||
          opcode == Opcode::kStoreSmiContextCell ||
@@ -724,7 +726,9 @@ constexpr bool IsElementsArrayWrite(Opcode opcode) {
 }
 constexpr bool IsTypedArrayStore(Opcode opcode) {
   return opcode == Opcode::kStoreIntTypedArrayElement ||
-         opcode == Opcode::kStoreDoubleTypedArrayElement;
+         opcode == Opcode::kStoreDoubleTypedArrayElement ||
+         opcode == Opcode::kStoreIntConstantTypedArrayElement ||
+         opcode == Opcode::kStoreDoubleConstantTypedArrayElement;
 }
 
 constexpr bool IsTruncatingToInt32(Opcode opcode) {
@@ -945,7 +949,11 @@ enum class UseRepresentation : uint8_t {
   kUint32,
   kFloat64,
   kHoleyFloat64,
-  kLast = kHoleyFloat64
+  kNonTruncated,  // Hint-only use (e.g. a value referenced by a deopt frame):
+                  // the value must survive as a non-truncated representation,
+                  // but any reversible untagging (Int32/Float64/HoleyFloat64)
+                  // is fine since it can be re-materialized.
+  kLast = kNonTruncated
 };
 
 std::ostream& operator<<(std::ostream& os, UseRepresentation repr);
@@ -1487,7 +1495,7 @@ class DeoptFrame {
 
   struct InterpretedFrameData {
     const MaglevCompilationUnit& unit;
-    const CompactInterpreterFrameState* frame_state;
+    CompactInterpreterFrameState* frame_state;
     ValueNode* closure;
     VirtualObject* last_virtual_object;
     const BytecodeOffset bytecode_position;
@@ -1563,7 +1571,7 @@ class DeoptFrame {
 class InterpretedDeoptFrame : public DeoptFrame {
  public:
   InterpretedDeoptFrame(const MaglevCompilationUnit& unit,
-                        const CompactInterpreterFrameState* frame_state,
+                        CompactInterpreterFrameState* frame_state,
                         ValueNode* closure, VirtualObject* last_vo,
                         BytecodeOffset bytecode_position,
                         SourcePosition source_position, DeoptFrame* parent)
@@ -1581,6 +1589,9 @@ class InterpretedDeoptFrame : public DeoptFrame {
   SourcePosition source_position() const { return data().source_position; }
   VirtualObject* last_virtual_object() const {
     return data().last_virtual_object;
+  }
+  void set_last_virtual_object(VirtualObject* last_vobj) {
+    data().last_virtual_object = last_vobj;
   }
 
   int ComputeReturnOffset(interpreter::Register result_location,
@@ -1939,6 +1950,7 @@ class LazyDeoptInfo : public DeoptInfo {
           case Builtin::kCallIteratorWithFeedbackLazyDeoptContinuation:
           case Builtin::kForOfNextLoadDoneLazyDeoptContinuation:
           case Builtin::kForOfNextLoadValueLazyDeoptContinuation:
+          case Builtin::kArrayDestructureLazyDeoptContinuation:
             return true;
           default:
             return false;
@@ -2367,6 +2379,15 @@ class NodeBase : public ZoneObject {
     DCHECK(properties().has_eager_deopt_info());
     new (eager_deopt_info())
         EagerDeoptInfo(zone, deopt_frame, feedback_to_update);
+  }
+
+  void SetLazyDeoptInfo(Zone* zone, DeoptFrame* deopt_frame,
+                        interpreter::Register result_location, int result_size,
+                        compiler::FeedbackSource feedback_to_update =
+                            compiler::FeedbackSource()) {
+    DCHECK(properties().can_lazy_deopt());
+    new (lazy_deopt_info()) LazyDeoptInfo(zone, deopt_frame, result_location,
+                                          result_size, feedback_to_update);
   }
 
   inline void ClearInputs();
@@ -2818,6 +2839,10 @@ class ValueNode : public Node {
   // Unwrap identities and conversions.
   ValueNode* Unwrap();
 
+  // Like Unwrap, but also unwraps single-input phis (cf.
+  // UnwrapIdentitiesAndPhis).
+  ValueNode* UnwrapForDeopt();
+
   ValueNode* UnwrapIdentitiesAndUpdateUseCountForDeopt(
       const VirtualObjectList& virtual_objects);
   ValueNode* UnwrapAndUpdateUseCountForDeopt(
@@ -2924,7 +2949,7 @@ inline ValueNode* ValueNode::UnwrapIdentitiesAndUpdateUseCountForDeopt(
 // use-count and increments the use-count of the unwrapped node.
 inline ValueNode* ValueNode::UnwrapAndUpdateUseCountForDeopt(
     const VirtualObjectList& virtual_objects) {
-  ValueNode* unwrapped = Unwrap();
+  ValueNode* unwrapped = UnwrapForDeopt();
   if (unwrapped != this) {
     // TODO(dmercadier): instead of a simple `remove_use` here, we could instead
     // recursively remove uses in VirtualObjects (basically doing the oppositve
@@ -5871,6 +5896,8 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
     allocation_ = allocation;
   }
 
+  const vobj::ObjectLayout* object_layout() const { return object_layout_; }
+
   bool compatible_for_merge(const VirtualObject* other) const {
     if (object_layout_->object_type != other->object_layout_->object_type) {
       return false;
@@ -7800,6 +7827,20 @@ class AssertPeeled : public FixedInputNodeT<0, AssertPeeled> {
   using ExpectPeeledField = NextBitField<bool, 1>;
 };
 
+class AssertEscapeAnalysisElided
+    : public FixedInputNodeT<1, AssertEscapeAnalysisElided> {
+ public:
+  explicit AssertEscapeAnalysisElided(uint64_t bitfield) : Base(bitfield) {}
+
+  static constexpr OpProperties kProperties = OpProperties::Pure();
+
+  DECLARE_INPUTS(Value)
+  DECLARE_INPUT_TYPES(Tagged)
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
+};
+
 class MajorGCForCompilerTesting
     : public FixedInputNodeT<0, MajorGCForCompilerTesting> {
  public:
@@ -8583,11 +8624,16 @@ inline std::ostream& operator<<(std::ostream& os, PropertyKey key) {
   return os;
 }
 
+enum class IsArrayLength { kNo, kYes };
+
 class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
  public:
   explicit LoadTaggedField(uint64_t bitfield, const int offset, NodeType type,
-                           bool is_const, PropertyKey property_key)
-      : Base(bitfield | IsConstantLoadField::encode(is_const)),
+                           bool is_const, PropertyKey property_key,
+                           IsArrayLength is_array_length)
+      : Base(
+            bitfield | IsConstantLoadField::encode(is_const) |
+            IsArrayLengthField::encode(is_array_length == IsArrayLength::kYes)),
         offset_(offset),
         type_(type),
         property_key_(property_key) {}
@@ -8599,14 +8645,18 @@ class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
   NodeType type() const { return type_; }
   bool is_const() const { return IsConstantLoadField::decode(bitfield()); }
   PropertyKey property_key() const { return property_key_; }
-
+  IsArrayLength is_array_length() const {
+    return IsArrayLengthField::decode(bitfield()) ? IsArrayLength::kYes
+                                                  : IsArrayLength::kNo;
+  }
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
   void PrintParams(std::ostream&) const;
 
   auto options() const {
-    return std::tuple{offset(), type(), is_const(), property_key()};
+    return std::tuple{offset(), type(), is_const(), property_key(),
+                      is_array_length()};
   }
 
  private:
@@ -8614,6 +8664,7 @@ class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
   const NodeType type_;
   PropertyKey property_key_;
   using IsConstantLoadField = NextBitField<bool, 1>;
+  using IsArrayLengthField = IsConstantLoadField::Next<bool, 1>;
 };
 
 class LoadContextSlotNoCells

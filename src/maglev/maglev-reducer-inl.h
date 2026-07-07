@@ -498,18 +498,17 @@ std::optional<ValueNode*> MaglevReducer<BaseT>::TryGetConstantAlternative(
 }
 
 template <typename BaseT>
-ReduceResult MaglevReducer<BaseT>::BuildLoadTaggedField(ValueNode* object,
-                                                        uint32_t offset,
-                                                        NodeType type,
-                                                        bool is_const,
-                                                        PropertyKey key) {
+ReduceResult MaglevReducer<BaseT>::BuildLoadTaggedField(
+    ValueNode* object, uint32_t offset, NodeType type, bool is_const,
+    PropertyKey key, IsArrayLength is_array_length) {
   if constexpr (ReducerBaseWithAllocationTracking<BaseT>) {
     if (std::optional<ValueNode*> val =
             base_->TryBuildLoadTaggedFieldFromAllocation(object, offset)) {
       return *val;
     }
   }
-  return AddNewNode<LoadTaggedField>({object}, offset, type, is_const, key);
+  return AddNewNode<LoadTaggedField>({object}, offset, type, is_const, key,
+                                     is_array_length);
 }
 
 template <typename BaseT>
@@ -841,11 +840,7 @@ void MaglevReducer<BaseT>::AddNonEscapingUses(InlinedAllocation* allocation,
 template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::BuildInlinedAllocation(
     VirtualObject* vobject, AllocationType allocation_type) {
-  known_node_aspects().virtual_objects().Add(vobject);
-  InlinedAllocation* allocation;
-
-  using ValueAndDesc = std::pair<ValueNode*, vobj::Field>;
-  SmallZoneVector<ValueAndDesc, 8> values(zone());
+  SmallZoneVector<std::pair<ValueNode*, vobj::Field>, 8> values(zone());
   bool result =
       vobject->ForEachSlot([&](ValueNode* node, vobj::Field desc) -> bool {
         CHECK_NE(node, VirtualObject::kUninitializedSlotValue);
@@ -870,7 +865,7 @@ ReduceResult MaglevReducer<BaseT>::BuildInlinedAllocation(
   if (!result) {
     return ReduceResult::DoneWithAbort();
   }
-  allocation =
+  InlinedAllocation* allocation =
       ExtendOrReallocateCurrentAllocationBlock(allocation_type, vobject);
   AddNonEscapingUses(allocation, static_cast<int>(values.size()));
   StoreTaggedMode store_mode = StoreTaggedMode::kInitializing;
@@ -906,6 +901,7 @@ ReduceResult MaglevReducer<BaseT>::BuildInlinedAllocation(
   if (v8_flags.maglev_allocation_folding < 2) {
     ClearCurrentAllocationBlock();
   }
+  known_node_aspects().virtual_objects().Add(vobject);
   return allocation;
 }
 
@@ -2109,7 +2105,7 @@ MaglevReducer<BaseT>::TryBuildLoadFixedArrayElementConstantIndex(
   int offset = FixedArray::OffsetOfElementAt(index);
   return AddNewNodeNoInputConversion<LoadTaggedField>(
       {elements}, offset, NodeTypeFromLoadType(type), false,
-      PropertyKey::None());
+      PropertyKey::None(), IsArrayLength::kNo);
 }
 
 template <typename BaseT>
@@ -3572,39 +3568,25 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldFloat64Max(ValueNode* lhs,
   return GetFloat64Constant(rhs_scalar);
 }
 
-#ifdef V8_USE_LIBM_TRIG_FUNCTIONS
-#define IF_LIBM(Macro, ...) Macro(__VA_ARGS__)
-#define IF_NOT_LIBM(Macro, ...)
-#else
-#define IF_LIBM(Macro, ...)
-#define IF_NOT_LIBM(Macro, ...) Macro(__VA_ARGS__)
-#endif  // V8_USE_LIBM_TRIG_FUNCTIONS
-
-#define IEEE_754_FUNCTION_MAPPER(V)                                       \
-  V(Acos, base::ieee754::acos)                                            \
-  V(Acosh, base::ieee754::acosh)                                          \
-  V(Asin, base::ieee754::asin)                                            \
-  V(Asinh, base::ieee754::asinh)                                          \
-  V(Atan, base::ieee754::atan)                                            \
-  V(Atanh, base::ieee754::atanh)                                          \
-  V(Cbrt, base::ieee754::cbrt)                                            \
-  IF_LIBM(V, Cos,                                                         \
-          (v8_flags.use_libm_trig_functions ? base::ieee754::libm_cos     \
-                                            : base::ieee754::fdlibm_cos)) \
-  IF_NOT_LIBM(V, Cos, base::ieee754::cos)                                 \
-  V(Cosh, base::ieee754::cosh)                                            \
-  V(Exp, base::ieee754::exp)                                              \
-  V(Expm1, base::ieee754::expm1)                                          \
-  V(Log, base::ieee754::log)                                              \
-  V(Log1p, base::ieee754::log1p)                                          \
-  V(Log10, base::ieee754::log10)                                          \
-  V(Log2, base::ieee754::log2)                                            \
-  IF_LIBM(V, Sin,                                                         \
-          (v8_flags.use_libm_trig_functions ? base::ieee754::libm_sin     \
-                                            : base::ieee754::fdlibm_sin)) \
-  IF_NOT_LIBM(V, Sin, base::ieee754::sin)                                 \
-  V(Sinh, base::ieee754::sinh)                                            \
-  V(Tan, base::ieee754::tan)                                              \
+#define IEEE_754_FUNCTION_MAPPER(V) \
+  V(Acos, base::ieee754::acos)      \
+  V(Acosh, base::ieee754::acosh)    \
+  V(Asin, base::ieee754::asin)      \
+  V(Asinh, base::ieee754::asinh)    \
+  V(Atan, base::ieee754::atan)      \
+  V(Atanh, base::ieee754::atanh)    \
+  V(Cbrt, base::ieee754::cbrt)      \
+  V(Cos, base::ieee754::cos)        \
+  V(Cosh, base::ieee754::cosh)      \
+  V(Exp, base::ieee754::exp)        \
+  V(Expm1, base::ieee754::expm1)    \
+  V(Log, base::ieee754::log)        \
+  V(Log1p, base::ieee754::log1p)    \
+  V(Log10, base::ieee754::log10)    \
+  V(Log2, base::ieee754::log2)      \
+  V(Sin, base::ieee754::sin)        \
+  V(Sinh, base::ieee754::sinh)      \
+  V(Tan, base::ieee754::tan)        \
   V(Tanh, base::ieee754::tanh)
 
 template <typename BaseT>
@@ -3696,6 +3678,71 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldLogicalNot(ValueNode* input) {
 
   return {};
 }
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryFoldTestTypeOf(
+    ValueNode* value, interpreter::TestTypeOfFlags::LiteralFlag literal) {
+  // TODO(v8:7700): Add a branch version of TestTypeOf that does not need to
+  // materialise the boolean value.
+  const auto node_type = GetType(value);
+  if (node_type == NodeType::kNone) {
+    return BuildAbort(AbortReason::kUnreachable);
+  }
+
+  const auto check_type = [&](NodeType match_type,
+                              NodeType can_be_type) -> MaybeReduceResult {
+    if (NodeTypeIs(node_type, match_type)) {
+      return GetBooleanConstant(true);
+    }
+    if (!NodeTypeCanBe(node_type, can_be_type)) {
+      return GetBooleanConstant(false);
+    }
+    return MaybeReduceResult::Fail();
+  };
+
+  using LiteralFlag = interpreter::TestTypeOfFlags::LiteralFlag;
+  switch (literal) {
+    case LiteralFlag::kNumber:
+      return check_type(NodeType::kNumber, NodeType::kNumber);
+    case LiteralFlag::kString:
+      return check_type(NodeType::kString, NodeType::kString);
+    case LiteralFlag::kSymbol:
+      return check_type(NodeType::kSymbol, NodeType::kSymbol);
+    case LiteralFlag::kBoolean:
+      return check_type(NodeType::kBoolean, NodeType::kBoolean);
+    case LiteralFlag::kBigInt:
+      return check_type(NodeType::kBigInt, NodeType::kBigInt);
+
+    case LiteralFlag::kUndefined:
+      return check_type(NodeType::kUndefined,
+                        UnionType(NodeType::kUndefined, NodeType::kJSReceiver));
+
+    case LiteralFlag::kFunction:
+      return check_type(NodeType::kJSFunction, NodeType::kCallable);
+
+    case LiteralFlag::kObject: {
+      constexpr NodeType kObjectTypes = UnionType(
+          NodeType::kNull,
+          UnionType(NodeType::kJSArray, UnionType(NodeType::kStringWrapper,
+                                                  NodeType::kJSDataView)));
+      if (NodeTypeIs(node_type, kObjectTypes)) {
+        return GetBooleanConstant(true);
+      }
+      if (!NodeTypeCanBe(node_type,
+                         UnionType(NodeType::kJSReceiver, NodeType::kNull)) ||
+          NodeTypeIs(node_type, NodeType::kCallable)) {
+        return GetBooleanConstant(false);
+      }
+      return {};
+    }
+
+    case LiteralFlag::kOther:
+      return GetBooleanConstant(false);
+  }
+
+  UNREACHABLE();
+}
+
 template <typename BaseT>
 bool MaglevReducer<BaseT>::IsTheHoleConstant(ValueNode* node) {
   if (node != nullptr) {
@@ -5001,7 +5048,7 @@ VirtualObject* MaglevReducer<BaseT>::CreateFixedDoubleArray(
 template <typename BaseT>
 VirtualObject* MaglevReducer<BaseT>::CreateContext(
     compiler::MapRef map, int length, compiler::ScopeInfoRef scope_info,
-    ValueNode* previous_context, std::optional<ValueNode*> extension) {
+    ValueNode* previous_context, ValueNode* extension) {
   using Shape = ContextShape;
   SBXCHECK_GE(length, Context::MIN_CONTEXT_SLOTS);
   DCHECK_EQ(Context::SizeFor(length) % FieldSizeOf(Shape::kBodyFieldType), 0);
@@ -5019,17 +5066,15 @@ VirtualObject* MaglevReducer<BaseT>::CreateContext(
   vobj->set(Context::OffsetOfElementAt(Context::PREVIOUS_INDEX),
             previous_context);
   int index = Context::PREVIOUS_INDEX + 1;
-  if (extension.has_value()) {
+  if (extension != nullptr) {
     SBXCHECK_GE(length, Context::MIN_CONTEXT_EXTENDED_SLOTS);
-    vobj->set(Context::OffsetOfElementAt(Context::EXTENSION_INDEX),
-              extension.value());
+    vobj->set(Context::OffsetOfElementAt(Context::EXTENSION_INDEX), extension);
     index++;
   }
   for (; index < length; index++) {
     vobj->set(Context::OffsetOfElementAt(index),
               GetRootConstant(RootIndex::kUndefinedValue));
   }
-  RecordType(vobj, NodeType::kContext);
   return vobj;
 }
 

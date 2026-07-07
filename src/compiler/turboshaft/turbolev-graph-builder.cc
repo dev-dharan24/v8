@@ -13,6 +13,7 @@
 #include "src/base/logging.h"
 #include "src/base/macros.h"
 #include "src/base/small-vector.h"
+#include "src/base/strong-alias.h"
 #include "src/base/vector.h"
 #include "src/codegen/bailout-reason.h"
 #include "src/codegen/interface-descriptors-inl.h"
@@ -614,7 +615,10 @@ class GraphBuildingNodeProcessor {
     return is_main_switch_block;
   }
 
-  void PostProcessBasicBlock(maglev::BasicBlock* maglev_block) {}
+  maglev::BlockProcessResult PostProcessBasicBlock(
+      maglev::BasicBlock* maglev_block) {
+    return maglev::BlockProcessResult::kContinue;
+  }
   maglev::BlockProcessResult PreProcessBasicBlock(
       maglev::BasicBlock* maglev_block) {
     TRACE("\nMaglev block: b" << maglev_block->id());
@@ -1541,7 +1545,7 @@ class GraphBuildingNodeProcessor {
       SetMap(node, __ Call(V<CallTarget>::Cast(callee), frame_state,
                            base::VectorOf(arguments),
                            TSCallDescriptor::Create(
-                               descriptor, CanThrow::kYes, lazy_deopt_on_throw,
+                               descriptor, CanThrow{true}, lazy_deopt_on_throw,
                                graph_zone(), wasm_call_params)));
     }
 
@@ -1631,7 +1635,7 @@ class GraphBuildingNodeProcessor {
 
     return __ Call<Type>(
         stub_code, frame_state, base::VectorOf(arguments),
-        TSCallDescriptor::Create(call_descriptor, CanThrow::kYes,
+        TSCallDescriptor::Create(call_descriptor, CanThrow{true},
                                  lazy_deopt_on_throw, graph_zone()));
   }
   maglev::ProcessResult Process(maglev::CallBuiltin* node,
@@ -1720,13 +1724,12 @@ class GraphBuildingNodeProcessor {
       GET_FRAME_STATE_MAYBE_ABORT(frame_state_value, node->lazy_deopt_info());
       frame_state = frame_state_value;
     }
-    DCHECK_IMPLIES(lazy_deopt_on_throw == LazyDeoptOnThrow::kYes,
-                   frame_state.has_value());
+    DCHECK_IMPLIES(lazy_deopt_on_throw, frame_state.has_value());
 
     BAILOUT_IF_TOO_MANY_ARGUMENTS_FOR_CALL(arguments.size());
     V<Any> call_idx =
         __ Call(c_entry_stub, frame_state, base::VectorOf(arguments),
-                TSCallDescriptor::Create(call_descriptor, CanThrow::kYes,
+                TSCallDescriptor::Create(call_descriptor, CanThrow{true},
                                          lazy_deopt_on_throw, graph_zone()));
     SetMapMaybeMultiReturn(node, call_idx);
 
@@ -1751,8 +1754,7 @@ class GraphBuildingNodeProcessor {
       GET_FRAME_STATE_MAYBE_ABORT(frame_state_value, node->lazy_deopt_info());
       frame_state = frame_state_value;
     }
-    DCHECK_IMPLIES(lazy_deopt_on_throw == LazyDeoptOnThrow::kYes,
-                   frame_state.has_value());
+    DCHECK_IMPLIES(lazy_deopt_on_throw, frame_state.has_value());
 
     base::SmallVector<OpIndex, 4> arguments;
     if (node->has_input()) {
@@ -1765,7 +1767,7 @@ class GraphBuildingNodeProcessor {
 
     arguments.push_back(native_context());
     __ Call(c_entry_stub, frame_state, base::VectorOf(arguments),
-            TSCallDescriptor::Create(call_descriptor, CanThrow::kYes,
+            TSCallDescriptor::Create(call_descriptor, CanThrow{true},
                                      lazy_deopt_on_throw, graph_zone()));
 
     // Throw is a block terminator in Maglev but not in Turboshaft (because it's
@@ -3019,6 +3021,7 @@ class GraphBuildingNodeProcessor {
         size += alloc->size();
       }
     }
+    DCHECK_NE(size, 0);
     node->set_size(size);
     SetMap(node, __ FinishInitialization(__ Allocate<HeapObject>(
                      size, node->allocation_type(), kTaggedAligned)));
@@ -5690,6 +5693,12 @@ class GraphBuildingNodeProcessor {
     return maglev::ProcessResult::kContinue;
   }
 
+  maglev::ProcessResult Process(maglev::AssertEscapeAnalysisElided* node,
+                                const maglev::ProcessingState&) {
+    DCHECK(!v8_flags.turbolev_escape_analysis);
+    return maglev::ProcessResult::kContinue;
+  }
+
   maglev::ProcessResult Process(maglev::MajorGCForCompilerTesting* node,
                                 const maglev::ProcessingState&) {
     __ MajorGCForCompilerTesting();
@@ -6152,8 +6161,9 @@ class GraphBuildingNodeProcessor {
       OptionalV<FrameStateType> parent_frame =
           BuildParentFrameState<FrameStateType>(*frame.parent(),
                                                 virtual_objects);
-      if (!parent_frame.has_value())
+      if (!parent_frame.has_value()) {
         return OptionalV<FrameStateType>::Nullopt();
+      }
       builder.AddParentFrameState(parent_frame.value());
     }
 
@@ -6220,6 +6230,9 @@ class GraphBuildingNodeProcessor {
                      const maglev::VirtualObjectList& virtual_objects,
                      const maglev::ValueNode* node) {
     node = node->UnwrapIdentities();
+    // Maglev FrameStates should contain InlinedAllocations instead of
+    // VirtualObjects.
+    DCHECK(!node->Is<maglev::VirtualObject>());
     if (const maglev::InlinedAllocation* alloc =
             node->TryCast<maglev::InlinedAllocation>()) {
       DCHECK(alloc->HasBeenAnalysed());
@@ -6367,7 +6380,9 @@ class GraphBuildingNodeProcessor {
         builder.AddRestLength();
         break;
       case maglev::Opcode::kVirtualObject:
-        UNREACHABLE();
+        AddVirtualObjectInput(builder, virtual_objects,
+                              value->Cast<maglev::VirtualObject>());
+        break;
       default:
         AddDeoptInput(builder, virtual_objects, value);
         break;
@@ -6761,7 +6776,7 @@ class GraphBuildingNodeProcessor {
     DCHECK(loop->is_loop());
     if (!loop->has_phi()) return;
     for (maglev::Phi* maglev_phi : *loop->phis()) {
-      // Note that we've already emited the backedge Goto, which means that
+      // Note that we've already emitted the backedge Goto, which means that
       // we're currently not in a block, which means that we need to pass
       // can_be_invalid=false to `Map`, otherwise it will think that we're
       // currently emitting unreachable operations and return
@@ -6860,10 +6875,10 @@ class GraphBuildingNodeProcessor {
   }
 
   LazyDeoptOnThrow ShouldLazyDeoptOnThrow(maglev::NodeBase* node) {
-    if (!node->properties().can_throw()) return LazyDeoptOnThrow::kNo;
+    if (!node->properties().can_throw()) return LazyDeoptOnThrow{false};
     const maglev::ExceptionHandlerInfo* info = node->exception_handler_info();
-    if (info->ShouldLazyDeopt()) return LazyDeoptOnThrow::kYes;
-    return LazyDeoptOnThrow::kNo;
+    if (info->ShouldLazyDeopt()) return LazyDeoptOnThrow{true};
+    return LazyDeoptOnThrow{false};
   }
 
   class ThrowingScope {

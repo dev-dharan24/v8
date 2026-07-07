@@ -9,11 +9,13 @@
 
 #include "src/compiler/heap-refs.h"
 #include "src/maglev/maglev-compilation-info.h"
+#include "src/maglev/maglev-deopt-frame-visitor.h"
 #include "src/maglev/maglev-graph-printer.h"
 #include "src/maglev/maglev-graph-processor.h"
 #include "src/maglev/maglev-graph.h"
 #include "src/maglev/maglev-interpreter-frame-state.h"
 #include "src/maglev/maglev-ir.h"
+#include "src/numbers/conversions.h"
 #include "src/zone/zone-containers.h"
 
 namespace v8::internal::maglev {
@@ -39,7 +41,9 @@ class RecomputePhiUseHintsProcessor {
 
   void PreProcessGraph(Graph* graph) {}
   void PostProcessGraph(Graph* graph) {}
-  void PostProcessBasicBlock(BasicBlock* block) {}
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
     if (!block->has_phi()) return BlockProcessResult::kContinue;
     Phi::List& phis = *block->phis();
@@ -90,6 +94,12 @@ class RecomputePhiUseHintsProcessor {
     return ProcessResult::kContinue;
   }
 
+  template <typename Derived>
+  ProcessResult Process(AssumeTypeT<Derived>* node,
+                        const ProcessingState& state) {
+    return ProcessResult::kContinue;
+  }
+
   ProcessResult Process(NodeBase* node, const ProcessingState& state) {
     DCHECK(!node->Is<Phi>());
     if (ValueNode* value_node = node->TryCast<ValueNode>()) {
@@ -126,6 +136,30 @@ class RecomputePhiUseHintsProcessor {
             << " and same_loop_use_reprs=" << phi->same_loop_use_repr_hints()
             << " after visiting input " << PrintNode(node));
       }
+    }
+    // Values referenced by deopt frames are re-materialized upon
+    // deoptimization, so they must survive as a non-truncated representation.
+    // Any reversible untagging (Int32/Float64/HoleyFloat64) can be
+    // re-materialized, but the irreversible truncated Int32 cannot. Missing
+    // these uses can let a Phi be truncated, corrupting the value the
+    // interpreter resumes with.
+    auto record_deopt_use = [&](ValueNode* input) {
+      if (Phi* phi = input->TryCast<Phi>()) {
+        phi->RecordUseReprHint(
+            UseRepresentationSet{UseRepresentation::kNonTruncated},
+            live_loop_phis_.contains(phi));
+        TRACE_PHI_USE_HINTS(
+            "updating use hints for "
+            << PrintNodeLabel(phi) << ": use_reprs=" << phi->use_repr_hints()
+            << " and same_loop_use_reprs=" << phi->same_loop_use_repr_hints()
+            << " after visiting deopt frame of " << PrintNode(node));
+      }
+    };
+    if (node->properties().has_eager_deopt_info()) {
+      node->eager_deopt_info()->ForEachInput(record_deopt_use);
+    }
+    if (node->properties().can_lazy_deopt()) {
+      node->lazy_deopt_info()->ForEachInput(record_deopt_use);
     }
     return ProcessResult::kContinue;
   }
@@ -165,7 +199,9 @@ class LoopOptimizationProcessor {
   void PreProcessGraph(Graph* graph) {}
   void PostPhiProcessing() {}
 
-  void PostProcessBasicBlock(BasicBlock* block) {}
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
     current_block = block;
     if (current_block->is_loop()) {
@@ -309,8 +345,14 @@ constexpr bool CanBeStoreToNonEscapedObject() {
 
 class AnyUseMarkingProcessor {
  public:
+  // TODO(victorgomes): extract the escape analysis to a separate processor.
+  explicit AnyUseMarkingProcessor(bool run_maglev_escape_analysis = true)
+      : run_maglev_escape_analysis_(run_maglev_escape_analysis) {}
+
   void PreProcessGraph(Graph* graph) {}
-  void PostProcessBasicBlock(BasicBlock* block) {}
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
     return BlockProcessResult::kContinue;
   }
@@ -346,9 +388,11 @@ class AnyUseMarkingProcessor {
   }
 
   void PostProcessGraph(Graph* graph) {
-    RunEscapeAnalysis(graph);
-    DropUseOfValueInStoresToCapturedAllocations();
-    DCHECK(drop_uses_stack_.empty());
+    if (run_maglev_escape_analysis_) {
+      RunEscapeAnalysis(graph);
+      DropUseOfValueInStoresToCapturedAllocations();
+      DCHECK(drop_uses_stack_.empty());
+    }
   }
 
  private:
@@ -450,6 +494,8 @@ class AnyUseMarkingProcessor {
     node->mark_unused_inputs_visited();
     DrainDropUsesStack();
   }
+
+  bool run_maglev_escape_analysis_;
 };
 
 class DeadNodeSweepingProcessor {
@@ -460,7 +506,9 @@ class DeadNodeSweepingProcessor {
     }
   }
   void PostProcessGraph(Graph* graph) {}
-  void PostProcessBasicBlock(BasicBlock* block) {}
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
     return BlockProcessResult::kContinue;
   }
@@ -542,7 +590,9 @@ class ReachableExceptionHandlerTracker {
 
   void PreProcessGraph(Graph* graph) {}
   void PostProcessGraph(Graph* graph) {}
-  void PostProcessBasicBlock(BasicBlock* block) {}
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
   void PostPhiProcessing() {}
 
   void MarkReachable(BasicBlock* block) {
@@ -593,6 +643,236 @@ class ReachableExceptionHandlerTracker {
 
   Graph* graph_;
   ZoneAbslFlatHashSet<BasicBlock*> reachable_exception_handlers_;
+};
+
+// TODO(victorgomes): This eliminator is block-local -- it clears its state at
+// every basic-block boundary (PreProcessBasicBlock), so a bounds check only
+// subsumes redundant checks, and only certifies Smi-safe indices, within the
+// same block. Extend it to a dominator-tree / whole-graph walk so a check in a
+// dominating block can eliminate checks (and fold Smi-size artifacts) in
+// dominated successor blocks.
+class BoundsCheckEliminationProcessor {
+ public:
+  explicit BoundsCheckEliminationProcessor(Graph* graph)
+      : graph_(graph),
+        current_block_bounds_checks_(graph->zone()),
+        current_block_smi_safe_(graph->zone()) {}
+
+  void PreProcessGraph(Graph* graph) {}
+  void PostProcessGraph(Graph* graph) {}
+  void PostPhiProcessing() {}
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
+
+  BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
+    current_block_ = block;
+    current_block_bounds_checks_.clear();
+    current_block_smi_safe_.clear();
+    scanned_current_block_ = false;
+    return BlockProcessResult::kContinue;
+  }
+
+  ProcessResult Process(CheckTypedArrayBounds* node,
+                        const ProcessingState& state) {
+    if (TryElide(node, state)) {
+      return ProcessResult::kRemove;
+    }
+    return ProcessResult::kContinue;
+  }
+
+  ProcessResult Process(CheckInt32Condition* node,
+                        const ProcessingState& state) {
+    RecordIfSmiSafeIndex(node);
+    if (TryElide(node, state)) {
+      return ProcessResult::kRemove;
+    }
+    return ProcessResult::kContinue;
+  }
+
+  ProcessResult Process(CheckInt32IsSmi* node, const ProcessingState&) {
+    if (IsKnownSmiSafe(node->input_node(0))) {
+      return ProcessResult::kRemove;
+    }
+    return ProcessResult::kContinue;
+  }
+
+  ProcessResult Process(CheckedSmiSizedInt32* node, const ProcessingState&) {
+    if (IsKnownSmiSafe(node->input_node(0))) {
+      node->OverwriteWithIdentityTo(node->input_node(0));
+      return ProcessResult::kRemove;
+    }
+    return ProcessResult::kContinue;
+  }
+
+  template <typename NodeT>
+  ProcessResult Process(NodeT* node, const ProcessingState& state) {
+    return ProcessResult::kContinue;
+  }
+
+ private:
+  struct BoundsCheckInfo {
+    int32_t max_index;
+    bool emitted = false;
+  };
+
+  bool TryElide(Node* node, const ProcessingState& state) {
+    int32_t index = 0;
+    ValueNode* length = nullptr;
+    if (!TryGetConstantBoundsCheck(node, &index, &length)) {
+      return false;
+    }
+
+    if (!scanned_current_block_) {
+      FindMaxConstantIndicesInBlock(state.node_index(), index, length);
+    }
+
+    auto it = current_block_bounds_checks_.find(length);
+    if (it == current_block_bounds_checks_.end()) {
+      return false;
+    }
+
+    auto& [max_index, emitted] = it->second;
+    if (!emitted) {
+      // Rewrite the very first bounds check in the block to check the maximum
+      // index.
+      if (index < max_index) {
+        node->change_input(0, graph_->GetInt32Constant(max_index));
+      }
+      emitted = true;
+      return false;
+    } else if (index > max_index) {
+      // This bounds check did not exist when FindMaxConstantIndicesInBlock was
+      // called. Its index is larger than the maximum we found then, so we have
+      // to emit a bounds check.
+
+      // Future bounds checks can be elided if their index is less than the
+      // index of this bounds check.
+      max_index = index;
+      return false;
+    }
+    // Any subsequent constant bounds checks on this length are redundant.
+    return true;
+  }
+
+  bool TryGetConstantBoundsCheck(Node* node, int32_t* index_val,
+                                 ValueNode** length) {
+    ValueNode* index = nullptr;
+    if (auto* typed_bounds_check = node->TryCast<CheckTypedArrayBounds>()) {
+      index = typed_bounds_check->IndexInput().node();
+      *length = typed_bounds_check->LengthInput().node();
+    } else if (auto* int_bounds_check = node->TryCast<CheckInt32Condition>()) {
+      if (int_bounds_check->condition() == AssertCondition::kUnsignedLessThan) {
+        index = int_bounds_check->input_node(0);
+        *length = int_bounds_check->input_node(1);
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+    if (std::optional<int32_t> const_index = TryGetInt32Constant(index)) {
+      if (*const_index >= 0) {
+        *index_val = *const_index;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // TODO(ahaas): This is a copy of MaglevReducer::TryGetInt32Constant. We
+  // should share this logic.
+  std::optional<int32_t> TryGetInt32Constant(ValueNode* value) {
+    switch (value->opcode()) {
+      case Opcode::kHeapConstant: {
+        compiler::ObjectRef object = value->Cast<HeapConstant>()->object();
+        if (object.IsHeapNumber() &&
+            IsInt32Double(object.AsHeapNumber().value())) {
+          return static_cast<int32_t>(object.AsHeapNumber().value());
+        }
+        return {};
+      }
+      case Opcode::kInt32Constant:
+        return value->Cast<Int32Constant>()->value();
+      case Opcode::kUint32Constant: {
+        uint32_t uint32_value = value->Cast<Uint32Constant>()->value();
+        if (uint32_value <= INT32_MAX) {
+          return static_cast<int32_t>(uint32_value);
+        }
+        return {};
+      }
+      case Opcode::kSmiConstant:
+        return value->Cast<SmiConstant>()->value().value();
+      case Opcode::kFloat64Constant: {
+        double double_value =
+            value->Cast<Float64Constant>()->value().get_scalar();
+        if (!IsInt32Double(double_value)) return {};
+        return FastD2I(double_value);
+      }
+      default:
+        break;
+    }
+    return {};
+  }
+
+  void FindMaxConstantIndicesInBlock(int start_index, int32_t initial_index_val,
+                                     ValueNode* initial_length) {
+    scanned_current_block_ = true;
+    // This function gets called when the first bounds check in the block with a
+    // constant index is encountered. We can insert it directly into the map. We
+    // then have to scan the rest of the block for other bounds checks with
+    // constant indices.
+    current_block_bounds_checks_.insert(
+        {initial_length,
+         BoundsCheckInfo{initial_index_val, /*emitted=*/false}});
+    const auto& nodes = current_block_->nodes();
+    for (size_t i = start_index + 1; i < nodes.size(); ++i) {
+      Node* node = nodes[i];
+      if (node == nullptr) continue;
+      int32_t index = 0;
+      ValueNode* length = nullptr;
+      if (TryGetConstantBoundsCheck(node, &index, &length)) {
+        auto it = current_block_bounds_checks_.find(length);
+        if (it != current_block_bounds_checks_.end()) {
+          it->second.max_index = std::max(it->second.max_index, index);
+        } else {
+          current_block_bounds_checks_.insert(
+              {length, BoundsCheckInfo{index, /*emitted=*/false}});
+        }
+      }
+    }
+  }
+
+  void RecordIfSmiSafeIndex(CheckInt32Condition* node) {
+    if (node->condition() != AssertCondition::kUnsignedLessThan) return;
+    if (!IsSmiBoundedLength(node->input_node(1))) return;
+    current_block_smi_safe_.insert(node->input_node(0)->UnwrapIdentities());
+  }
+
+  bool IsKnownSmiSafe(ValueNode* node) {
+    return current_block_smi_safe_.contains(node->UnwrapIdentities());
+  }
+
+  bool IsSmiBoundedLength(ValueNode* length) {
+    length = length->UnwrapIdentities();
+    while (length->Is<CheckedSmiUntag>() || length->Is<UnsafeSmiUntag>()) {
+      length = length->input_node(0)->UnwrapIdentities();
+    }
+    if (auto* load = length->TryCast<LoadTaggedField>()) {
+      return load->is_array_length() == IsArrayLength::kYes &&
+             load->type() == NodeType::kSmi;
+    }
+    if (std::optional<int32_t> c = TryGetInt32Constant(length)) {
+      return *c >= 0 && *c <= Smi::kMaxValue;
+    }
+    return false;
+  }
+
+  Graph* graph_;
+  BasicBlock* current_block_ = nullptr;
+  ZoneMap<ValueNode*, BoundsCheckInfo> current_block_bounds_checks_;
+  ZoneAbslFlatHashSet<ValueNode*> current_block_smi_safe_;
+  bool scanned_current_block_ = false;
 };
 
 }  // namespace v8::internal::maglev

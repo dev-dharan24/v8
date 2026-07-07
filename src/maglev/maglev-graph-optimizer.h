@@ -32,7 +32,7 @@ class MaglevGraphOptimizer {
   void PreProcessGraph(Graph* graph) {}
   void PostProcessGraph(Graph* graph) {}
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block);
-  void PostProcessBasicBlock(BasicBlock* block);
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block);
   void PostPhiProcessing() {}
 
 #define DECLARE_PROCESS(NodeT)                                        \
@@ -72,6 +72,20 @@ class MaglevGraphOptimizer {
   }
 
   void AttachExceptionHandlerInfo(NodeBase* node);
+
+  // Called by the reducer for every node emitted while lowering. Such nodes
+  // (e.g. the specific call a generic call is reduced to) bypass
+  // PostProcessNode, so mirror its allocation-folding barrier here: a
+  // side-effecting node must stop folding into the current allocation block.
+  template <typename NodeT>
+  void MarkPossibleSideEffect(NodeT* node) {
+    if constexpr (Node::opcode_of<NodeT> != Opcode::kAllocationBlock &&
+                  (NodeT::kProperties.can_allocate() ||
+                   NodeT::kProperties.can_deopt() ||
+                   NodeT::kProperties.can_throw())) {
+      reducer_.ClearCurrentAllocationBlock();
+    }
+  }
 
   ProcessResult DeoptAndTruncate(DeoptimizeReason reason) {
     ReduceResult result = reducer_.EmitUnconditionalDeopt(reason);
@@ -122,6 +136,11 @@ class MaglevGraphOptimizer {
   MaybeReduceResult GetUntaggedValueWithRepresentation(
       ValueNode* node, UseRepresentation repr,
       std::optional<TaggedToFloat64ConversionType> conversion_type);
+
+  // Records the untagged input of a tagging conversion as the matching
+  // untagged alternative of `tagged`, so a later untagging use can reuse it.
+  template <ValueRepresentation kRepresentation>
+  void RegisterUntaggedAlternative(ValueNode* tagged);
 
   void PreProcessNode(Node*, const ProcessingState& state);
   void PostProcessNode(Node*);

@@ -586,8 +586,7 @@ bool Heap::CreateEarlyReadOnlyMapsAndObjects() {
     obj->set_map_after_allocation(isolate(), roots.descriptor_array_map(),
                                   SKIP_WRITE_BARRIER);
     Tagged<DescriptorArray> array = Cast<DescriptorArray>(obj);
-    array->Initialize(roots.empty_enum_cache(), roots.undefined_value(), 0, 0,
-                      DescriptorArrayMarkingState::kInitialGCState);
+    array->Initialize(roots.empty_enum_cache(), roots.undefined_value(), 0, 0);
     array->set_fast_iterable(DescriptorArray::FastIterableState::kJsonFast);
   }
   set_empty_descriptor_array(Cast<DescriptorArray>(obj));
@@ -961,7 +960,7 @@ void Heap::StaticRootsEnsureAllocatedSize(DirectHandle<HeapObject> obj,
             filler_size, AllocationType::kReadOnly, AllocationOrigin::kRuntime,
             AllocationAlignment::kTaggedAligned);
     CreateFillerObjectAt(filler.address(), filler_size,
-                         ClearFreedMemoryMode::kClearFreedMemory);
+                         ClearFreedMemoryMode{true});
 
     CHECK_EQ(filler.address(), obj->address() + obj_size);
     CHECK_EQ(filler.address() + filler->Size(), obj->address() + required);
@@ -1776,7 +1775,7 @@ void Heap::CreateInitialMutableObjects() {
         *ProtectedWeakFixedArray::New(isolate_, 0));
 #ifdef V8_ENABLE_WEBASSEMBLY
     set_empty_wasm_dispatch_table(*isolate_->factory()->NewWasmDispatchTable(
-        0, wasm::kWasmFuncRef, SharedFlag::kNo));
+        0, wasm::kWasmFuncRef, SharedFlag{false}));
 #endif
   }
 }

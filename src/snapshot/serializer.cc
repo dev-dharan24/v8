@@ -1154,7 +1154,7 @@ void Serializer::ObjectSerializer::VisitCppHeapPointer(
   // We serialize the slot as initialized-but-unused slot.  The actual API
   // wrapper serialization is implemented in
   // `ContextSerializer::SerializeApiWrapperFields()`.
-  DCHECK(IsJSApiWrapperObjectMap(object_->map()));
+  DCHECK(IsJSApiWrapperObjectMap(object_->map()) || IsNativeContext(*object_));
   static_assert(kCppHeapPointerSlotSize % kTaggedSize == 0);
   sink_->Put(
       FixedRawDataWithSize::Encode(kCppHeapPointerSlotSize >> kTaggedSizeLog2),
@@ -1403,15 +1403,6 @@ void Serializer::ObjectSerializer::OutputRawData(Address up_to) {
                                offsetof(SharedFunctionInfo, age_),
                                sizeof(field_value),
                                reinterpret_cast<uint8_t*>(&field_value));
-    } else if (IsDescriptorArray(*object_)) {
-      // The number of marked descriptors field can be changed by GC
-      // concurrently.
-      const auto field_value = DescriptorArrayMarkingState::kInitialGCState;
-      static_assert(sizeof(field_value) == DescriptorArray::kSizeOfRawGcState);
-      OutputRawWithCustomField(sink_, object_start, base, bytes_to_output,
-                               offsetof(DescriptorArray, raw_gc_state_),
-                               sizeof(field_value),
-                               reinterpret_cast<const uint8_t*>(&field_value));
     } else if (IsCode(*object_)) {
       // The instruction_start field contains a raw value that will be
       // recomputed after deserialization, so write zeros to keep the snapshot

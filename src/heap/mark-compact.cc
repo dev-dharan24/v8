@@ -4128,7 +4128,6 @@ void MarkCompactCollector::WeakenStrongDescriptorArrays() {
       DCHECK(IsStrongDescriptorArray(raw));
       raw->set_map_safe_transition_no_write_barrier(heap_->isolate(),
                                                     descriptor_array_map);
-      DCHECK_EQ(raw->raw_gc_state(kRelaxedLoad), 0);
     }
   }
   strong_descriptor_arrays_.clear();
@@ -4142,10 +4141,9 @@ void MarkCompactCollector::TrimDescriptorArray(
     return;
   }
   const bool can_trim =
-      v8_flags.trim_descriptor_arrays_in_gc &&
-      (v8_flags.trim_descriptor_arrays_in_gc_with_stack ||
-       (!heap_->IsGCWithStack() && heap_->ShouldReduceMemory()));
-  int to_trim =
+      !heap_->IsGCWithStack() && (heap_->ShouldReduceMemory() ||
+                                  v8_flags.stress_descriptor_array_trimming);
+  const int to_trim =
       descriptors->number_of_all_descriptors() - number_of_own_descriptors;
   DCHECK_IMPLIES(to_trim == 0, descriptors->number_of_all_descriptors() ==
                                    number_of_own_descriptors);
@@ -4673,7 +4671,6 @@ void MarkCompactCollector::EvacuatePrologue() {
   // Large new space.
   if (NewLargeObjectSpace* new_lo_space = heap_->new_lo_space()) {
     new_lo_space->Flip();
-    new_lo_space->ResetPendingObject();
   }
 
   // Old space.
@@ -4818,7 +4815,9 @@ void Evacuator::EvacuatePage(MutablePage* page) {
                  static_cast<void*>(this), static_cast<void*>(page),
                  chunk->InNewSpace(), page->will_be_promoted(),
                  page->is_executable(),
-                 heap_->new_space()->IsPromotionCandidate(page),
+                 (heap_->new_space() && chunk->InNewSpace())
+                     ? heap_->new_space()->IsPromotionCandidate(page)
+                     : false,
                  saved_live_bytes, evacuation_time, success);
   }
 }
