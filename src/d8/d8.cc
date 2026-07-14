@@ -52,6 +52,7 @@
 #include "src/base/platform/time.h"
 #include "src/base/platform/wrappers.h"
 #include "src/base/sanitizer/msan.h"
+#include "src/base/strong-alias.h"
 #include "src/base/sys-info.h"
 #include "src/base/utils/random-number-generator.h"
 #include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
@@ -61,6 +62,7 @@
 #include "src/debug/debug-interface.h"
 #include "src/deoptimizer/deoptimizer.h"
 #include "src/diagnostics/basic-block-profiler.h"
+#include "src/execution/execution.h"
 #include "src/execution/microtask-queue.h"
 #include "src/execution/v8threads.h"
 #include "src/execution/vm-state-inl.h"
@@ -4485,7 +4487,13 @@ void Shell::ReportException(Isolate* isolate, Local<v8::Message> message,
     return *value ? *value : "<string conversion failed>";
   };
 
-  v8::String::Utf8Value exception(isolate, exception_obj);
+  // Stringify the exception explicitly. Constructing the Utf8Value below would
+  // do this implicitly, but exception_obj may carry a user toString that
+  // terminates execution (or throws); doing it here lets us bail before
+  // re-entering V8 for the message conversions further down.
+  Local<String> exception_str;
+  if (!exception_obj->ToString(context).ToLocal(&exception_str)) return;
+  v8::String::Utf8Value exception(isolate, exception_str);
   const char* exception_string = ToCString(exception);
   if (message.IsEmpty()) {
     // V8 didn't provide any extra information about this error; just
@@ -5875,21 +5883,33 @@ class InspectorFrontend final : public v8_inspector::V8Inspector::Channel {
     Local<String> callback_name = v8::String::NewFromUtf8Literal(
         isolate_, "receive", NewStringType::kInternalized);
     Local<Context> context = context_.Get(isolate_);
-    Local<Value> callback =
-        context->Global()->Get(context, callback_name).ToLocalChecked();
+    Local<Value> callback;
+    if (!context->Global()->Get(context, callback_name).ToLocal(&callback)) {
+      return;
+    }
     if (callback->IsFunction()) {
       v8::TryCatch try_catch(isolate_);
-      Local<Value> args[] = {message};
-      USE(callback.As<Function>()->Call(context, Undefined(isolate_), 1, args));
+      i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate_);
+      i::DirectHandle<i::Object> i_callback =
+          Utils::OpenDirectHandle(*callback);
+      i::DirectHandle<i::Object> i_receiver =
+          i_isolate->factory()->undefined_value();
+      i::DirectHandle<i::Object> i_args[] = {Utils::OpenDirectHandle(*message)};
+      i::MaybeDirectHandle<i::Object> maybe_exception;
+      std::ignore = i::Execution::TryCall(
+          i_isolate, i_callback, i_receiver, base::VectorOf(i_args),
+          i::Execution::MessageHandling::kKeepPending, &maybe_exception);
 #ifdef DEBUG
-      if (try_catch.HasCaught() && !try_catch.HasTerminated() &&
-          !i::v8_flags.fuzzing) {
-        Local<Object> exception = try_catch.Exception().As<Object>();
+      i::DirectHandle<i::Object> i_exception;
+      if (maybe_exception.ToHandle(&i_exception) &&
+          !try_catch.HasTerminated() && !i::v8_flags.fuzzing) {
+        Local<Value> exception = Utils::ToLocal(i_exception);
+        Local<Object> exception_obj = exception.As<Object>();
         Local<String> key = v8::String::NewFromUtf8Literal(
             isolate_, "message", NewStringType::kInternalized);
         Local<String> expected = v8::String::NewFromUtf8Literal(
             isolate_, "Maximum call stack size exceeded");
-        Local<Value> value = exception->Get(context, key).ToLocalChecked();
+        Local<Value> value = exception_obj->Get(context, key).ToLocalChecked();
         DCHECK(value->StrictEquals(expected));
       }
 #endif
@@ -5929,14 +5949,29 @@ class InspectorClient : public v8_inspector::V8InspectorClient {
     context_.Reset(isolate_, global_context);
   }
 
+  ~InspectorClient() override {
+    // The InspectorClient is stack-allocated in RunMainIsolate(). Async tasks
+    // (e.g. WebAssembly compilation) may outlive that frame and later invoke
+    // `send()` in the old context. Clear the raw pointer we stashed in the
+    // context's embedder data so those calls fail safely instead of touching
+    // dead stack memory.
+    if (!isolate_) return;
+    HandleScope scope(isolate_);
+    Local<Context> context = context_.Get(isolate_);
+    context->SetAlignedPointerInEmbedderData(kInspectorClientIndex, nullptr,
+                                             kInspectorClientTag);
+  }
+
   void runMessageLoopOnPause(int contextGroupId) override {
     v8::Isolate::AllowJavascriptExecutionScope allow_script(isolate_);
     v8::HandleScope handle_scope(isolate_);
     Local<String> callback_name = v8::String::NewFromUtf8Literal(
         isolate_, "handleInspectorMessage", NewStringType::kInternalized);
     Local<Context> context = context_.Get(isolate_);
-    Local<Value> callback =
-        context->Global()->Get(context, callback_name).ToLocalChecked();
+    Local<Value> callback;
+    if (!context->Global()->Get(context, callback_name).ToLocal(&callback)) {
+      return;
+    }
     if (!callback->IsFunction()) return;
 
     // Running the message loop below may trigger the execution of a stackless
@@ -5966,7 +6001,7 @@ class InspectorClient : public v8_inspector::V8InspectorClient {
     InspectorClient* inspector_client = static_cast<InspectorClient*>(
         context->GetAlignedPointerFromEmbedderData(kInspectorClientIndex,
                                                    kInspectorClientTag));
-    return inspector_client->session_.get();
+    return inspector_client ? inspector_client->session_.get() : nullptr;
   }
 
   Local<Context> ensureDefaultContextInGroup(int group_id) override {
@@ -5985,6 +6020,7 @@ class InspectorClient : public v8_inspector::V8InspectorClient {
     Local<String> message = info[0]->ToString(context).ToLocalChecked();
     v8_inspector::V8InspectorSession* session =
         InspectorClient::GetSession(context);
+    if (!session) return;
     uint32_t length = message->Length();
     std::unique_ptr<uint16_t[]> buffer(new uint16_t[length]);
     message->Write(isolate, 0, length, buffer.get());
@@ -6003,7 +6039,7 @@ class InspectorClient : public v8_inspector::V8InspectorClient {
   std::unique_ptr<v8_inspector::V8Inspector::Channel> channel_;
   bool is_paused = false;
   Global<Context> context_;
-  Isolate* isolate_;
+  Isolate* isolate_ = nullptr;
 };
 
 SourceGroup::~SourceGroup() {
@@ -6803,7 +6839,10 @@ void Worker::Close(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 namespace {
 
-bool FlagMatches(const char* flag, char** arg, bool keep_flag = false) {
+using KeepFlag = base::StrongAlias<struct KeepFlagTag, bool>;
+
+bool FlagMatches(const char* flag, char** arg,
+                 KeepFlag keep_flag = KeepFlag{false}) {
   if (strcmp(*arg, flag) == 0) {
     if (!keep_flag) {
       *arg = nullptr;
@@ -6815,7 +6854,8 @@ bool FlagMatches(const char* flag, char** arg, bool keep_flag = false) {
 
 template <size_t N>
 bool FlagWithArgMatches(const char (&flag)[N], char** flag_value, int argc,
-                        char* argv[], int* i, bool keep_flag = false) {
+                        char* argv[], int* i,
+                        KeepFlag keep_flag = KeepFlag{false}) {
   char* current_arg = argv[*i];
 
   // Compare the flag up to the last character of the flag name (not including
@@ -6845,6 +6885,7 @@ bool FlagWithArgMatches(const char (&flag)[N], char** flag_value, int argc,
 }  // namespace
 
 bool Shell::SetOptions(int argc, char* argv[]) {
+  i::v8_flags.flag_processing_mode = "abort-on-error";
   options.d8_path = argv[0];
   bool disallow_unsafe_flags = false;
   bool flag_processing_mode_explicitly_set = false;
@@ -6862,7 +6903,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     } else if (FlagMatches("--simulate-errors", &argv[i])) {
       options.simulate_errors = true;
     } else if (FlagWithArgMatches("--flag-processing-mode", &flag_value, argc,
-                                  argv, &i, /*keep_flag=*/true)) {
+                                  argv, &i, KeepFlag{true})) {
       if (!flag_processing_mode_explicitly_set) {
         flag_processing_mode_explicitly_set = true;
         if (strcmp(flag_value, "exit-on-error") == 0) {
@@ -6876,8 +6917,8 @@ bool Shell::SetOptions(int argc, char* argv[]) {
           exit_on_flag_contradictions = false;
         }
       }
-    } else if (FlagMatches("--fuzzing", &argv[i], /*keep_flag=*/true) ||
-               FlagMatches("--sandbox-fuzzing", &argv[i], /*keep_flag=*/true)) {
+    } else if (FlagMatches("--fuzzing", &argv[i], KeepFlag{true}) ||
+               FlagMatches("--sandbox-fuzzing", &argv[i], KeepFlag{true})) {
       // Set v8_flags.fuzzing early because this is tested in some locations to
       // decide how to handle conflicting flags (it would later be set by
       // implications but we need it being set earlier).
@@ -6885,8 +6926,32 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       if (!flag_processing_mode_explicitly_set) {
         check_d8_flag_contradictions = false;
       }
+    } else if (FlagMatches("--run-as-security-poc", &argv[i], KeepFlag{true}) ||
+               FlagMatches("--run-as-sandbox-security-poc", &argv[i],
+                           KeepFlag{true})) {
+      // Setting the security poc flag automatically also sets the flag
+      // processing mode. We cannot use a regular implication on V8 flags here
+      // as we want to prevent --fuzzing or other --flag-processing-mode to
+      // override any behavior here.
+      flag_processing_mode_explicitly_set = true;
+      check_d8_flag_contradictions = true;
+      exit_on_flag_contradictions = true;
+      // Flag implications are only processed much later, so we need to manually
+      // establish this link here.
+      disallow_unsafe_flags = true;
+      static constexpr char kFlagProcessingMode[] =
+          "--flag-processing-mode=exit-on-error";
+      i::FlagList::SetFlagsFromString(kFlagProcessingMode,
+                                      strlen(kFlagProcessingMode));
+      // We require `--run-as-security-poc`or `--run-as-sandbox-security-poc` as
+      // first parameter to set the flag processing modes properly. The
+      // configuration then consistently bails out with exit(-1) for flag
+      // contradictions.
+      if (i != 1) {
+        ReportFlagError("Flag '%s' must be the first parameter.", argv[i]);
+      }
     } else if (FlagMatches("--disallow-unsafe-flags", &argv[i],
-                           /*keep_flag=*/true)) {
+                           KeepFlag{true})) {
       disallow_unsafe_flags = true;
     } else if (FlagMatches("--version", &argv[i])) {
       printf("V8 version %s\n", V8::GetVersion());
@@ -6911,12 +6976,12 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       // TODO(herhut) Remove this flag once wasm compilation is fully
       // isolate-independent.
       options.wait_for_background_tasks = false;
-    } else if (FlagMatches("-f", &argv[i], /*keep_flag=*/true)) {
+    } else if (FlagMatches("-f", &argv[i], KeepFlag{true})) {
       // Ignore any -f flags for compatibility with other stand-alone
       // JavaScript engines.
       continue;
     } else if (FlagWithArgMatches("-C", &flag_value, argc, argv, &i,
-                                  /*keep_flag=*/true)) {
+                                  KeepFlag{true})) {
       if (options.cwd.WasSpecified()) {
         FATAL("Only one -C option is allowed.");
       }
@@ -7155,7 +7220,6 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       "  -C        set the current working directory before executing "
       "subsequent files\n";
   using HelpOptions = i::FlagList::HelpOptions;
-  i::v8_flags.flag_processing_mode = "abort-on-error";
   static constexpr char kStandaloneD8ShellFlag[] = "--is_standalone_d8_shell";
   i::FlagList::SetFlagsFromString(kStandaloneD8ShellFlag,
                                   strlen(kStandaloneD8ShellFlag));
@@ -8163,6 +8227,11 @@ int Shell::Main(int argc, char* argv[]) {
               // Isolate to avoid retaining stray tasks with v8::Global pointing
               // into a reclaimed Isolate.
               platform::NotifyIsolateShutdown(g_default_platform, isolate2);
+#ifdef V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
+              if (Shell::options.memory_corruption_via_watchpoints) {
+                ResetAllHardwareWatchpoints();
+              }
+#endif  // V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
               isolate2->Dispose();
             });
 

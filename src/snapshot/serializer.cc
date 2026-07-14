@@ -929,17 +929,6 @@ void Serializer::ObjectSerializer::SerializeObject() {
   Tagged<Map> map = object_->map();
   int size = object_->SizeFromMap(map);
 
-  // Descriptor arrays have complex element weakness, that is dependent on the
-  // maps pointing to them. During deserialization, this can cause them to get
-  // prematurely trimmed if one of their owners isn't deserialized yet. We work
-  // around this by forcing all descriptor arrays to be serialized as "strong",
-  // i.e. no custom weakness, and "re-weaken" them in the deserializer once
-  // deserialization completes.
-  //
-  // See also `Deserializer::WeakenDescriptorArrays`.
-  if (map == ReadOnlyRoots(isolate()).descriptor_array_map()) {
-    map = ReadOnlyRoots(isolate()).strong_descriptor_array_map();
-  }
   SnapshotSpace space = GetSnapshotSpace(isolate(), *object_);
   SerializePrologue(space, size, map);
 
@@ -1147,6 +1136,9 @@ void Serializer::ObjectSerializer::OutputExternalReference(
 
 void Serializer::ObjectSerializer::VisitCppHeapPointer(
     Tagged<HeapObject> host, CppHeapPointerSlot slot) {
+  // If necessary, output any raw data preceding this slot.
+  OutputRawData(slot.address());
+
   PtrComprCageBase cage_base(isolate());
   // Currently there's only very limited support for CppHeapPointerSlot
   // serialization as it's only used for API wrappers.
@@ -1172,7 +1164,7 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
       InstanceTypeChecker::IsAccessorInfo(instance_type) ||
       InstanceTypeChecker::IsInterceptorInfo(instance_type) ||
       InstanceTypeChecker::IsFunctionTemplateInfo(instance_type)) {
-    // Output raw data payload, if any.
+    // If necessary, output any raw data preceding this slot.
     OutputRawData(slot.address());
     Address value = slot.load(isolate());
 #ifdef V8_ENABLE_SANDBOX
@@ -1187,6 +1179,19 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
     const bool sandboxify = V8_ENABLE_SANDBOX_BOOL;
     OutputExternalReference(value, kSystemPointerSize, sandboxify, tag);
     bytes_processed_so_far_ += kExternalPointerSlotSize;
+
+#ifndef V8_CPPGC_MICROTASK_QUEUE
+  } else if (InstanceTypeChecker::IsNativeContext(instance_type)) {
+    // If necessary, output any raw data preceding this slot.
+    OutputRawData(slot.address());
+    // Serialize MicrotaskQueue* value as nullptr (it'll be set to correct
+    // value during deserialization anyway).
+    const bool sandboxify = V8_ENABLE_SANDBOX_BOOL;
+    OutputExternalReference(kNullAddress, kSystemPointerSize, sandboxify,
+                            kNativeContextMicrotaskQueueTag);
+    bytes_processed_so_far_ += kExternalPointerSlotSize;
+#endif  // V8_CPPGC_MICROTASK_QUEUE
+
   } else {
     // Serialization of external references in other objects is handled
     // elsewhere or not supported.
@@ -1200,8 +1205,6 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
         InstanceTypeChecker::IsJSArrayBuffer(instance_type) ||
         // See ObjectSerializer::SerializeExternalString().
         InstanceTypeChecker::IsExternalString(instance_type) ||
-        // See ObjectSerializer::SanitizeNativeContextScope.
-        InstanceTypeChecker::IsNativeContext(instance_type) ||
         // Serialization of external pointers stored in
         // JSSynchronizationPrimitive is not supported.
         // TODO(v8:12547): JSSynchronizationPrimitives should also be sanitized
@@ -1267,7 +1270,7 @@ void Serializer::ObjectSerializer::VisitProtectedPointer(
   if (content == Smi::zero()) return;
   DCHECK(!IsSmi(content));
 
-  // If necessary, output any raw data preceeding this slot.
+  // If necessary, output any raw data preceding this slot.
   OutputRawData(slot.address());
 
   Handle<HeapObject> object(Cast<HeapObject>(content), isolate());

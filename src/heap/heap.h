@@ -351,15 +351,6 @@ class Heap final {
 
   static size_t HeapSizeToSemiSpaceRatio(uint64_t physical_memory);
 
-  // Calculates the maximum amount of filler that could be required by the
-  // given alignment.
-  V8_EXPORT_PRIVATE static int GetMaximumFillToAlign(
-      AllocationAlignment alignment);
-  // Calculates the actual amount of filler required for a given address at the
-  // given alignment.
-  V8_EXPORT_PRIVATE static int GetFillToAlign(Address address,
-                                              AllocationAlignment alignment);
-
   // Returns the size of the initial area of a code-range, which is marked
   // writable and reserved to contain unwind information.
   static size_t GetCodeRangeReservedAreaSize();
@@ -436,12 +427,6 @@ class Heap final {
   // Notifies the heap that is ok to start marking or other activities that
   // should not happen during deserialization.
   void NotifyDeserializationComplete();
-
-  // Weakens StrongDescriptorArray objects into regular DescriptorArray objects.
-  //
-  // Thread-safe.
-  void WeakenDescriptorArrays(
-      GlobalHandleVector<DescriptorArray> strong_descriptor_arrays);
 
   void NotifyBootstrapComplete();
 
@@ -2607,6 +2592,7 @@ using TraceRingBuffer = char[Heap::kTraceRingBufferSize + 1];
   V(ByteSize, malloced_memory)              \
   V(ByteSize, malloced_peak_memory)         \
   V(size_t, isolate_count)                  \
+  V(size_t, native_context_count)           \
   V(size_t, last_os_error)                  \
   V(bool, is_main_isolate)                  \
   V(CageStats, main_cage)                   \

@@ -1733,6 +1733,38 @@ void BaselineCompiler::VisitIntrinsicAsyncFunctionResolve(
   CallBuiltin<Builtin::kAsyncFunctionResolve>(args);
 }
 
+void BaselineCompiler::VisitIntrinsicGeneratorYieldResult(
+    interpreter::RegisterList args) {
+  Register value = WriteBarrierDescriptor::ValueRegister();
+  Register generator = WriteBarrierDescriptor::ObjectRegister();
+  DCHECK(!AreAliased(value, generator, kInterpreterAccumulatorRegister));
+
+  Label allocate, done;
+
+  __ LoadRegister(generator, args[1]);  // generator
+
+  // Check whether the generator user asked to skip result allocation
+  // (yielded_value_ == TheHole).
+  __ LoadTaggedField(kInterpreterAccumulatorRegister, generator,
+                     offsetof(JSGeneratorObject, yielded_value_));
+  __ JumpIfNotRoot(kInterpreterAccumulatorRegister, RootIndex::kTheHoleValue,
+                   &allocate);
+
+  // Skip allocation: store value into yielded_value_.
+  __ LoadRegister(value, args[0]);  // value
+  __ StoreTaggedFieldWithWriteBarrier(
+      generator, offsetof(JSGeneratorObject, yielded_value_), value);
+
+  __ LoadRoot(kInterpreterAccumulatorRegister, RootIndex::kTheHoleValue);
+  __ Jump(&done);
+
+  __ Bind(&allocate);
+  CallBuiltin<Builtin::kCreateIterResultObject>(args[0],
+                                                RootIndex::kFalseValue);
+
+  __ Bind(&done);
+}
+
 void BaselineCompiler::VisitIntrinsicAsyncGeneratorAwait(
     interpreter::RegisterList args) {
   CallBuiltin<Builtin::kAsyncGeneratorAwait>(args);
@@ -2721,12 +2753,10 @@ void BaselineCompiler::VisitGetIterator() {
 void BaselineCompiler::VisitArrayDestructure() {
   interpreter::Register first_reg = RegisterOperand(0);
   uint32_t count = RegisterCount(1);
-  CallBuiltin<Builtin::kArrayDestructure>(kInterpreterAccumulatorRegister,
-                                          Smi::FromInt(count));
-  for (uint32_t i = 0; i < count; ++i) {
-    __ LoadFixedArrayElement(kReturnRegister1, kReturnRegister0, i);
-    __ Move(interpreter::Register(first_reg.index() + i), kReturnRegister1);
-  }
+  Register first_reg_addr = ArrayDestructureDescriptor::GetRegisterParameter(2);
+  __ RegisterFrameAddress(first_reg, first_reg_addr);
+  CallBuiltin<Builtin::kArrayDestructure>(
+      kInterpreterAccumulatorRegister, static_cast<int>(count), first_reg_addr);
 }
 
 void BaselineCompiler::VisitDebugger() {

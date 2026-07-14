@@ -417,64 +417,100 @@ TF_BUILTIN(IterableToListConvertHoles, IteratorBuiltinsAssembler) {
 }
 
 void IteratorBuiltinsAssembler::FastIterableToList(
-    TNode<Context> context, TNode<JSAny> iterable,
+    TNode<Context> context, TNode<JSAny> maybe_iterable,
     TVariable<JSArray>* var_result, Label* slow) {
-  Label done(this), check_string(this), check_map(this), check_set(this);
+  Label done(this);
+
+  GotoIfForceSlowPath(slow);
 
   // Always call the `next()` builtins when the debugger is
   // active, to ensure we capture side-effects correctly.
   GotoIf(IsDebugActive(), slow);
 
-  GotoIfNot(
-      Word32Or(IsFastJSArrayWithNoCustomIteration(context, iterable),
-               IsFastJSArrayForReadWithNoCustomIteration(context, iterable)),
-      &check_string);
+  GotoIf(TaggedIsSmi(maybe_iterable), slow);
+  TNode<JSAnyNotSmi> iterable = CAST(maybe_iterable);
 
-  // Fast path for fast JSArray.
-  *var_result = CAST(
-      CallBuiltin(Builtin::kCloneFastJSArrayFillingHoles, context, iterable));
-  Goto(&done);
-
-  BIND(&check_string);
+  // Check FastJSArrayForReadWithNoCustomIteration case.
   {
-    Label string_maybe_fast_call(this);
+    Label check_next(this);
+    GotoIfNot(IsFastJSArrayForReadWithNoCustomIteration(context, iterable),
+              &check_next);
+
+    // Fast path for fast JSArray.
+    *var_result = CAST(
+        CallBuiltin(Builtin::kCloneFastJSArrayFillingHoles, context, iterable));
+    Goto(&done);
+
+    BIND(&check_next);
+  }
+  // Check StringPrimitiveWithNoCustomIteration case.
+  {
+    Label if_fast(this), check_next(this);
     StringBuiltinsAssembler string_assembler(state());
     string_assembler.BranchIfStringPrimitiveWithNoCustomIteration(
-        iterable, context, &string_maybe_fast_call, &check_map);
+        iterable, &if_fast, &check_next);
 
-    BIND(&string_maybe_fast_call);
-    const TNode<Uint32T> length = LoadStringLengthAsWord32(CAST(iterable));
-    // Use string length as conservative approximation of number of codepoints.
-    GotoIf(
-        Uint32GreaterThan(length, Uint32Constant(JSArray::kMaxFastArrayLength)),
-        slow);
-    *var_result = CAST(CallBuiltin(Builtin::kStringToList, context, iterable));
-    Goto(&done);
+    BIND(&if_fast);
+    {
+      const TNode<Uint32T> length = LoadStringLengthAsWord32(CAST(iterable));
+      // Use string length as conservative approximation of number of
+      // codepoints.
+      GotoIf(Uint32GreaterThan(length,
+                               Uint32Constant(JSArray::kMaxFastArrayLength)),
+             slow);
+      *var_result =
+          CAST(CallBuiltin(Builtin::kStringToList, context, iterable));
+      Goto(&done);
+    }
+
+    BIND(&check_next);
   }
-
-  BIND(&check_map);
+  // Check FastIterableToListInterceptor case.
   {
-    Label map_fast_call(this);
+    Label if_fast(this), check_next(this);
+    BranchIfFastIterableToListInterceptor(iterable, &if_fast, &check_next);
+
+    BIND(&if_fast);
+    {
+      TNode<Object> result = CallRuntime(
+          Runtime::kIterableToListWithInterceptor, context, iterable);
+      *var_result = CAST(result);
+      Goto(&done);
+    }
+
+    BIND(&check_next);
+  }
+  // Check IterableWithOriginalKeyOrValueMapIterator case.
+  {
+    Label if_fast(this), check_next(this);
     BranchIfIterableWithOriginalKeyOrValueMapIterator(
-        state(), iterable, context, &map_fast_call, &check_set);
+        state(), iterable, context, &if_fast, &check_next);
 
-    BIND(&map_fast_call);
-    *var_result =
-        CAST(CallBuiltin(Builtin::kMapIteratorToList, context, iterable));
-    Goto(&done);
+    BIND(&if_fast);
+    {
+      *var_result =
+          CAST(CallBuiltin(Builtin::kMapIteratorToList, context, iterable));
+      Goto(&done);
+    }
+
+    BIND(&check_next);
   }
-
-  BIND(&check_set);
+  // Check IterableWithOriginalValueSetIterator case.
   {
-    Label set_fast_call(this);
+    Label if_fast(this), check_next(this);
     BranchIfIterableWithOriginalValueSetIterator(state(), iterable, context,
-                                                 &set_fast_call, slow);
+                                                 &if_fast, &check_next);
 
-    BIND(&set_fast_call);
-    *var_result =
-        CAST(CallBuiltin(Builtin::kSetOrSetIteratorToList, context, iterable));
-    Goto(&done);
+    BIND(&if_fast);
+    {
+      *var_result = CAST(
+          CallBuiltin(Builtin::kSetOrSetIteratorToList, context, iterable));
+      Goto(&done);
+    }
+
+    BIND(&check_next);
   }
+  Goto(slow);
 
   BIND(&done);
 }
@@ -620,139 +656,6 @@ TF_BUILTIN(IterableToFixedArrayWithSymbolLookupSlow,
   TNode<Object> iterator_fn = GetIteratorMethod(context, iterable);
   TailCallBuiltin(Builtin::kIterableToFixedArray, context, iterable,
                   iterator_fn);
-}
-
-TNode<FixedArray> IteratorBuiltinsAssembler::ArrayDestructure(
-    TNode<Context> context, TNode<Object> receiver, TNode<Smi> count_smi) {
-  // TODO(leszeks): Add a mode for bytecode and Sparkplug where the builtin
-  // takes the on-stack address of the first register + register list length,
-  // and writes directly from array backing store to register stack slot instead
-  // of allocating an intermediate FixedArray.
-  TNode<JSAny> iterable = CAST(receiver);
-  TNode<IntPtrT> count = PositiveSmiUntag(count_smi);
-  TVARIABLE(FixedArray, var_result, EmptyFixedArrayConstant());
-  Label done(this), slow_path(this), fast_array(this);
-
-  // Fast path conditions:
-  // 1. Not forced to slow path (e.g. via flags or stress modes).
-  // 2. Debug is not active (to allow debugger stepping hook checks).
-  // 3. The iterable is a fast JSArray with unmodified iteration
-  //    protocols (IsFastJSArrayWithNoCustomIteration /
-  //    IsFastJSArrayForReadWithNoCustomIteration).
-  GotoIfForceSlowPath(&slow_path);
-  GotoIf(IsDebugActive(), &slow_path);
-  Branch(Word32Or(IsFastJSArrayWithNoCustomIteration(context, iterable),
-                  IsFastJSArrayForReadWithNoCustomIteration(context, iterable)),
-         &fast_array, &slow_path);
-
-  BIND(&fast_array);
-  {
-    GotoIf(WordEqual(count, IntPtrConstant(0)), &done);
-    TNode<FixedArray> allocated_result =
-        CAST(AllocateFixedArray(PACKED_ELEMENTS, count, AllocationFlag::kNone));
-    FillFixedArrayWithValue(PACKED_ELEMENTS, allocated_result,
-                            IntPtrConstant(0), count,
-                            RootIndex::kUndefinedValue);
-    var_result = allocated_result;
-    TNode<JSArray> list = CAST(iterable);
-    TNode<FixedArrayBase> elements = LoadElements(list);
-    TNode<IntPtrT> length = PositiveSmiUntag(CAST(LoadJSArrayLength(list)));
-    TNode<IntPtrT> copy_len = IntPtrMin(count, length);
-    GotoIf(WordEqual(copy_len, IntPtrConstant(0)), &done);
-    TNode<Int32T> elements_kind = LoadMapElementsKind(LoadMap(list));
-    Label if_double(this), if_not_double(this);
-    Branch(IsDoubleElementsKind(elements_kind), &if_double, &if_not_double);
-
-    BIND(&if_double);
-    {
-      CopyFixedArrayElements(PACKED_DOUBLE_ELEMENTS, elements, PACKED_ELEMENTS,
-                             allocated_result, IntPtrConstant(0), copy_len,
-                             copy_len, UPDATE_WRITE_BARRIER,
-                             HoleConversionMode::kConvertToUndefined);
-      Goto(&done);
-    }
-
-    BIND(&if_not_double);
-    {
-      CopyFixedArrayElements(PACKED_ELEMENTS, elements, PACKED_ELEMENTS,
-                             allocated_result, IntPtrConstant(0), copy_len,
-                             copy_len, UPDATE_WRITE_BARRIER,
-                             HoleConversionMode::kConvertToUndefined);
-      Goto(&done);
-    }
-  }
-
-  BIND(&slow_path);
-  {
-    TVARIABLE(FixedArray, var_allocated, EmptyFixedArrayConstant());
-    Label allocate_done(this);
-    GotoIf(WordEqual(count, IntPtrConstant(0)), &allocate_done);
-    TNode<FixedArray> res =
-        CAST(AllocateFixedArray(PACKED_ELEMENTS, count, AllocationFlag::kNone));
-    FillFixedArrayWithValue(PACKED_ELEMENTS, res, IntPtrConstant(0), count,
-                            RootIndex::kUndefinedValue);
-    var_allocated = res;
-    Goto(&allocate_done);
-
-    BIND(&allocate_done);
-    var_result = var_allocated.value();
-
-    TVARIABLE(IntPtrT, var_index, IntPtrConstant(0));
-    Iterate(
-        context, iterable, GetIteratorMethod(context, iterable),
-        [&]() { return IntPtrLessThan(var_index.value(), count); },
-        [&](TNode<Object> next_value) {
-          StoreFixedArrayElement(var_allocated.value(), var_index.value(),
-                                 next_value);
-          var_index = IntPtrAdd(var_index.value(), IntPtrConstant(1));
-        },
-        {&var_index});
-    Goto(&done);
-  }
-
-  BIND(&done);
-  return var_result.value();
-}
-
-TF_BUILTIN(ArrayDestructure, IteratorBuiltinsAssembler) {
-  auto context = Parameter<Context>(Descriptor::kContext);
-  auto receiver = Parameter<Object>(Descriptor::kReceiver);
-  auto count = Parameter<Smi>(Descriptor::kCount);
-
-  Return(ArrayDestructure(context, receiver, count));
-}
-
-// Continuation builtin invoked when lazy deoptimization triggers during or
-// after Builtin::kArrayDestructure. Because JSArrayDestructure lowers to a stub
-// call returning a FixedArray, unoptimized interpreted code expects the
-// destructured elements to reside directly in sequential register stack slots
-// rather than inside an array. This continuation takes the returned FixedArray
-// and unpacks its elements directly into the interpreted stack frame slots
-// starting at first_reg.
-TF_BUILTIN(ArrayDestructureLazyDeoptContinuation, IteratorBuiltinsAssembler) {
-  auto first_reg_smi = Parameter<Smi>(Descriptor::kFirstReg);
-  auto count_smi = Parameter<Smi>(Descriptor::kCount);
-  auto result = Parameter<FixedArray>(Descriptor::kResult);
-
-  TNode<RawPtrT> caller_fp = LoadParentFramePointer();
-  TNode<IntPtrT> first_reg = PositiveSmiUntag(first_reg_smi);
-  TNode<IntPtrT> count = PositiveSmiUntag(count_smi);
-
-  BuildFastLoop<IntPtrT>(
-      IntPtrConstant(0), count,
-      [&](TNode<IntPtrT> i) {
-        TNode<Object> val = LoadFixedArrayElement(result, i);
-        TNode<IntPtrT> reg_index = IntPtrAdd(first_reg, i);
-        TNode<IntPtrT> offset = IntPtrSub(
-            IntPtrConstant(InterpreterFrameConstants::kRegisterFileFromFp),
-            TimesSystemPointerSize(reg_index));
-        TNode<RawPtrT> target_addr = ReinterpretCast<RawPtrT>(
-            IntPtrAdd(ReinterpretCast<IntPtrT>(caller_fp), offset));
-        StoreFullTaggedNoWriteBarrier(target_addr, IntPtrConstant(0), val);
-      },
-      1, kNoLoopUnrolling, IndexAdvanceMode::kPost);
-
-  Return(result);
 }
 
 #include "src/codegen/undef-code-stub-assembler-macros.inc"

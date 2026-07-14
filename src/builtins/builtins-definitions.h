@@ -309,6 +309,7 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
   /* Construct a JSValue. */                                                   \
   ASM(JSConstructEntryTrampoline, JSEntry)                                     \
   ASM(ResumeGeneratorTrampoline, ResumeGenerator)                              \
+  TFC(ResumeGeneratorTrampoline_WithCatch, ResumeGenerator)                    \
                                                                                \
   /* String helpers */                                                         \
   IF_TSA(TFC_TSA, TFC, StringFromCodePointAt, StringAtAsString)                \
@@ -785,8 +786,6 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
       ForOfNextLoadValueEagerDeoptContinuation)                                \
   TFC(ForOfNextLoadValueLazyDeoptContinuation,                                 \
       ForOfNextLoadValueLazyDeoptContinuation)                                 \
-  TFC(ArrayDestructureLazyDeoptContinuation,                                   \
-      ArrayDestructureLazyDeoptContinuation)                                   \
                                                                                \
   /* Global object */                                                          \
   CPP(GlobalDecodeURI, kDontAdaptArgumentsSentinel)                            \
@@ -878,7 +877,6 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
                                                                                \
   /* IterableToList */                                                         \
   TFS(IterableToList, NeedsContext{true}, kIterable, kIteratorFn)              \
-  TFS(ArrayDestructure, NeedsContext{true}, kReceiver, kCount)                 \
   TFS(IterableToFixedArray, NeedsContext{true}, kIterable, kIteratorFn)        \
   TFS(IterableToListWithSymbolLookup, NeedsContext{true}, kIterable)           \
   TFS(IterableToFixedArrayWithSymbolLookupSlow, NeedsContext{true}, kIterable) \
@@ -1408,6 +1406,7 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
   IF_WASM(ASM, WasmCompileLazy, WasmDummy)                                     \
   IF_WASM(ASM, WasmLiftoffFrameSetup, WasmDummy)                               \
   IF_WASM(ASM, WasmDebugBreak, WasmDummy)                                      \
+  IF_WASM(ASM, WasmDebugTrap, WasmDummy)                                       \
   IF_WASM(ASM, WasmOnStackReplace, WasmDummy)                                  \
   IF_WASM(ASM, WasmHandleStackOverflow, WasmHandleStackOverflow)               \
   IF_WASM(TFC, WasmFloat32ToNumber, WasmFloat32ToNumber)                       \

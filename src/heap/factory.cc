@@ -56,6 +56,7 @@
 #include "src/objects/fixed-primitive-array-inl.h"
 #include "src/objects/foreign-inl.h"
 #include "src/objects/hash-seed-wrapper.h"
+#include "src/objects/heap-object-field-inl.h"
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/heap-object.h"
 #include "src/objects/instance-type-inl.h"
@@ -65,6 +66,7 @@
 #include "src/objects/js-collection-inl.h"
 #include "src/objects/js-disposable-stack-inl.h"
 #include "src/objects/js-generator-inl.h"
+#include "src/objects/js-interceptor-map-inl.h"
 #include "src/objects/js-objects.h"
 #include "src/objects/js-proxy-inl.h"
 #include "src/objects/js-regexp-inl.h"
@@ -893,6 +895,7 @@ MaybeHandle<String> NewStringFromBytes(Isolate* isolate, PeekBytes peek_bytes,
       return isolate->factory()->LookupSingleCharacterStringFromCode(codepoint);
     }
     // Allocate string.
+    SharedObjectConditionalSafePublishGuard publish_guard(allocation);
     Handle<SeqOneByteString> result;
     ASSIGN_RETURN_ON_EXCEPTION(
         isolate, result,
@@ -905,6 +908,7 @@ MaybeHandle<String> NewStringFromBytes(Isolate* isolate, PeekBytes peek_bytes,
   }
 
   // Allocate string.
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   Handle<SeqTwoByteString> result;
   ASSIGN_RETURN_ON_EXCEPTION(isolate, result,
                              StringPolicy::AllocateTwoByteString(
@@ -1910,6 +1914,7 @@ DirectHandle<InterceptorInfo> Factory::NewInterceptorInfo(
 #undef INIT_CALLBACK_FIELD
 
   info->init_indexed_index_of();
+  info->init_indexed_iterable_to_list();
 
   return direct_handle(info, isolate());
 }
@@ -2418,6 +2423,7 @@ DirectHandle<WasmArray> Factory::NewWasmArray(wasm::ValueType element_type,
                                               DirectHandle<Map> map,
                                               AllocationType allocation,
                                               WriteBarrierMode write_barrier) {
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
   if (element_type.is_numeric()) {
@@ -2442,6 +2448,7 @@ DirectHandle<WasmArray> Factory::NewWasmArray(wasm::ValueType element_type,
 DirectHandle<WasmArray> Factory::NewWasmArrayFromElements(
     const wasm::ArrayType* type, base::Vector<wasm::WasmValue> elements,
     DirectHandle<Map> map, AllocationType allocation) {
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   uint32_t length = static_cast<uint32_t>(elements.size());
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
@@ -2464,6 +2471,7 @@ DirectHandle<WasmArray> Factory::NewWasmArrayFromMemory(
     uint32_t length, DirectHandle<Map> map, AllocationType allocation,
     wasm::CanonicalValueType element_type, base::Vector<const uint8_t> source) {
   DCHECK(element_type.is_numeric());
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
 #if V8_TARGET_BIG_ENDIAN
@@ -2487,6 +2495,7 @@ DirectHandle<Object> Factory::NewWasmArrayFromElementSegment(
     DirectHandle<Map> map, AllocationType allocation,
     wasm::CanonicalValueType element_type) {
   DCHECK(element_type.is_ref());
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
 
   // If the element segment has not been initialized yet, lazily initialize it
   // now.
@@ -2531,13 +2540,13 @@ Handle<WasmStruct> Factory::NewWasmStructUninitialized(
 DirectHandle<WasmStruct> Factory::NewWasmStruct(const wasm::StructType* type,
                                                 wasm::WasmValue* args,
                                                 DirectHandle<Map> map) {
+  SharedObjectConditionalSafePublishGuard publish_guard(type->is_shared());
   AllocationAlignment alignment =
       type->is_shared() ? kDoubleAligned : kTaggedAligned;
-  Tagged<HeapObject> raw = AllocateRaw(WasmStruct::Size(type),
-                                       HeapLayout::InAnySharedSpace(*map)
-                                           ? AllocationType::kSharedOld
-                                           : AllocationType::kYoung,
-                                       alignment);
+  Tagged<HeapObject> raw = AllocateRaw(
+      WasmStruct::Size(type),
+      type->is_shared() ? AllocationType::kSharedOld : AllocationType::kYoung,
+      alignment);
   raw->set_map_after_allocation(isolate(), *map);
   Tagged<WasmStruct> result = Cast<WasmStruct>(raw);
   result->set_raw_properties_or_hash(*empty_fixed_array(), kRelaxedStore);
@@ -2705,6 +2714,7 @@ Handle<Map> Factory::NewMapImpl(MetaMapProviderFunc&& meta_map_provider,
                                 int instance_size, ElementsKind elements_kind,
                                 int inobject_properties,
                                 AllocationType allocation_type) {
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation_type);
   static_assert(LAST_JS_OBJECT_TYPE == LAST_TYPE);
   DCHECK(!InstanceTypeChecker::MayHaveMapCheckFastCase(type));
   DCHECK_IMPLIES(InstanceTypeChecker::IsJSObject(type) &&
@@ -2840,6 +2850,16 @@ DirectHandle<ExtendedMap> Factory::NewExtendedMapWithMetaMap(
                  elements_kind, inobject_properties, allocation_type));
   map->set_is_extended_map(true);
   map->set_map_kind_and_size(map_kind, map_size);
+
+  // Factory methods must initialize all tagged fields.
+  int fields_count =
+      (map_size - ExtendedMap::kStartOfStrongExtendedFieldsOffset) /
+      kTaggedSize;
+  if (fields_count > 0) {
+    MemsetTagged(map->RawField(ExtendedMap::kStartOfStrongExtendedFieldsOffset),
+                 read_only_roots().undefined_value(), fields_count);
+  }
+
   return map;
 }
 
@@ -2889,18 +2909,11 @@ DirectHandle<ExtendedMap> Factory::NewContextfulMap(
          InstanceTypeChecker::IsWasmStruct(type) ||
 #endif  // V8_ENABLE_WEBASSEMBLY
          InstanceTypeChecker::IsMap(type));
-  int map_size = ExtendedMapSizeForKind(map_kind);
-  DCHECK_GE(map_size, ExtendedMap::kMinimumSize);
-  auto meta_map_provider = [native_context] {
-    // Tie new map to given native context.
-    return native_context->meta_map();
-  };
-  DirectHandle<ExtendedMap> map = UncheckedCast<ExtendedMap>(
-      NewMapImpl(meta_map_provider, map_size, type, instance_size,
-                 elements_kind, inobject_properties, allocation_type));
-  map->set_is_extended_map(true);
-  map->set_map_kind_and_size(map_kind, map_size);
-  return map;
+
+  DirectHandle<Map> meta_map(native_context->meta_map(), isolate());
+  return NewExtendedMapWithMetaMap(meta_map, map_kind, type, instance_size,
+                                   elements_kind, inobject_properties,
+                                   allocation_type);
 }
 
 Handle<Map> Factory::NewContextfulMapForCurrentContext(

@@ -245,9 +245,8 @@ struct StaticReadOnlyRoot {
   static constexpr Tagged_t kStoreHandler1Map = kStoreHandler0Map + 40;
   static constexpr Tagged_t kStoreHandler2Map = kStoreHandler1Map + 40;
   static constexpr Tagged_t kStoreHandler3Map = kStoreHandler2Map + 40;
-  static constexpr Tagged_t kStrongDescriptorArrayMap = kStoreHandler3Map + 40;
   static constexpr Tagged_t kTurboshaftWord32SetTypeMap =
-      kStrongDescriptorArrayMap + 40;
+      kStoreHandler3Map + 40;
   static constexpr Tagged_t kTurboshaftWord64SetTypeMap =
       kTurboshaftWord32SetTypeMap + 40;
   static constexpr Tagged_t kTurboshaftFloat64SetTypeMap =
@@ -1220,13 +1219,13 @@ struct StaticReadOnlyRoot {
   static constexpr Tagged_t kJSAtomicsMutexMap = 0x1800cd;
   static constexpr Tagged_t kJSAtomicsConditionMap = 0x1800f5;
   static constexpr Tagged_t kNoOpNamedInterceptorInfo = 0x18011d;
-  static constexpr Tagged_t kNoOpIndexedInterceptorInfo = 0x180169;
+  static constexpr Tagged_t kNoOpIndexedInterceptorInfo = 0x180171;
 
   static constexpr Tagged_t kFirstAllocatedRoot = 0x11;
-  static constexpr Tagged_t kLastAllocatedRoot = 0x180169;
+  static constexpr Tagged_t kLastAllocatedRoot = 0x180171;
 };
 
-static constexpr std::array<Tagged_t, 1023> StaticReadOnlyRootsPointerTable = {
+static constexpr std::array<Tagged_t, 1022> StaticReadOnlyRootsPointerTable = {
     StaticReadOnlyRoot::kUndefinedValue,
     StaticReadOnlyRoot::kTheHoleValue,
     StaticReadOnlyRoot::kNullValue,
@@ -1368,7 +1367,6 @@ static constexpr std::array<Tagged_t, 1023> StaticReadOnlyRootsPointerTable = {
     StaticReadOnlyRoot::kJSAtomicsMutexMap,
     StaticReadOnlyRoot::kJSAtomicsConditionMap,
     StaticReadOnlyRoot::kDescriptorArrayMap,
-    StaticReadOnlyRoot::kStrongDescriptorArrayMap,
     StaticReadOnlyRoot::kOnHeapBasicBlockProfilerDataMap,
     StaticReadOnlyRoot::kTurbofanBitsetTypeMap,
     StaticReadOnlyRoot::kTurbofanUnionTypeMap,

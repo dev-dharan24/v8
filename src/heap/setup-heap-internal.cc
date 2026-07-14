@@ -736,7 +736,6 @@ bool Heap::CreateLateReadOnlyNonJSReceiverMaps() {
     }
 
     // The DescriptorArray map is pre-allocated and initialized above.
-    ALLOCATE_VARSIZE_MAP(STRONG_DESCRIPTOR_ARRAY_TYPE, strong_descriptor_array)
     ALLOCATE_VARSIZE_MAP(TURBOSHAFT_WORD32_SET_TYPE_TYPE,
                          turboshaft_word32set_type)
     ALLOCATE_VARSIZE_MAP(TURBOSHAFT_WORD64_SET_TYPE_TYPE,
@@ -1446,7 +1445,7 @@ void Heap::CreateReadOnlyApiObjects() {
   // Make sure read only heap layout does not depend on the size of
   // ExternalPointer fields.
   constexpr int kMaxPossibleInterceptorInfoSize =
-      3 * kTaggedSize + 8 * kSystemPointerSize;
+      3 * kTaggedSize + 9 * kSystemPointerSize;
 
   auto info = isolate()->factory()->NewInterceptorInfo(
       InterceptorKind::kNamed, AllocationType::kReadOnly);

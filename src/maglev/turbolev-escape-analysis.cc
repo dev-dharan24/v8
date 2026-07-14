@@ -28,12 +28,6 @@ namespace v8::internal::maglev {
 #define BLOCK_ID(b) b->id()
 #define PRINT_NODE(n) "n" << NODE_ID(n) << ": " << PrintNode(n)
 
-bool IsUnusedAndCanBeRemoved(ValueNode* node) {
-  if (node->properties().is_required_when_unused()) return false;
-  if (node->Is<ArgumentsElements>()) return false;
-  return !node->is_used();
-}
-
 ValueNode* EscapeAnalysisData::Get(InlinedAllocation* base, int offset) {
   DCHECK_EQ(base, TryGetCandidateInlinedAllocation(base));
   ObjectField addr = ObjectField{base, offset};
@@ -566,15 +560,25 @@ class CandidateAnalyzer {
     TRACE("Process " << PRINT_NODE(node));
     if (Int32Constant* index_node =
             node->IndexInput().node()->template TryCast<Int32Constant>()) {
-      int offset = FixedArrayT::OffsetOfElementAt(index_node->value());
+      int index = index_node->value();
+      // Note that in unreachable code, {index} could be negative or too large,
+      // but this shouldn't be possible here, since the GraphOptimizer should
+      // truncate the graph in such cases.
+      CHECK(index >= 0 &&
+            static_cast<uint32_t>(index) <= FixedArrayT::kMaxLength);
+
+      int offset = FixedArrayT::OffsetOfElementAt(index);
+      DCHECK_NE(offset, offsetof(FixedArrayT, map_));
+
       ProcessFieldStore(node, node->ElementsInput().node(), offset,
                         node->ValueInput().node());
-    } else {
-      // TODO(dmercadier): handle non-constant indices. This will require
-      // stack-allocating the array.
-      data_.MarkAsEscapedIfCandidate(node->ElementsInput().node());
-      data_.MarkAsEscapedIfCandidate(node->ValueInput().node());
+      return ProcessResult::kContinue;
     }
+
+    // TODO(dmercadier): handle non-constant indices. This will require
+    // stack-allocating the array.
+    data_.MarkAsEscapedIfCandidate(node->ElementsInput().node());
+    data_.MarkAsEscapedIfCandidate(node->ValueInput().node());
 
     return ProcessResult::kContinue;
   }
@@ -748,13 +752,8 @@ class CandidateAnalyzer {
   template <class NodeT>
     requires std::is_base_of_v<NodeBase, NodeT>
   ProcessResult Process(NodeT* node, const ProcessingState&) {
-    if constexpr (std::is_base_of_v<ValueNode, NodeT>) {
-      if (IsUnusedAndCanBeRemoved(static_cast<ValueNode*>(node))) {
-        // TODO(dmercadier): consider running proper DCE before escape analysis
-        // to not block escape analysis on dead nodes.
-        return ProcessResult::kContinue;
-      }
-    }
+    // TODO(dmercadier): consider running proper DCE before escape analysis
+    // to not block escape analysis on dead nodes.
 
     for (Input input : node->inputs()) {
       ValueNode* input_node = data_.ResolveBase(input);
@@ -1530,6 +1529,21 @@ class Elider {
       Key key = keys_mappings().at(addr);
       ValueNode* replacement = field_values().Get(key);
       DCHECK_NOT_NULL(replacement);
+
+      if (replacement->value_representation() != node->value_representation()) {
+        // We have to be in unreachable code. Replacing by a DeadValue node
+        // instead to avoid mismatches in the graph.
+        // Note that this may sound a  bit risky: the mismatch could be because
+        // of a bug in the escape analysis. However, even if this is the case,
+        // inserting a DeadValue will lead to a reliable crash during compiling
+        // (it it reaches the Turbolev graph builder) or at runtime (if it
+        // reaches the MaglevGraphOptimizer, which will replace it by an
+        // Unreachable).
+        node->OverwriteWith(
+            Opcode::kDeadValue,
+            OpProperties::ForValueRepresentation(node->value_representation()));
+        return ProcessResult::kContinue;
+      }
 
       if (!IsStillInTheGraph(replacement)) {
         // {replacement} isn't in the graph anymore, so we don't overwrite the

@@ -76,6 +76,7 @@
 #include "src/heap/incremental-marking.h"
 #include "src/heap/large-spaces.h"
 #include "src/heap/local-heap-inl.h"
+#include "src/heap/main-allocator-inl.h"
 #include "src/heap/mark-compact-inl.h"
 #include "src/heap/mark-compact.h"
 #include "src/heap/marking-barrier-inl.h"
@@ -117,6 +118,7 @@
 #include "src/objects/free-space-inl.h"
 #include "src/objects/hash-table-inl.h"
 #include "src/objects/hash-table.h"
+#include "src/objects/heap-object-field-inl.h"
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/instance-type.h"
 #include "src/objects/js-weak-refs-inl.h"
@@ -2815,31 +2817,6 @@ static_assert(IsAligned(OFFSET_OF_DATA_START(ByteArray), kTaggedSize));
 static_assert(IsAligned(OFFSET_OF_DATA_START(ByteArray), kDoubleAlignment));
 #endif
 
-int Heap::GetMaximumFillToAlign(AllocationAlignment alignment) {
-  if (V8_COMPRESS_POINTERS_8GB_BOOL) return 0;
-  switch (alignment) {
-    case kTaggedAligned:
-      return 0;
-    case kDoubleAligned:
-    case kDoubleUnaligned:
-      return kDoubleSize - kTaggedSize;
-    default:
-      UNREACHABLE();
-  }
-}
-
-// static
-int Heap::GetFillToAlign(Address address, AllocationAlignment alignment) {
-  if (V8_COMPRESS_POINTERS_8GB_BOOL) return 0;
-  if (alignment == kDoubleAligned && (address & kDoubleAlignmentMask) != 0) {
-    return kTaggedSize;
-  }
-  if (alignment == kDoubleUnaligned && (address & kDoubleAlignmentMask) == 0) {
-    return kDoubleSize - kTaggedSize;  // No fill if double is always aligned.
-  }
-  return 0;
-}
-
 size_t Heap::GetCodeRangeReservedAreaSize() {
   return CodeRange::GetWritableReservedAreaSize();
 }
@@ -2862,7 +2839,8 @@ Tagged<HeapObject> Heap::AlignWithFillerBackground(
     AllocationAlignment alignment) {
   const int filler_size = allocation_size - object_size;
   DCHECK_LT(0, filler_size);
-  const int pre_filler = GetFillToAlign(object.address(), alignment);
+  const int pre_filler =
+      MainAllocator::GetFillToAlign(object.address(), alignment);
   if (pre_filler) {
     object = PrecedeWithFillerBackground(object, pre_filler);
   }
@@ -5142,6 +5120,7 @@ void Heap::RecordStats(HeapStats* stats) {
   stats->memory_allocator_capacity =
       ByteSize(memory_allocator_size + memory_allocator()->Available());
   stats->isolate_count = isolate_->isolate_group()->GetIsolateCount();
+  stats->native_context_count = NumberOfNativeContexts();
   stats->last_os_error = base::OS::GetLastError();
   const size_t allocator_memory =
       isolate_->allocator()->GetCurrentMemoryUsage() +
@@ -6128,32 +6107,6 @@ void Heap::PrintMaxNewSpaceSizeReached() {
 
 int Heap::NextStressMarkingLimit() {
   return isolate()->fuzzer_rng()->NextInt(v8_flags.stress_marking + 1);
-}
-
-void Heap::WeakenDescriptorArrays(
-    GlobalHandleVector<DescriptorArray> strong_descriptor_arrays) {
-  if (incremental_marking()->IsMajorMarking()) {
-    // During incremental/concurrent marking regular DescriptorArray objects are
-    // treated with custom weakness. This weakness depends on
-    // DescriptorArray::raw_gc_state() which is not set up properly upon
-    // deserialization. The strong arrays are transitioned to weak ones at the
-    // end of the GC.
-    mark_compact_collector()->RecordStrongDescriptorArraysForWeakening(
-        std::move(strong_descriptor_arrays));
-    return;
-  }
-
-  // No GC is running, weaken the arrays right away.
-  DisallowGarbageCollection no_gc;
-  Tagged<Map> descriptor_array_map =
-      ReadOnlyRoots(isolate()).descriptor_array_map();
-  for (auto it = strong_descriptor_arrays.begin();
-       it != strong_descriptor_arrays.end(); ++it) {
-    Tagged<DescriptorArray> array = it.raw();
-    DCHECK(IsStrongDescriptorArray(array));
-    array->set_map_safe_transition_no_write_barrier(isolate(),
-                                                    descriptor_array_map);
-  }
 }
 
 void Heap::NotifyDeserializationComplete() {

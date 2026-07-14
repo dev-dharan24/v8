@@ -4,7 +4,9 @@
 
 #include "src/compiler/turboshaft/turbolev-frontend-pipeline.h"
 
+#include <algorithm>
 #include <iomanip>
+#include <sstream>
 
 #include "src/base/logging.h"
 #include "src/common/synchronization-point-support.h"
@@ -47,6 +49,35 @@ namespace v8::internal::compiler::turboshaft {
 
 #define DECL_TURBOLEV_PHASE_CONSTANTS(Name) \
   DECL_TURBOLEV_PHASE_CONSTANTS_IMPL(Name, Turbolev##Name)
+
+namespace {
+std::string NormalizePhaseName(std::string str) {
+  str.erase(std::remove_if(str.begin(), str.end(), [](char c) {
+    return c == '-' || c == ' ';
+  }), str.end());
+  std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+  return str;
+}
+}  // namespace
+
+bool TurbolevFrontendPipeline::TurbolevPhaseMatchesFilter(
+    maglev::MaglevPhase phase) {
+  if (v8_flags.turbolev_phase_filter.value() == nullptr) return true;
+  if (strcmp(v8_flags.turbolev_phase_filter.value(), "*") == 0) return true;
+
+  std::string phase_name = NormalizePhaseName(maglev::PhaseName(phase));
+  std::stringstream ss(v8_flags.turbolev_phase_filter.value());
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    if (phase_name.find(NormalizePhaseName(token)) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 
 TurbolevFrontendPipeline::TurbolevFrontendPipeline(PipelineData* data,
                                                    Linkage* linkage)
@@ -264,10 +295,17 @@ struct PostOptimizerPhase {
     maglev::RecomputeKnownNodeAspectsProcessor kna_processor(
         graph, exception_handler_tracker);
     maglev::MaglevGraphOptimizer optimizer(graph, kna_processor, ranges);
-    maglev::GraphMultiProcessor<maglev::MaglevGraphOptimizer&,
-                                maglev::ReachableExceptionHandlerTracker&,
-                                maglev::RecomputeKnownNodeAspectsProcessor&>
-        optimization_pass(optimizer, exception_handler_tracker, kna_processor);
+    maglev::CommonSubexpressionEliminationProcessor<
+        maglev::RecomputeKnownNodeAspectsProcessor>
+        cse(kna_processor);
+    maglev::GraphMultiProcessor<
+        maglev::MaglevGraphOptimizer&,
+        maglev::CommonSubexpressionEliminationProcessor<
+            maglev::RecomputeKnownNodeAspectsProcessor>&,
+        maglev::ReachableExceptionHandlerTracker&,
+        maglev::RecomputeKnownNodeAspectsProcessor&>
+        optimization_pass(optimizer, cse, exception_handler_tracker,
+                          kna_processor);
     optimization_pass.ProcessGraph(graph);
 
     // Remove unreachable blocks if we have any.
@@ -348,7 +386,7 @@ auto TurbolevFrontendPipeline::Run(Args&&... args) {
   Phase phase;
   SYNCHRONIZATION_POINT(Phase::synchronization_point_name());
   bool result = phase.Run(graph_, std::forward<Args>(args)...);
-  if (V8_UNLIKELY(ShouldPrintMaglevGraph())) {
+  if (V8_UNLIKELY(ShouldPrintMaglevGraph(Phase::phase))) {
     PrintMaglevGraph(Phase::phase);
   }
   if (compilation_info_->trace_json_enabled()) {

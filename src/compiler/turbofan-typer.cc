@@ -2173,6 +2173,7 @@ Type Typer::Visitor::TypeJSCallWithSpread(Node* node) {
 Type Typer::Visitor::TypeJSCallRuntime(Node* node) {
   switch (CallRuntimeParametersOf(node->op()).id()) {
     case Runtime::kInlineCreateIterResultObject:
+    case Runtime::kInlineGeneratorYieldResult:
       return Type::OtherObject();
     case Runtime::kHasInPrototypeChain:
       return Type::Boolean();
@@ -2802,7 +2803,6 @@ Type Typer::Visitor::TypeConstant(Handle<Object> value) {
 }
 
 Type Typer::Visitor::TypeJSGetIterator(Node* node) { return Type::Any(); }
-Type Typer::Visitor::TypeJSArrayDestructure(Node* node) { return Type::Any(); }
 
 }  // namespace compiler
 }  // namespace internal

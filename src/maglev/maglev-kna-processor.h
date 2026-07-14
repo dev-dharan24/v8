@@ -99,6 +99,10 @@ class RecomputeKnownNodeAspectsProcessor {
     }
     DCHECK_NOT_NULL(known_node_aspects_);
 
+    if (block->is_exception_handler_block()) {
+      known_node_aspects_->ClearAvailableExpressions();
+    }
+
     // We might now have more accurate types for phi inputs; recompute the phi
     // types based on them.
     RecomputePhiTypes(block);
@@ -269,7 +273,6 @@ class RecomputeKnownNodeAspectsProcessor {
   }
   PROCESS_CHECK(Smi)
   PROCESS_CHECK(String)
-  PROCESS_CHECK(SeqOneByteString)
   PROCESS_CHECK(StringOrStringWrapper)
   PROCESS_CHECK(StringOrOddball)
   PROCESS_CHECK(Symbol)
@@ -363,6 +366,15 @@ class RecomputeKnownNodeAspectsProcessor {
     auto& props_for_key = known_node_aspects().GetLoadedPropertiesForKey(
         zone(), true, PropertyKey::ArrayBufferViewByteLength());
     props_for_key[node->ValueInput().node()] = node;
+    return ProcessResult::kContinue;
+  }
+
+  ProcessResult ProcessNode(LoadTypedArrayLength* node) {
+    if (!IsRabGsabTypedArrayElementsKind(node->elements_kind())) {
+      auto& props_for_key = known_node_aspects().GetLoadedPropertiesForKey(
+          zone(), true, PropertyKey::TypedArrayLength());
+      props_for_key[node->ValueInput().node()] = node;
+    }
     return ProcessResult::kContinue;
   }
 
@@ -465,8 +477,7 @@ class RecomputeKnownNodeAspectsProcessor {
     return ProcessResult::kContinue;
   }
 
-  template <typename Derived>
-  ProcessResult ProcessNode(AssumeTypeT<Derived>* node) {
+  ProcessResult ProcessNode(AssumeType* node) {
     RecordType(node->input_node(0), node->asserted_type());
     return ProcessResult::kContinue;
   }

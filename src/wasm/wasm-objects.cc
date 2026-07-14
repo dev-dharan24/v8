@@ -22,6 +22,7 @@
 #include "src/debug/debug.h"
 #include "src/execution/futex-emulation.h"
 #include "src/logging/counters.h"
+#include "src/objects/heap-object-field-inl.h"
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/managed-inl.h"
@@ -779,6 +780,7 @@ void SetInstanceMemory(Tagged<WasmTrustedInstanceData> trusted_instance_data,
     Isolate* isolate = Isolate::Current();
     HandleScope scope(isolate);
     wasm::WasmInterpreterRuntime::UpdateMemoryAddress(
+        isolate,
         direct_handle(trusted_instance_data->instance_object(), isolate),
         memory_index);
   }

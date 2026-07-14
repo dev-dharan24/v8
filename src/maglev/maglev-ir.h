@@ -202,10 +202,9 @@ class ExceptionHandlerInfo;
 // LINT.ThenChange(/src/maglev/maglev-graph-processor.h:maglev_constant_nodes, /src/maglev/maglev-regalloc.cc:maglev_constant_nodes)
 // clang-format on
 
-#define INLINE_BUILTIN_NODE_LIST(V)              \
-  V(BuiltinStringFromCharCode)                   \
-  V(BuiltinStringPrototypeCharCodeOrCodePointAt) \
-  V(BuiltinSeqOneByteStringCharCodeAt)
+#define INLINE_BUILTIN_NODE_LIST(V) \
+  V(BuiltinStringFromCharCode)      \
+  V(BuiltinStringPrototypeCharCodeOrCodePointAt)
 
 #define TURBOLEV_VALUE_NODE_LIST(V) \
   V(CreateFastArrayElements)        \
@@ -223,10 +222,7 @@ class ExceptionHandlerInfo;
   V(AssertPeeled)                       \
   V(AssertEscapeAnalysisElided)         \
   V(AssumeMap)                          \
-  V(AssumeTaggedType)                   \
-  V(AssumeInt32Type)                    \
-  V(AssumeUint32Type)                   \
-  V(AssumeFloat64Type)
+  V(AssumeType)
 
 #define CONVERSION_NODE_LIST(V)         \
   V(ChangeInt32ToFloat64)               \
@@ -390,7 +386,6 @@ class ExceptionHandlerInfo;
   V(StringConcat)                                                     \
   V(StringIndexOf)                                                    \
   IF_INTL(V, StringLocaleCompareIntl)                                 \
-  V(SeqOneByteStringAt)                                               \
   V(ConsStringMap)                                                    \
   V(UnwrapStringWrapper)                                              \
   V(ToBoolean)                                                        \
@@ -459,7 +454,6 @@ class ExceptionHandlerInfo;
   V(CheckNumber)                              \
   V(CheckSmi)                                 \
   V(CheckString)                              \
-  V(CheckSeqOneByteString)                    \
   V(CheckStringOrStringWrapper)               \
   V(CheckStringOrOddball)                     \
   V(CheckSymbol)                              \
@@ -728,7 +722,9 @@ constexpr bool IsTypedArrayStore(Opcode opcode) {
   return opcode == Opcode::kStoreIntTypedArrayElement ||
          opcode == Opcode::kStoreDoubleTypedArrayElement ||
          opcode == Opcode::kStoreIntConstantTypedArrayElement ||
-         opcode == Opcode::kStoreDoubleConstantTypedArrayElement;
+         opcode == Opcode::kStoreDoubleConstantTypedArrayElement ||
+         opcode == Opcode::kStoreSignedIntDataViewElement ||
+         opcode == Opcode::kStoreDoubleDataViewElement;
 }
 
 constexpr bool IsTruncatingToInt32(Opcode opcode) {
@@ -1951,6 +1947,7 @@ class LazyDeoptInfo : public DeoptInfo {
           case Builtin::kForOfNextLoadDoneLazyDeoptContinuation:
           case Builtin::kForOfNextLoadValueLazyDeoptContinuation:
           case Builtin::kArrayDestructureLazyDeoptContinuation:
+          case Builtin::kGeneratorPrototypeNextLazyDeoptContinuation:
             return true;
           default:
             return false;
@@ -3244,10 +3241,11 @@ class Identity : public FixedInputValueNodeT<1, Identity> {
 
 class DeadValue : public FixedInputValueNodeT<0, DeadValue> {
  public:
-  static constexpr OpProperties kProperties =
-      OpProperties::ForValueRepresentation(ValueRepresentation::kTagged);
+  static constexpr OpProperties kProperties = OpProperties::Pure();
 
-  explicit DeadValue(uint64_t bitfield) : Base(bitfield) {}
+  explicit DeadValue(uint64_t bitfield,
+                     ValueRepresentation repr = ValueRepresentation::kTagged)
+      : Base(bitfield | OpProperties::ForValueRepresentation(repr)) {}
 
   void SetValueLocationConstraints() { UNREACHABLE(); }
   void GenerateCode(MaglevAssembler*, const ProcessingState&) { UNREACHABLE(); }
@@ -5275,11 +5273,14 @@ class GeneratorRestoreRegister
 
 class InitialValue : public FixedInputValueNodeT<0, InitialValue> {
  public:
-  explicit InitialValue(uint64_t bitfield, interpreter::Register source);
+  explicit InitialValue(uint64_t bitfield, interpreter::Register source,
+                        NodeType type)
+      : Base(bitfield), source_(source), type_(type) {}
 
   interpreter::Register source() const { return source_; }
   uint32_t stack_slot() const;
   static uint32_t stack_slot(uint32_t register_idx);
+  NodeType type() const { return type_; }
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
@@ -5288,10 +5289,11 @@ class InitialValue : public FixedInputValueNodeT<0, InitialValue> {
   bool is_unused() const { return UnusedField::decode(bitfield()); }
   void mark_unused() { set_bitfield(UnusedField::update(bitfield(), true)); }
 
-  auto options() const { return std::tuple{source()}; }
+  auto options() const { return std::tuple{source(), type()}; }
 
  private:
   const interpreter::Register source_;
+  NodeType type_;
   using UnusedField = NextBitField<bool, 1>;
 };
 
@@ -6179,7 +6181,9 @@ struct VirtualJSGeneratorObjectShape : VirtualJSObjectShape {
   V(resume_mode, offsetof(T, resume_mode_), vobj::FieldType::kTagged)   \
   V(continuation, offsetof(T, continuation_), vobj::FieldType::kTagged) \
   V(parameters_and_registers, offsetof(T, parameters_and_registers_),   \
-    vobj::FieldType::kTagged)
+    vobj::FieldType::kTagged)                                           \
+  V(yielded_value, offsetof(T, yielded_value_), vobj::FieldType::kTagged)
+
   DEF_SHAPE(VirtualJSObjectShape, FIELD_LIST);
 #undef FIELD_LIST
 };
@@ -6196,20 +6200,21 @@ struct VirtualJSAsyncGeneratorObjectShape : VirtualJSGeneratorObjectShape {
 
 struct VirtualJSAsyncFunctionObjectShape : VirtualJSObjectShape {
   using T = JSAsyncFunctionObject;
-#define FIELD_LIST(V)                                                   \
-  V(function, offsetof(T, function_), vobj::FieldType::kTagged)         \
-  V(context, offsetof(T, context_), vobj::FieldType::kTagged)           \
-  V(receiver, offsetof(T, receiver_), vobj::FieldType::kTagged)         \
-  V(input_or_debug_pos, offsetof(T, input_or_debug_pos_),               \
-    vobj::FieldType::kTagged)                                           \
-  V(resume_mode, offsetof(T, resume_mode_), vobj::FieldType::kTagged)   \
-  V(continuation, offsetof(T, continuation_), vobj::FieldType::kTagged) \
-  V(parameters_and_registers, offsetof(T, parameters_and_registers_),   \
-    vobj::FieldType::kTagged)                                           \
-  V(promise, offsetof(T, promise_), vobj::FieldType::kTagged)           \
-  V(await_resolve_closure, offsetof(T, await_resolve_closure_),         \
-    vobj::FieldType::kTagged)                                           \
-  V(await_reject_closure, offsetof(T, await_reject_closure_),           \
+#define FIELD_LIST(V)                                                     \
+  V(function, offsetof(T, function_), vobj::FieldType::kTagged)           \
+  V(context, offsetof(T, context_), vobj::FieldType::kTagged)             \
+  V(receiver, offsetof(T, receiver_), vobj::FieldType::kTagged)           \
+  V(input_or_debug_pos, offsetof(T, input_or_debug_pos_),                 \
+    vobj::FieldType::kTagged)                                             \
+  V(resume_mode, offsetof(T, resume_mode_), vobj::FieldType::kTagged)     \
+  V(continuation, offsetof(T, continuation_), vobj::FieldType::kTagged)   \
+  V(parameters_and_registers, offsetof(T, parameters_and_registers_),     \
+    vobj::FieldType::kTagged)                                             \
+  V(yielded_value, offsetof(T, yielded_value_), vobj::FieldType::kTagged) \
+  V(promise, offsetof(T, promise_), vobj::FieldType::kTagged)             \
+  V(await_resolve_closure, offsetof(T, await_resolve_closure_),           \
+    vobj::FieldType::kTagged)                                             \
+  V(await_reject_closure, offsetof(T, await_reject_closure_),             \
     vobj::FieldType::kTagged)
   DEF_SHAPE(VirtualJSObjectShape, FIELD_LIST);
 #undef FIELD_LIST
@@ -7405,25 +7410,6 @@ class CheckString : public FixedInputNodeT<1, CheckString> {
   using CheckTypeBitField = NextBitField<CheckType, 1>;
 };
 
-class CheckSeqOneByteString : public FixedInputNodeT<1, CheckSeqOneByteString> {
- public:
-  explicit CheckSeqOneByteString(uint64_t bitfield, CheckType check_type)
-      : Base(CheckTypeBitField::update(bitfield, check_type)) {}
-
-  static constexpr OpProperties kProperties = OpProperties::EagerDeopt();
-  DECLARE_INPUTS(Receiver)
-  DECLARE_INPUT_TYPES(Tagged)
-
-  CheckType check_type() const { return CheckTypeBitField::decode(bitfield()); }
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
-
-  auto options() const { return std::tuple{check_type()}; }
-
- private:
-  using CheckTypeBitField = NextBitField<CheckType, 1>;
-};
 
 class CheckStringOrStringWrapper
     : public FixedInputNodeT<1, CheckStringOrStringWrapper> {
@@ -7741,61 +7727,24 @@ class AssumeMap : public FixedInputNodeT<1, AssumeMap> {
   const compiler::ZoneRefSet<Map> maps_;
 };
 
-template <class Derived>
-class AssumeTypeT : public FixedInputNodeT<1, Derived> {
+class AssumeType : public NodeT<AssumeType> {
  public:
-  using Base = FixedInputNodeT<1, Derived>;
-
-  explicit AssumeTypeT(uint64_t bitfield, NodeType type)
+  explicit AssumeType(uint64_t bitfield, NodeType type)
       : Base(bitfield), asserted_type_(type) {}
 
   static constexpr OpProperties kProperties = OpProperties::Pure();
 
   NodeType asserted_type() const { return asserted_type_; }
   auto options() const { return std::tuple{asserted_type_}; }
+  void VerifyInputs() const { DCHECK_EQ(input_count(), 1); }
+#ifdef V8_COMPRESS_POINTERS
+  void MarkTaggedInputsAsDecompressing() { UNREACHABLE(); }
+#endif
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
 
  private:
   const NodeType asserted_type_;
-};
-
-class AssumeTaggedType : public AssumeTypeT<AssumeTaggedType> {
- public:
-  using AssumeTypeT<AssumeTaggedType>::AssumeTypeT;
-
-  DECLARE_UNOP(Tagged)
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
-};
-
-class AssumeInt32Type : public AssumeTypeT<AssumeInt32Type> {
- public:
-  using AssumeTypeT<AssumeInt32Type>::AssumeTypeT;
-
-  DECLARE_UNOP(Int32)
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
-};
-
-class AssumeUint32Type : public AssumeTypeT<AssumeUint32Type> {
- public:
-  using AssumeTypeT<AssumeUint32Type>::AssumeTypeT;
-
-  DECLARE_UNOP(Uint32)
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
-};
-
-class AssumeFloat64Type : public AssumeTypeT<AssumeFloat64Type> {
- public:
-  using AssumeTypeT<AssumeFloat64Type>::AssumeTypeT;
-
-  DECLARE_UNOP(Float64)
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
 };
 
 class TurbofanStaticAssert : public FixedInputNodeT<1, TurbofanStaticAssert> {
@@ -8049,22 +7998,6 @@ class BuiltinStringPrototypeCharCodeOrCodePointAt
   using ModeField = NextBitField<Mode, 1>;
 };
 
-class BuiltinSeqOneByteStringCharCodeAt
-    : public FixedInputValueNodeT<2, BuiltinSeqOneByteStringCharCodeAt> {
- public:
-  explicit BuiltinSeqOneByteStringCharCodeAt(uint64_t bitfield)
-      : Base(bitfield) {}
-
-  static constexpr OpProperties kProperties =
-      OpProperties::CanRead() | OpProperties::Int32();
-  DECLARE_INPUTS(String, Index)
-  DECLARE_INPUT_TYPES(Tagged, Int32)
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
-
-  NodeType type() const { return NodeType::kNumber; }
-};
 
 class MapPrototypeGet : public FixedInputValueNodeT<2, MapPrototypeGet> {
  public:
@@ -9859,19 +9792,6 @@ class StringAt : public FixedInputValueNodeT<2, StringAt> {
   NodeType type() const { return NodeType::kString; }
 };
 
-class SeqOneByteStringAt : public FixedInputValueNodeT<2, SeqOneByteStringAt> {
- public:
-  explicit SeqOneByteStringAt(uint64_t bitfield) : Base(bitfield) {}
-
-  static constexpr OpProperties kProperties = OpProperties::CanRead();
-  DECLARE_INPUTS(String, Index)
-  DECLARE_INPUT_TYPES(Tagged, Int32)
-
-  void SetValueLocationConstraints();
-  void GenerateCode(MaglevAssembler*, const ProcessingState&);
-
-  NodeType type() const { return NodeType::kInternalizedString; }
-};
 
 class StringLength : public FixedInputValueNodeT<1, StringLength> {
  public:
@@ -9931,7 +9851,12 @@ class StringLocaleCompareIntl
 
 class StringConcat : public FixedInputValueNodeT<2, StringConcat> {
  public:
-  explicit StringConcat(uint64_t bitfield) : Base(bitfield) {}
+  using MinLengthField = NextBitField<uint32_t, 8>;
+  static constexpr uint32_t kNoMinLength = MinLengthField::kMax;
+  static_assert(kNoMinLength > ConsString::kMinLength);
+
+  explicit StringConcat(uint64_t bitfield)
+      : Base(bitfield | MinLengthField::encode(kNoMinLength)) {}
 
   static constexpr OpProperties kProperties =
       OpProperties::Call() | OpProperties::CanAllocate() |
@@ -9943,6 +9868,19 @@ class StringConcat : public FixedInputValueNodeT<2, StringConcat> {
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 
   NodeType type() const { return NodeType::kString; }
+
+  template <typename Cb>
+  uint32_t MinLength(const Cb& Compute) {
+    uint32_t cur = MinLengthField::decode(bitfield());
+    if (cur == kNoMinLength) {
+      cur = Compute();
+      if (cur >= kNoMinLength) {
+        cur = kNoMinLength - 1;
+      }
+      set_bitfield(MinLengthField::update(bitfield(), cur));
+    }
+    return cur;
+  }
 };
 
 /*

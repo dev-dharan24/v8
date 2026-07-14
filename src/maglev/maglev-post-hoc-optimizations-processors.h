@@ -9,12 +9,14 @@
 
 #include "src/compiler/heap-refs.h"
 #include "src/maglev/maglev-compilation-info.h"
+#include "src/maglev/maglev-cse.h"
 #include "src/maglev/maglev-deopt-frame-visitor.h"
 #include "src/maglev/maglev-graph-printer.h"
 #include "src/maglev/maglev-graph-processor.h"
 #include "src/maglev/maglev-graph.h"
 #include "src/maglev/maglev-interpreter-frame-state.h"
 #include "src/maglev/maglev-ir.h"
+#include "src/maglev/maglev-known-node-aspects.h"
 #include "src/numbers/conversions.h"
 #include "src/zone/zone-containers.h"
 
@@ -40,7 +42,68 @@ class RecomputePhiUseHintsProcessor {
   explicit RecomputePhiUseHintsProcessor(Zone* zone) : live_loop_phis_(zone) {}
 
   void PreProcessGraph(Graph* graph) {}
-  void PostProcessGraph(Graph* graph) {}
+  void PostProcessGraph(Graph* graph) {
+#ifdef DEBUG
+    // The recording below trusts the graph's top-frame sets to be exhaustive:
+    // a top frame referencing a Phi that isn't registered would be skipped,
+    // silently letting the Phi be truncated. Enforce the invariant that any
+    // unregistered top frame is Phi-free (e.g. the FunctionEntryStackCheck
+    // frame, which is never registered but has no Phis at function entry).
+    // TODO(victorgomes): Move this check to the Maglev verifier and make frame
+    // registration a global invariant (kept live across escape analysis and the
+    // classic-Maglev LICM frame rewrites), so it can run at every pipeline
+    // point instead of only here.
+    auto references_phi = [](const auto* deopt_info) {
+      bool found = false;
+      deopt_info->ForEachInput([&](ValueNode* input) {
+        if (input->Is<Phi>()) found = true;
+      });
+      return found;
+    };
+    for (BasicBlock* block : graph->blocks()) {
+      if (block->is_dead()) continue;
+      block->ForEachNodeAndControl([&](NodeBase* node) {
+        if (node->properties().has_eager_deopt_info()) {
+          const EagerDeoptInfo* info = node->eager_deopt_info();
+          DCHECK_IMPLIES(
+              !graph->eager_deopt_top_frames().contains(&info->top_frame()),
+              !references_phi(info));
+        }
+        if (node->properties().can_lazy_deopt()) {
+          const LazyDeoptInfo* info = node->lazy_deopt_info();
+          DCHECK_IMPLIES(
+              !graph->lazy_deopt_top_frames().contains(&info->top_frame()),
+              !references_phi(info));
+        }
+      });
+    }
+#endif  // DEBUG
+    // Record kNonTruncated for Phis referenced by deopt frames, walking the
+    // graph's deduplicated top-frame sets instead of every node's frame. This
+    // uses the non-const ForEachInput, which also unwraps the frames and moves
+    // their deopt uses onto the unwrapped nodes, which UnwrapDeoptFrames relies
+    // on. Relies on every live top frame being registered there (the loop
+    // peeler registers its cloned frames).
+    auto record_deopt_use = [](ValueNode* input) {
+      Phi* phi = input->TryCast<Phi>();
+      if (!phi) return;
+      phi->RecordUseReprHint(
+          UseRepresentationSet{UseRepresentation::kNonTruncated},
+          /*force_same_loop=*/false);
+      TRACE_PHI_USE_HINTS("updating deopt-frame use hints for "
+                          << PrintNodeLabel(phi)
+                          << ": use_reprs=" << phi->use_repr_hints());
+    };
+    for (DeoptFrame* top_frame : graph->eager_deopt_top_frames()) {
+      EagerDeoptInfo info(graph->zone(), top_frame, {});
+      info.ForEachInput(record_deopt_use);
+    }
+    for (auto [top_frame, result_location] : graph->lazy_deopt_top_frames()) {
+      LazyDeoptInfo info(graph->zone(), top_frame, result_location.first,
+                         result_location.second, {});
+      info.ForEachInput(record_deopt_use);
+    }
+  }
   BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
     return BlockProcessResult::kContinue;
   }
@@ -94,9 +157,7 @@ class RecomputePhiUseHintsProcessor {
     return ProcessResult::kContinue;
   }
 
-  template <typename Derived>
-  ProcessResult Process(AssumeTypeT<Derived>* node,
-                        const ProcessingState& state) {
+  ProcessResult Process(AssumeType* node, const ProcessingState& state) {
     return ProcessResult::kContinue;
   }
 
@@ -137,30 +198,7 @@ class RecomputePhiUseHintsProcessor {
             << " after visiting input " << PrintNode(node));
       }
     }
-    // Values referenced by deopt frames are re-materialized upon
-    // deoptimization, so they must survive as a non-truncated representation.
-    // Any reversible untagging (Int32/Float64/HoleyFloat64) can be
-    // re-materialized, but the irreversible truncated Int32 cannot. Missing
-    // these uses can let a Phi be truncated, corrupting the value the
-    // interpreter resumes with.
-    auto record_deopt_use = [&](ValueNode* input) {
-      if (Phi* phi = input->TryCast<Phi>()) {
-        phi->RecordUseReprHint(
-            UseRepresentationSet{UseRepresentation::kNonTruncated},
-            live_loop_phis_.contains(phi));
-        TRACE_PHI_USE_HINTS(
-            "updating use hints for "
-            << PrintNodeLabel(phi) << ": use_reprs=" << phi->use_repr_hints()
-            << " and same_loop_use_reprs=" << phi->same_loop_use_repr_hints()
-            << " after visiting deopt frame of " << PrintNode(node));
-      }
-    };
-    if (node->properties().has_eager_deopt_info()) {
-      node->eager_deopt_info()->ForEachInput(record_deopt_use);
-    }
-    if (node->properties().can_lazy_deopt()) {
-      node->lazy_deopt_info()->ForEachInput(record_deopt_use);
-    }
+    // Deopt-frame uses are recorded in PostProcessGraph.
     return ProcessResult::kContinue;
   }
 
@@ -643,6 +681,73 @@ class ReachableExceptionHandlerTracker {
 
   Graph* graph_;
   ZoneAbslFlatHashSet<BasicBlock*> reachable_exception_handlers_;
+};
+
+template <typename KnaProvider>
+class CommonSubexpressionEliminationProcessor {
+ public:
+  explicit CommonSubexpressionEliminationProcessor(KnaProvider& kna_provider)
+      : kna_provider_(kna_provider) {}
+
+  void PreProcessGraph(Graph* graph) {}
+  void PostProcessGraph(Graph* graph) {}
+  void PostPhiProcessing() {}
+  BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
+
+  template <typename NodeT>
+  ProcessResult Process(NodeT* node, const ProcessingState& state) {
+    if constexpr (ShouldCSE(Node::opcode_of<NodeT>) &&
+                  IsFixedInputNode<NodeT>()) {
+      return TryCSE(node);
+    }
+    return ProcessResult::kContinue;
+  }
+
+ private:
+  static constexpr bool ShouldCSE(Opcode op) {
+    return Node::participate_in_cse(op) && !Node::needs_epoch_check(op);
+  }
+
+  KnownNodeAspects& known_node_aspects() {
+    return kna_provider_.known_node_aspects();
+  }
+
+  template <typename NodeT>
+  ProcessResult TryCSE(NodeT* node) {
+    static_assert(IsFixedInputNode<NodeT>());
+    static_assert(Node::participate_in_cse(Node::opcode_of<NodeT>));
+    static_assert(!Node::needs_epoch_check(Node::opcode_of<NodeT>));
+    std::array<ValueNode*, NodeT::kInputCount> inputs;
+    int i = 0;
+    for (ValueNode*& input : inputs) {
+      input = node->input_node(i++)->UnwrapIdentities();
+    }
+    cse::CanonicalizeCommutative<NodeT>(inputs);
+    uint32_t hash = cse::HashNode(node, inputs);
+    NodeT* equivalent = std::apply(
+        [&](const auto&... opts) {
+          return known_node_aspects().template FindExpression<NodeT>(
+              hash, inputs, opts...);
+        },
+        node->options());
+    if (equivalent) {
+      // Value nodes forward their uses to the equivalent via an Identity;
+      // checks have no result, so a plain removal suffices.
+      if constexpr (std::is_base_of_v<ValueNode, NodeT>) {
+        node->OverwriteWithIdentityTo(equivalent);
+      }
+      return ProcessResult::kRemove;
+    }
+    known_node_aspects().AddExpression(hash, node);
+    return ProcessResult::kContinue;
+  }
+
+  KnaProvider& kna_provider_;
 };
 
 // TODO(victorgomes): This eliminator is block-local -- it clears its state at

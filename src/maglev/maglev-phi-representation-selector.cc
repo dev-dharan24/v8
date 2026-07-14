@@ -1118,6 +1118,29 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateUntaggingOfPhi(
     return ProcessResult::kContinue;
   }
 
+  if (old_untagging->Is<TruncateUnsafeNumberAsSafeIntToInt32>() ||
+      old_untagging->Is<TruncateCheckedNumberAsSafeIntToInt32>()) {
+    // These conversions truncate to Int32 but must keep the
+    // AdditiveSafeInteger range check: the truncation pass turned
+    // Float64SpeculateSafeAdd chains into Int32 operations, which is only
+    // value-equivalent as long as inputs stay in the safe integer range.
+    // Using a fully checked Float64->Int32 conversion here instead would
+    // deopt for any value outside Int32 range and cause deopt loops.
+    if (from_repr == ValueRepresentation::kFloat64) {
+      old_untagging->OverwriteWith<TruncateFloat64AsSafeIntToInt32>();
+      return ProcessResult::kContinue;
+    }
+    // A phi with a SafeInt truncation use never untags to HoleyFloat64:
+    // TruncateChecked... keeps its CheckedNumberToFloat64 alive (it can deopt,
+    // so it is required-when-unused), which pins a Float64 use hint on the phi;
+    // TruncateUnsafe... only exists for provably-Number phis. If this fires the
+    // invariant broke: handle HoleyFloat64 with a new
+    // TruncateHoleyFloat64AsSafeIntToInt32 (mirror the Float64 lowering) rather
+    // than falling through to the generic CheckedHoleyFloat64ToInt32, which
+    // deopt-loops on safe integers outside Int32 range.
+    DCHECK_NE(from_repr, ValueRepresentation::kHoleyFloat64);
+  }
+
   // To be safe, GetOpcodeForConversion (called below) always return a
   // conversion that deopts when converting a non-int32 float64 to int32 (eg,
   // when attempting to convert 3.35 to int32). However, some Float64->Int32 and
@@ -1277,31 +1300,9 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
 }
 
 ProcessResult MaglevPhiRepresentationSelector::UpdateNodePhiInput(
-    AssumeTaggedType* node, Phi* phi, int input_index,
-    const ProcessingState* state) {
+    AssumeType* node, Phi* phi, int input_index, const ProcessingState* state) {
   DCHECK_EQ(input_index, 0);
-  NodeType asserted_type = node->asserted_type();
-  switch (phi->value_representation()) {
-    case ValueRepresentation::kTagged:
-      // {phi} wasn't untagged, so we don't need to do anything.
-      return ProcessResult::kContinue;
-    case ValueRepresentation::kInt32:
-      node->OverwriteWith<AssumeInt32Type>(asserted_type);
-      return ProcessResult::kContinue;
-    case ValueRepresentation::kFloat64:
-      node->OverwriteWith<AssumeFloat64Type>(asserted_type);
-      return ProcessResult::kContinue;
-    case ValueRepresentation::kHoleyFloat64:
-      // There is no HoleyFloat64 assume node; rather than retagging the phi
-      // just to keep the assumption, drop it.
-      return ProcessResult::kRemove;
-    case ValueRepresentation::kUint32:
-    case ValueRepresentation::kIntPtr:
-    case ValueRepresentation::kRawPtr:
-    case ValueRepresentation::kNone:
-      UNREACHABLE();
-  }
-  UNREACHABLE();
+  return ProcessResult::kContinue;
 }
 
 BlockProcessResult MaglevPhiRepresentationSelector::PostProcessBasicBlock(

@@ -14,6 +14,7 @@
 #include "src/builtins/builtins.h"
 #include "src/handles/global-handles-inl.h"
 #include "src/heap/heap-write-barrier.h"
+#include "src/objects/heap-object-field-inl.h"
 #include "src/snapshot/embedded/embedded-data-inl.h"
 #include "src/wasm/canonical-types.h"
 #include "src/wasm/decoder.h"
@@ -7420,7 +7421,7 @@ void WasmEHDataGenerator::RecordPotentialExceptionThrowingInstruction(
 }
 
 WasmBytecode::WasmBytecode(int func_index, const uint8_t* code_data,
-                           size_t code_length, uint32_t stack_frame_size,
+                           size_t code_length, size_t stack_frame_size,
                            const FunctionSig* signature,
                            const CanonicalSig* canonical_signature,
                            const InterpreterCode* interpreter_code,

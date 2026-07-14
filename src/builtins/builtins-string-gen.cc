@@ -539,13 +539,28 @@ TNode<String> StringBuiltinsAssembler::StringAdd(
     TNode<IntPtrT> word_left_length = Signed(ChangeUint32ToWord(left_length));
     TNode<IntPtrT> word_right_length = Signed(ChangeUint32ToWord(right_length));
 
+    // Allocating the result string below may trigger a GC that internalizes
+    // {var_left} or {var_right} in place, turning a sequential string into a
+    // ThinString. The copies below read them with their (now stale) sequential
+    // layout, so re-check after the allocation and fall back to the runtime
+    // (which handles any representation) if either transitioned. {result} is
+    // only committed once the check passes, so the bailout leaves it unbound
+    // like the other paths to {runtime}.
+    auto bail_if_not_sequential = [&]() {
+      GotoIfNot(IsSequentialString(var_left.value()), &runtime);
+      GotoIfNot(IsSequentialString(var_right.value()), &runtime);
+    };
+
     Label two_byte(this);
     static_assert(kTwoByteStringTag == 0);
     GotoIf(IsNotSetWord32(Word32And(left_instance_type, right_instance_type),
                           kStringEncodingMask),
            &two_byte);
     // One-byte sequential string case
-    result = AllocateNonEmptySeqOneByteString(new_length);
+    TNode<String> one_byte_result =
+        AllocateNonEmptySeqOneByteString(new_length);
+    bail_if_not_sequential();
+    result = one_byte_result;
     CopyStringCharacters(var_left.value(), result.value(), IntPtrConstant(0),
                          IntPtrConstant(0), word_left_length,
                          String::ONE_BYTE_ENCODING, String::ONE_BYTE_ENCODING);
@@ -557,7 +572,10 @@ TNode<String> StringBuiltinsAssembler::StringAdd(
     BIND(&two_byte);
     {
       // Two-byte sequential string case
-      result = AllocateNonEmptySeqTwoByteString(new_length);
+      TNode<String> two_byte_result =
+          AllocateNonEmptySeqTwoByteString(new_length);
+      bail_if_not_sequential();
+      result = two_byte_result;
       Label left_two_byte(this);
       Label right_two_byte(this);
       GotoIf(IsNotSetWord32(left_instance_type, kStringEncodingMask),
@@ -1855,10 +1873,8 @@ void StringBuiltinsAssembler::ReplaceUnpairedSurrogates(TNode<String> source,
 }
 
 void StringBuiltinsAssembler::BranchIfStringPrimitiveWithNoCustomIteration(
-    TNode<Object> object, TNode<Context> context, Label* if_true,
-    Label* if_false) {
-  GotoIf(TaggedIsSmi(object), if_false);
-  GotoIfNot(IsString(CAST(object)), if_false);
+    TNode<JSAnyNotSmi> object, Label* if_true, Label* if_false) {
+  GotoIfNot(IsString(object), if_false);
 
   // Check that the String iterator hasn't been modified in a way that would
   // affect iteration.
@@ -1958,11 +1974,23 @@ void StringBuiltinsAssembler::CopyStringCharacters(
 template <typename T>
 TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
     TNode<T> from, TNode<BoolT> from_is_one_byte, TNode<IntPtrT> from_index,
-    TNode<IntPtrT> character_count) {
+    TNode<IntPtrT> character_count, Label* if_bailout) {
   CSA_DCHECK(this, IntPtrGreaterThan(character_count, IntPtrConstant(0)));
 
   Label end(this), one_byte_sequential(this), two_byte_sequential(this);
   TVARIABLE(String, var_result);
+
+  // The AllocateNonEmptySeq*String calls below may trigger a GC, during which
+  // {from} (a sequential string on entry) can be internalized in place and
+  // forwarded to a ThinString. Reading it as a sequential string afterwards
+  // would interpret the ThinString's fields as character data, so re-check
+  // after each allocation and bail to the runtime if the map changed. In the
+  // external case {from} is a raw pointer and cannot transition.
+  auto bail_if_not_sequential = [&]() {
+    if constexpr (std::is_same_v<T, String>) {
+      GotoIfNot(IsSequentialString(from), if_bailout);
+    }
+  };
 
   Branch(from_is_one_byte, &one_byte_sequential, &two_byte_sequential);
 
@@ -1971,6 +1999,8 @@ TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
   {
     TNode<String> result = AllocateNonEmptySeqOneByteString(
         Unsigned(TruncateIntPtrToInt32(character_count)));
+    bail_if_not_sequential();
+
     CopyStringCharacters<T>(from, result, from_index, IntPtrConstant(0),
                             character_count, String::ONE_BYTE_ENCODING,
                             String::ONE_BYTE_ENCODING);
@@ -2045,6 +2075,8 @@ TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
     {
       TNode<String> result = AllocateNonEmptySeqOneByteString(
           Unsigned(TruncateIntPtrToInt32(character_count)));
+      bail_if_not_sequential();
+
       CopyStringCharacters<T>(from, result, from_index, IntPtrConstant(0),
                               character_count, String::TWO_BYTE_ENCODING,
                               String::ONE_BYTE_ENCODING);
@@ -2056,6 +2088,8 @@ TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
     {
       TNode<String> result = AllocateNonEmptySeqTwoByteString(
           Unsigned(TruncateIntPtrToInt32(character_count)));
+      bail_if_not_sequential();
+
       CopyStringCharacters<T>(from, result, from_index, IntPtrConstant(0),
                               character_count, String::TWO_BYTE_ENCODING,
                               String::TWO_BYTE_ENCODING);
@@ -2139,7 +2173,7 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
     GotoIf(to_direct.is_external(), &external_string);
 
     var_result = AllocAndCopyStringCharacters(direct_string, is_one_byte,
-                                              offset, substr_length);
+                                              offset, substr_length, &runtime);
     Goto(&end);
   }
 
@@ -2150,7 +2184,7 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
         to_direct.PointerToString(&runtime);
 
     var_result = AllocAndCopyStringCharacters(
-        fake_sequential_string, is_one_byte, offset, substr_length);
+        fake_sequential_string, is_one_byte, offset, substr_length, &runtime);
 
     Goto(&end);
   }

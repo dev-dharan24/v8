@@ -802,9 +802,11 @@ DEFINE_BOOL(maglev_non_eager_inlining, false,
             "enable Maglev non-eager inlining")
 DEFINE_BOOL(turbolev_non_eager_inlining, true,
             "enable Turbolev non-eager inlining")
+DEFINE_BOOL(turbolev_non_eager_loop_peeling, false,
+            "enable Turbolev non-eager loop peeling")
+DEFINE_BOOL(turbolev_eager_loop_peeling_osr, true,
+            "use eager loop peeling in Turbolev OSR compiles")
 DEFINE_WEAK_IMPLICATION(turbolev_future, turbolev_non_eager_loop_peeling)
-DEFINE_EXPERIMENTAL_FEATURE(turbolev_non_eager_loop_peeling,
-                            "enable Turbolev non-eager loop peeling")
 DEFINE_DEVELOPER_FLAG(turbolev_trace_loop_peeling,
                       "trace turbolev non-eager loop peeling decisions")
 
@@ -884,10 +886,6 @@ DEFINE_BOOL(maglev_function_context_specialization, true,
 DEFINE_WEAK_IMPLICATION(future, flush_baseline_code)
 #endif
 
-DEFINE_EXPERIMENTAL_FEATURE(
-    specialize_code_for_one_byte_seq_strings,
-    "Specialize maglev code for feedback with only one-byte sequential "
-    "strings.")
 
 #ifdef V8_TARGET_ARCH_64_BIT
 DEFINE_BOOL(additive_safe_int_feedback, true,
@@ -1814,6 +1812,8 @@ DEFINE_BOOL(turboshaft_load_elimination, true,
             "enable Turboshaft's low-level load elimination for JS")
 DEFINE_BOOL(turboshaft_loop_unrolling, true,
             "enable Turboshaft's loop unrolling")
+DEFINE_EXPERIMENTAL_FEATURE(turboshaft_loop_optimization,
+                            "enable Turboshaft's loop optimization phase")
 DEFINE_EXPERIMENTAL_FEATURE(turboshaft_random_rescheduling,
                             "enable Turboshaft's random rescheduling phase")
 DEFINE_BOOL(turboshaft_string_concat_escape_analysis, true,
@@ -1849,6 +1849,8 @@ DEFINE_BOOL(turbolev, false,
 
 DEFINE_DEVELOPER_FLAG(print_turbolev_frontend,
                       "print Turbolev frontend (Maglev graphs)")
+DEFINE_STRING(turbolev_phase_filter, "*",
+              "filter for turbolev phases (comma-separated list of phase names)")
 
 DEFINE_DEVELOPER_FLAG(print_turbolev_inline_functions,
                       "print Turbolev inline functions")
@@ -2537,7 +2539,7 @@ DEFINE_SIZE_T(
     "All three flags cannot be specified at the same time.")
 DEFINE_SIZE_T(initial_heap_size, 0, "initial size of the heap (in Mbytes)")
 DEFINE_SIZE_T(initial_old_space_size, 0, "initial old space size (in Mbytes)")
-DEFINE_SIZE_T(preconfigured_old_space_size, 0,
+DEFINE_SIZE_T(preconfigured_old_space_size, 32,
               "preconfigured old space size (in Mbytes)")
 DEFINE_WEAK_VALUE_IMPLICATION(future, preconfigured_old_space_size, size_t{32})
 DEFINE_BOOL(gc_global, false, "always perform global GCs")
@@ -2873,9 +2875,13 @@ DEFINE_BOOL(fuzzer_gc_analysis, false,
 DEFINE_INT(stress_marking, 0,
            "force marking at random points between 0 and X (inclusive) percent "
            "of the regular marking start limit")
+DEFINE_REQUIREMENT(v8_flags.stress_marking >= 0)
+DEFINE_REQUIREMENT(v8_flags.stress_marking <= 100)
 DEFINE_INT(stress_scavenge, 0,
            "force scavenge at random points between 0 and X (inclusive) "
            "percent of the new space capacity")
+DEFINE_REQUIREMENT(v8_flags.stress_scavenge >= 0)
+DEFINE_REQUIREMENT(v8_flags.stress_scavenge <= 100)
 DEFINE_VALUE_IMPLICATION(fuzzer_gc_analysis, stress_marking, 99)
 DEFINE_VALUE_IMPLICATION(fuzzer_gc_analysis, stress_scavenge, 99)
 DEFINE_BOOL(
@@ -3105,6 +3111,8 @@ DEFINE_BOOL(test_small_max_function_context_stub_size, false,
             "by making the maximum size smaller")
 DEFINE_WEAK_IMPLICATION(future, fast_api_indexof)
 DEFINE_BOOL(fast_api_indexof, false, "enable using indexOf Api callbacks")
+DEFINE_BOOL(fast_api_iterable_to_list, false,
+            "enable fast path for IterableToList for indexed interceptors")
 
 DEFINE_BOOL(inline_new, true, "use fast inline allocation")
 DEFINE_NEG_NEG_IMPLICATION(inline_new, turbo_allocation_folding)
@@ -3715,6 +3723,14 @@ DEFINE_BOOL_READONLY(
     "available) and enables the sandbox crash filter to terminate the process "
     "(with status zero) if a crash that does not represent a sandbox violation "
     "is detected.")
+#endif
+
+#ifdef V8_ENABLE_GENERATED_CODE_VALIDATOR
+DEFINE_EXPERIMENTAL_FEATURE(validate_generated_code,
+                            "Enable generated code verifier")
+#else
+DEFINE_BOOL_READONLY(validate_generated_code, false,
+                     "Enable generated code verifier")
 #endif
 
 #ifdef V8_ENABLE_MEMORY_CORRUPTION_API
@@ -4419,10 +4435,17 @@ DEFINE_NOT_EXPLICITLY_SET_IMPLICATION(disallow_unsafe_flags &&
                                           !sandbox_testing && !sandbox_fuzzing,
                                       expose_memory_corruption_api)
 
+// Flags which trigger a breakpoint on purpose.
+DEFINE_NEG_IMPLICATION(disallow_unsafe_flags, maglev_break_on_entry)
+#ifdef USE_SIMULATOR
+DEFINE_NOT_EXPLICITLY_SET_IMPLICATION(disallow_unsafe_flags, stop_sim_at)
+#endif
+
 // Runs a program as security POC. This mode is used to determine whether a bug
 // in a program is a security problem. V8 supports many different configurations
 // and modes that are sometimes incomplete or incompatible. The flag aims at
-// providing guidance on what is actually considered a security issue.
+// providing guidance on what is actually considered a security issue. The flag
+// must be passed as first argument.
 //
 // Note: The mode may be insufficient and/or incomplete. Passing this flag does
 // not guarantee a bug will be classified as a valid vulnerability. The V8 team
@@ -4447,7 +4470,8 @@ DEFINE_NEG_IMPLICATION(run_as_security_poc, experimental)
 // the memory corruption APIs and as such allows to directly modify untrusted V8
 // heap contents. V8 supports many different configurations and modes that are
 // sometimes incomplete or incompatible. The flag aims at providing guidance on
-// what is actually considered a security issue.
+// what is actually considered a security issue. The flag must be passed as
+// first argument.
 //
 // Note: The mode may be insufficient and/or incomplete. Passing this flag does
 // not guarantee a bug will be classified as a valid vulnerability. The V8 team

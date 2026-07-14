@@ -440,19 +440,25 @@ void MacroAssembler::Call(Label* target) {
 }
 
 void MacroAssembler::Push(Handle<HeapObject> handle) {
-  mov(r0, Operand(handle));
-  push(r0);
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  mov(scratch, Operand(handle));
+  push(scratch);
 }
 
 void MacroAssembler::Push(Tagged<Smi> smi) {
-  mov(r0, Operand(smi));
-  push(r0);
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  mov(scratch, Operand(smi));
+  push(scratch);
 }
 
 void MacroAssembler::Push(Tagged<TaggedIndex> index) {
   // TaggedIndex is the same as Smi for 32 bit archs.
-  mov(r0, Operand(static_cast<uint32_t>(index.value())));
-  push(r0);
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  mov(scratch, Operand(static_cast<uint32_t>(index.value())));
+  push(scratch);
 }
 
 void MacroAssembler::PushArray(Register array, Register size, Register scratch,
@@ -1270,7 +1276,7 @@ int MacroAssembler::LeaveFrame(StackFrame::Type type, int stack_adjustment) {
 // in the fp register (r31)
 // Then - we buy a new frame
 
-void MacroAssembler::EnterExitFrame(Register scratch, int stack_space,
+void MacroAssembler::EnterExitFrame(int stack_space,
                                     StackFrame::Type frame_type) {
   DCHECK(frame_type == StackFrame::EXIT ||
          frame_type == StackFrame::BUILTIN_EXIT ||
@@ -1286,6 +1292,8 @@ void MacroAssembler::EnterExitFrame(Register scratch, int stack_space,
   // all of the pushes that have happened inside of V8
   // since we were called from C code
 
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   mov(scratch, Operand(StackFrame::TypeToMarker(frame_type)));
   PushCommonFrame(scratch);
   // Reserve room for saved entry sp.
@@ -1340,12 +1348,14 @@ int MacroAssembler::ActivationFrameAlignment() {
 #endif
 }
 
-void MacroAssembler::LeaveExitFrame(Register scratch) {
+void MacroAssembler::LeaveExitFrame() {
   ConstantPoolUnavailableScope constant_pool_unavailable(this);
 
   // Restore current context from top and clear it in debug mode.
   LoadU64(cp, AsMemOperand(IsolateFieldId::kContext));
 
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
 #ifdef DEBUG
   mov(scratch, Operand(Context::kNoContext));
   StoreU64(scratch, AsMemOperand(IsolateFieldId::kContext));
@@ -1376,18 +1386,21 @@ void MacroAssembler::LoadStackLimit(Register destination, StackLimitKind kind) {
   LoadU64(destination, MemOperand(kRootRegister, offset));
 }
 
-void MacroAssembler::StackOverflowCheck(Register num_args, Register scratch,
+void MacroAssembler::StackOverflowCheck(Register num_args,
                                         Label* stack_overflow) {
   // Check the stack for overflow. We are not trying to catch
   // interruptions (e.g. debug break and preemption) here, so the "real stack
   // limit" is checked.
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
   LoadStackLimit(scratch, StackLimitKind::kRealStackLimit);
   // Make scratch the space we have left. The stack might already be overflowed
   // here which will cause scratch to become negative.
   sub(scratch, sp, scratch);
   // Check if the arguments will overflow the stack.
-  ShiftLeftU64(r0, num_args, Operand(kSystemPointerSizeLog2));
-  CmpS64(scratch, r0);
+  Register bytes_needed = temps.Acquire();
+  ShiftLeftU64(bytes_needed, num_args, Operand(kSystemPointerSizeLog2));
+  CmpS64(scratch, bytes_needed);
   ble(stack_overflow);  // Signed comparison.
 }
 
@@ -1411,7 +1424,7 @@ void MacroAssembler::InvokePrologue(Register expected_parameter_count,
 
   Label stack_overflow;
   Register scratch = r7;
-  StackOverflowCheck(expected_parameter_count, scratch, &stack_overflow);
+  StackOverflowCheck(expected_parameter_count, &stack_overflow);
 
   // Underapplication. Move the arguments already in the stack, including the
   // receiver and the return address.
@@ -5129,7 +5142,7 @@ void CallApiFunctionAndReturn(MacroAssembler* masm, bool with_profiling,
     // Load the number of stack slots to drop before LeaveExitFrame modifies sp.
     __ LoadU64(argc_reg, *argc_operand);
   }
-  __ LeaveExitFrame(scratch);
+  __ LeaveExitFrame();
 
   {
     ASM_CODE_COMMENT_STRING(masm,

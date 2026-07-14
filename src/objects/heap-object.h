@@ -331,7 +331,7 @@ V8_OBJECT class HeapObject {
       InSharedSpace in_shared_space, Tagged<Map> map);
   static inline AllocationAlignment RequiredAlignment(
       AllocationSpace allocation_space, Tagged<Map> map);
-  bool inline CheckRequiredAlignment() const;
+  bool CheckRequiredAlignment() const;
 
   // Whether the object needs rehashing. That is the case if the object's
   // content depends on v8_flags.hash_seed. When the object is deserialized into
@@ -424,7 +424,6 @@ IS_TYPE_FUNCTION_DECL(SloppyArgumentsElements)
 IS_TYPE_FUNCTION_DECL(SmallOrderedHashTable)
 IS_TYPE_FUNCTION_DECL(PropertyDictionary)
 IS_TYPE_FUNCTION_DECL(AnyHole)
-IS_TYPE_FUNCTION_DECL(StrongDescriptorArray)
 #undef IS_TYPE_FUNCTION_DECL
 
 #define IS_TYPE_FUNCTION_DECL(Type, ...) \

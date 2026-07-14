@@ -144,6 +144,9 @@ class V8_NODISCARD MaybeReduceResult {
   // function, etc)
   bool IsDoneWithAbort() const { return kind() == kDoneWithAbort; }
 
+  // Done and not aborting.
+  bool IsDoneWithoutAbort() const { return IsDone() && !IsDoneWithAbort(); }
+
   Kind kind() const { return payload_.GetPayload(); }
 
   inline ReduceResult Checked();
@@ -173,7 +176,9 @@ class V8_NODISCARD ReduceResult : public MaybeReduceResult {
   static ReduceResult Done() { return ReduceResult(kDoneWithoutPayload); }
   static ReduceResult DoneWithAbort() { return ReduceResult(kDoneWithAbort); }
 
+  bool IsDone() const { return true; }
   bool IsFail() const { return false; }
+  bool IsDoneWithoutAbort() const { return !IsDoneWithAbort(); }
   ReduceResult Checked() { return *this; }
 
  protected:
@@ -326,6 +331,34 @@ enum class BranchResult {
   kAlwaysFalse,
   // Bailed out before evaluating the condition.
   kAbort,
+};
+
+enum class BranchType { kBranchIfTrue, kBranchIfFalse };
+enum class BranchSpecializationMode { kDefault, kAlwaysBoolean };
+
+inline BranchType NegateBranchType(BranchType jump_type) {
+  switch (jump_type) {
+    case BranchType::kBranchIfTrue:
+      return BranchType::kBranchIfFalse;
+    case BranchType::kBranchIfFalse:
+      return BranchType::kBranchIfTrue;
+  }
+  UNREACHABLE();
+}
+
+template <typename Derived>
+class BranchBuilderBase {
+ public:
+  BranchType GetCurrentBranchType() const { return jump_type_; }
+  void SwapTargets() { jump_type_ = NegateBranchType(jump_type_); }
+  BranchResult AlwaysTrue() const { return derived().FromBool(true); }
+  BranchResult AlwaysFalse() const { return derived().FromBool(false); }
+  static BranchResult Abort() { return BranchResult::kAbort; }
+
+ protected:
+  explicit BranchBuilderBase(BranchType jump_type) : jump_type_(jump_type) {}
+  const Derived& derived() const { return *static_cast<const Derived*>(this); }
+  BranchType jump_type_;
 };
 
 inline bool CompareInt32(int32_t lhs, int32_t rhs, Operation operation) {
@@ -749,9 +782,19 @@ class MaglevReducer {
   MaybeReduceResult TryBuildFastInstanceOfWithFeedback(
       ValueNode* context, ValueNode* object, ValueNode* callable,
       compiler::FeedbackSource feedback_source);
+  bool CanElideResolvePromiseThenLookup(ValueNode* value);
 
   ReduceResult BuildSmiUntag(ValueNode* node);
   ReduceResult BuildCheckSmi(ValueNode* object);
+  ReduceResult BuildCheckString(ValueNode* object);
+
+  ReduceResult TryBuildCheckInt32Condition(ValueNode* lhs, ValueNode* rhs,
+                                           AssertCondition condition,
+                                           DeoptimizeReason reason);
+
+  compiler::OptionalObjectRef TryFoldLoadConstantDataField(
+      compiler::JSObjectRef holder,
+      compiler::PropertyAccessInfo const& access_info);
 
   ReduceResult BuildNumberOrOddballToFloat64OrHoleyFloat64(
       ValueNode* node, UseRepresentation use_rep, NodeType allowed_input_type);
@@ -1080,6 +1123,9 @@ class MaglevReducer {
   V(MathRound)                                 \
   V(MathSqrt)                                  \
   V(MathTrunc)                                 \
+  V(PromisePrototypeThen)                      \
+  V(PromiseResolveTrampoline)                  \
+  V(RegExpPrototypeTest)                       \
   IEEE_754_UNARY_LIST(V)                       \
   IEEE_754_BINARY_LIST(V)                      \
   IF_INTL(V, StringPrototypeLocaleCompareIntl) \
@@ -1141,17 +1187,62 @@ class MaglevReducer {
   ReduceResult BuildInt32Max(ValueNode* a, ValueNode* b);
   ReduceResult BuildInt32Min(ValueNode* a, ValueNode* b);
 
-  // TODO(victorgomes): Maybe it makes sense to port BranchBuilder.
-  template <typename Sub>
-  BranchResult BuildBranchIfInt32Compare(Sub& sg,
-                                         typename Sub::Label* false_target,
-                                         Operation op, ValueNode* lhs,
-                                         ValueNode* rhs);
-  template <typename Sub>
-  BranchResult BuildBranchIfUint32Compare(Sub& sg,
-                                          typename Sub::Label* false_target,
-                                          Operation op, ValueNode* lhs,
-                                          ValueNode* rhs);
+  class BranchBuilder : public BranchBuilderBase<BranchBuilder> {
+   public:
+    using Label = typename Subgraph<BaseT>::Label;
+
+    BranchBuilder(Subgraph<BaseT>* sub, BranchType jump_type, Label* label)
+        : BranchBuilderBase<BranchBuilder>(jump_type),
+          sub_(sub),
+          label_(label) {}
+
+    BranchResult FromBool(bool value) const {
+      return value ? BranchResult::kAlwaysTrue : BranchResult::kAlwaysFalse;
+    }
+
+    template <typename ControlNodeT, typename... Args>
+    BranchResult Build(std::initializer_list<ValueNode*> inputs,
+                       Args&&... args);
+
+    void SetBranchSpecializationMode(BranchSpecializationMode) {}
+    class PatchAccumulatorInBranchScope {
+     public:
+      PatchAccumulatorInBranchScope(BranchBuilder&, ValueNode*, RootIndex) {}
+    };
+
+   private:
+    Subgraph<BaseT>* sub_;
+    Label* label_;
+  };
+
+  BranchResult BuildBranchIfInt32Compare(BranchBuilder& b, Operation op,
+                                         ValueNode* lhs, ValueNode* rhs);
+  BranchResult BuildBranchIfUint32Compare(BranchBuilder& b, Operation op,
+                                          ValueNode* lhs, ValueNode* rhs);
+
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfInt32ToBooleanTrue(BranchBuilderT& b,
+                                               ValueNode* node);
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfIntPtrToBooleanTrue(BranchBuilderT& b,
+                                                ValueNode* node);
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfFloat64ToBooleanTrue(BranchBuilderT& b,
+                                                 ValueNode* node);
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfHoleyFloat64ToBooleanTrue(BranchBuilderT& b,
+                                                      ValueNode* node);
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfFloat64IsHole(BranchBuilderT& b, ValueNode* node);
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfFloat64IsUndefinedOrHole(BranchBuilderT& b,
+                                                     ValueNode* node);
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfJSReceiver(BranchBuilderT& b, ValueNode* value);
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfUndefinedOrNull(BranchBuilderT& b, ValueNode* node);
 
   // TODO(victorgomes): Support DoneWithoutValue.
   template <typename CondFn>
@@ -1363,24 +1454,9 @@ class MaglevReducer {
       return;
     }
 
-    switch (node->value_representation()) {
-      case ValueRepresentation::kTagged:
-        AddNewNodeNoInputConversion<AssumeTaggedType>({node}, type);
-        break;
-      case ValueRepresentation::kInt32:
-        AddNewNodeNoInputConversion<AssumeInt32Type>({node}, type);
-        break;
-      case ValueRepresentation::kUint32:
-        AddNewNodeNoInputConversion<AssumeUint32Type>({node}, type);
-        break;
-      case ValueRepresentation::kFloat64:
-        AddNewNodeNoInputConversion<AssumeFloat64Type>({node}, type);
-        break;
-      default:
-        // If you ever run into the UNREACHABLE below, you might need to add a
-        // new `Assume` operation.
-        UNREACHABLE();
-    }
+    auto* assume_node = NodeBase::New<AssumeType>(zone(), 1, type);
+    assume_node->set_input(0, node);
+    AttachExtraInfoAndAddToGraph(assume_node);
   }
 
   bool IsEmptyNodeType(NodeType type) {

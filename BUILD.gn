@@ -160,6 +160,9 @@ declare_args() {
   # Sets -DV8_ENABLE_DEBUG_CODE
   v8_enable_debug_code = ""
 
+  # Enable generated code verifier.
+  v8_enable_generated_code_validator = ""
+
   # Enable native counters from the snapshot (impacts performance, sets
   # -DV8_SNAPSHOT_NATIVE_CODE_COUNTERS).
   # This option will generate extra code in the snapshot to increment counters,
@@ -556,6 +559,14 @@ if (v8_enable_object_print == "") {
 if (v8_always_enable_maglev_graph_labeller == "") {
   v8_always_enable_maglev_graph_labeller = v8_enable_debugging_features
 }
+if (v8_enable_generated_code_validator == "") {
+  v8_enable_generated_code_validator =
+      v8_enable_verification_features &&
+      (v8_current_cpu == "x64" || v8_current_cpu == "arm64")
+}
+assert(!v8_enable_generated_code_validator || v8_current_cpu == "x64" ||
+           v8_current_cpu == "arm64",
+       "Generated code verifier is only supported on x64 and arm64")
 if (v8_enable_disassembler == "") {
   v8_enable_disassembler = v8_enable_debugging_features
 }
@@ -1482,6 +1493,9 @@ config("features") {
   if (v8_enable_turbofan) {
     defines += [ "V8_ENABLE_TURBOFAN" ]
   }
+  if (v8_enable_generated_code_validator) {
+    defines += [ "V8_ENABLE_GENERATED_CODE_VALIDATOR" ]
+  }
   if (v8_jitless) {
     defines += [ "V8_JITLESS" ]
   }
@@ -1652,7 +1666,10 @@ config("toolchain") {
     defines += [ "_MIPS_TARGET_SIMULATOR" ]
   }
 
-  if (v8_current_cpu == "mips64el" || v8_current_cpu == "mips64") {
+  assert(v8_current_cpu != "mips64",
+         "Fatal: MIPS64 Big-Endian ('mips64')  has been explicitly disabled.")
+
+  if (v8_current_cpu == "mips64el") {
     defines += [ "V8_TARGET_ARCH_MIPS64" ]
     if (v8_can_use_fpu_instructions) {
       defines += [ "CAN_USE_FPU_INSTRUCTIONS" ]
@@ -1662,8 +1679,6 @@ config("toolchain") {
     }
     if (host_byteorder == "little") {
       defines += [ "V8_TARGET_ARCH_MIPS64_LE" ]
-    } else if (host_byteorder == "big") {
-      defines += [ "V8_TARGET_ARCH_MIPS64_BE" ]
     }
     if (v8_use_mips_abi_hardfloat) {
       defines += [
@@ -2034,6 +2049,7 @@ if (v8_postmortem_support) {
       "src/objects/heap-number-inl.h",
       "src/objects/heap-object.h",
       "src/objects/heap-object-inl.h",
+      "src/objects/heap-object-field-inl.h",
       "src/objects/heap-object-set-map-inl.h",
       "src/objects/instance-type.h",
       "src/objects/instance-type-checker.h",
@@ -3969,6 +3985,8 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/load-store-simplification-reducer.h",
     "src/compiler/turboshaft/load-store-verification-reducer.h",
     "src/compiler/turboshaft/loop-finder.h",
+    "src/compiler/turboshaft/loop-optimization-phase.h",
+    "src/compiler/turboshaft/loop-optimization-reducer.h",
     "src/compiler/turboshaft/loop-peeling-phase.h",
     "src/compiler/turboshaft/loop-peeling-reducer.h",
     "src/compiler/turboshaft/loop-unrolling-phase.h",
@@ -4374,6 +4392,7 @@ v8_header_set("v8_internal_headers") {
     "src/objects/hash-table.h",
     "src/objects/heap-number-inl.h",
     "src/objects/heap-number.h",
+    "src/objects/heap-object-field-inl.h",
     "src/objects/heap-object-inl.h",
     "src/objects/heap-object-set-map-inl.h",
     "src/objects/heap-object.h",
@@ -4800,6 +4819,7 @@ v8_header_set("v8_internal_headers") {
       "src/maglev/maglev-compilation-unit.h",
       "src/maglev/maglev-compiler.h",
       "src/maglev/maglev-concurrent-dispatcher.h",
+      "src/maglev/maglev-cse.h",
       "src/maglev/maglev-deopt-frame-visitor.h",
       "src/maglev/maglev-graph-builder.h",
       "src/maglev/maglev-graph-labeller.h",
@@ -5581,6 +5601,7 @@ v8_compiler_sources = [
   "src/compiler/turboshaft/late-load-elimination-reducer.cc",
   "src/compiler/turboshaft/load-elimination-phase.cc",
   "src/compiler/turboshaft/loop-finder.cc",
+  "src/compiler/turboshaft/loop-optimization-phase.cc",
   "src/compiler/turboshaft/loop-peeling-phase.cc",
   "src/compiler/turboshaft/loop-unrolling-phase.cc",
   "src/compiler/turboshaft/loop-unrolling-reducer.cc",
@@ -6889,6 +6910,18 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "//third_party/fast_float",
     "//third_party/highway:libhwy",
   ]
+
+  if (v8_enable_generated_code_validator) {
+    sources += [
+      "src/sandbox/generated-code-validator.cc",
+      "src/sandbox/generated-code-validator.h",
+    ]
+    if (v8_current_cpu == "x64") {
+      deps += [ "//third_party/fadec" ]
+    } else if (v8_current_cpu == "arm64") {
+      deps += [ "//third_party/disarm" ]
+    }
+  }
 
   public_deps = [
     ":cppgc_base",
