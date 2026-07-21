@@ -395,7 +395,7 @@ auto TurbolevFrontendPipeline::Run(Args&&... args) {
   }
 #ifdef DEBUG
   maglev::GraphProcessor<maglev::MaglevGraphVerifier> verifier(
-      compilation_info_.get());
+      compilation_info_.get(), Phase::phase);
   verifier.ProcessGraph(graph_);
 #endif
   return result;
@@ -418,13 +418,8 @@ std::optional<maglev::Graph*> TurbolevFrontendPipeline::Run() {
   if (v8_flags.maglev_truncation && graph_->may_have_truncation()) {
     Run<TruncationPhase>();
   }
-  // TODO(turbolev): sort out perf problems blocking
-  // https://chromium-review.git.corp.google.com/c/v8/v8/+/7595239 from landing.
   if (v8_flags.turbolev_untagged_phis) {
     Run<PrePhiUntaggingPhase>();
-  }
-  graph_->UnwrapDeoptFrames();
-  if (v8_flags.turbolev_untagged_phis) {
     Run<PhiUntaggingPhase>();
   }
   if (v8_flags.maglev_range_analysis) {
@@ -436,6 +431,9 @@ std::optional<maglev::Graph*> TurbolevFrontendPipeline::Run() {
     // TODO(dmercadier): it would make sense to run this before Phi untagging so
     // that Phi untagging can untag the Phis created by Escape Analysis.
     Run<EscapeAnalysisPhase>();
+    // TODO(dmercadier): can we run this PostOptimizerPhase as part of the
+    // Elider phase of escape analysis?
+    Run<PostOptimizerPhase>(nullptr);
   }
   Run<PostHocPhase>();
   Run<DeadNodeSweepingPhase>();

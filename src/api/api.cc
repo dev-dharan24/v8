@@ -3882,7 +3882,7 @@ bool Value::IsDataView() const {
 bool Value::IsSharedArrayBuffer() const {
   auto obj = *Utils::OpenDirectHandle(this);
   if (!IsJSArrayBuffer(obj)) return false;
-  return i::Cast<i::JSArrayBuffer>(obj)->is_shared();
+  return i::Cast<i::JSArrayBuffer>(obj)->is_shared().value();
 }
 
 bool Value::IsObject() const {
@@ -4290,15 +4290,17 @@ size_t v8::BackingStore::MaxByteLength() const {
 }
 
 bool v8::BackingStore::IsShared() const {
-  return reinterpret_cast<const i::BackingStore*>(this)->is_shared();
+  return reinterpret_cast<const i::BackingStore*>(this)->is_shared().value();
 }
 
 bool v8::BackingStore::IsImmutable() const {
-  return reinterpret_cast<const i::BackingStore*>(this)->is_immutable();
+  return reinterpret_cast<const i::BackingStore*>(this)->is_immutable().value();
 }
 
 bool v8::BackingStore::IsResizableByUserJavaScript() const {
-  return reinterpret_cast<const i::BackingStore*>(this)->is_resizable_by_js();
+  return reinterpret_cast<const i::BackingStore*>(this)
+      ->is_resizable_by_js()
+      .value();
 }
 
 // static
@@ -4322,7 +4324,7 @@ void* v8::ArrayBuffer::Data() const {
 }
 
 bool v8::ArrayBuffer::IsResizableByUserJavaScript() const {
-  return Utils::OpenDirectHandle(this)->is_resizable_by_js();
+  return Utils::OpenDirectHandle(this)->is_resizable_by_js().value();
 }
 
 std::shared_ptr<v8::BackingStore> v8::SharedArrayBuffer::GetBackingStore() {
@@ -8798,7 +8800,8 @@ MaybeLocal<Promise> Promise::Catch(Local<Context> context,
   PrepareForExecutionScope api_scope{context, RCCId::kAPI_Promise_Catch};
   i::Isolate* i_isolate = api_scope.i_isolate();
   auto self = Utils::OpenDirectHandle(this);
-  i::Handle<i::JSPromise> return_promise = i_isolate->factory()->NewJSPromise();
+  i::Handle<i::JSPromise> return_promise =
+      i_isolate->factory()->NewJSPromise(self);
   i::DirectHandle<i::Object> args[] = {i_isolate->factory()->undefined_value(),
                                        Utils::OpenDirectHandle(*handler),
                                        return_promise};
@@ -8817,7 +8820,8 @@ MaybeLocal<Promise> Promise::Then(Local<Context> context,
   PrepareForExecutionScope api_scope{context, RCCId::kAPI_Promise_Then};
   i::Isolate* i_isolate = api_scope.i_isolate();
   auto self = Utils::OpenDirectHandle(this);
-  i::Handle<i::JSPromise> return_promise = i_isolate->factory()->NewJSPromise();
+  i::Handle<i::JSPromise> return_promise =
+      i_isolate->factory()->NewJSPromise(self);
   i::DirectHandle<i::Object> args[] = {Utils::OpenDirectHandle(*handler),
                                        i_isolate->factory()->undefined_value(),
                                        return_promise};
@@ -8837,7 +8841,8 @@ MaybeLocal<Promise> Promise::Then(Local<Context> context,
   PrepareForExecutionScope api_scope{context, RCCId::kAPI_Promise_Then};
   i::Isolate* i_isolate = api_scope.i_isolate();
   auto self = Utils::OpenDirectHandle(this);
-  i::Handle<i::JSPromise> return_promise = i_isolate->factory()->NewJSPromise();
+  i::Handle<i::JSPromise> return_promise =
+      i_isolate->factory()->NewJSPromise(self);
   i::DirectHandle<i::Object> args[] = {Utils::OpenDirectHandle(*on_fulfilled),
                                        Utils::OpenDirectHandle(*on_rejected),
                                        return_promise};
@@ -9422,13 +9427,13 @@ size_t v8::ArrayBufferView::CopyContents(void* dest, size_t byte_length) {
     bool is_shared;
     if (i::IsJSTypedArray(*self)) {
       i::Tagged<i::JSTypedArray> array = i::Cast<i::JSTypedArray>(*self);
-      is_shared = array->buffer()->is_shared();
+      is_shared = array->buffer()->is_shared().value();
       source = reinterpret_cast<char*>(array->DataPtr());
     } else {
       DCHECK(i::IsJSDataView(*self) || i::IsJSRabGsabDataView(*self));
       i::Tagged<i::JSDataViewOrRabGsabDataView> data_view =
           i::Cast<i::JSDataViewOrRabGsabDataView>(*self);
-      is_shared = data_view->buffer()->is_shared();
+      is_shared = data_view->buffer()->is_shared().value();
       source = reinterpret_cast<char*>(data_view->data_pointer());
     }
     if (is_shared) {
@@ -9676,7 +9681,7 @@ Local<SharedArrayBuffer> v8::SharedArrayBuffer::New(
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   std::shared_ptr<i::BackingStore> i_backing_store(ToInternal(backing_store));
   Utils::ApiCheck(
-      i_backing_store->is_shared(), "v8::SharedArrayBuffer::New",
+      i_backing_store->is_shared().value(), "v8::SharedArrayBuffer::New",
       "Cannot construct SharedArrayBuffer with BackingStore of ArrayBuffer");
   i::DirectHandle<i::JSArrayBuffer> obj =
       i_isolate->factory()->NewJSSharedArrayBuffer(std::move(i_backing_store));
@@ -10296,7 +10301,7 @@ void Isolate::Initialize(Isolate* v8_isolate,
     uintptr_t limit =
         reinterpret_cast<uintptr_t>(params.constraints.stack_limit());
     i_isolate->stack_guard()->SetStackLimit(limit);
-    i_isolate->set_stack_size(base::Stack::GetStackStart() - limit);
+    i_isolate->SetStackSize(base::Stack::GetStackStart() - limit);
   }
 
   // TODO(v8:2487): Once we got rid of Isolate::Current(), we can remove this.
@@ -10992,7 +10997,7 @@ void Isolate::SetStackLimit(uintptr_t stack_limit) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
   CHECK(stack_limit);
   i_isolate->stack_guard()->SetStackLimit(stack_limit);
-  i_isolate->set_stack_size(base::Stack::GetStackStart() - stack_limit);
+  i_isolate->SetStackSize(base::Stack::GetStackStart() - stack_limit);
 }
 
 void Isolate::GetCodeRange(void** start, size_t* length_in_bytes) {

@@ -853,7 +853,6 @@ struct builtin : CallDescriptorBuilder {
     struct Arguments : ArgumentsBase {
       ARG(V<WasmTrustedInstanceData>, wasm_instance)
       ARG(V<Word32>, function_index)
-      ARG(V<Word32>, extract_shared_data)
     };
     using returns_t = std::tuple<V<WasmFuncRef>>;
 
@@ -1403,7 +1402,7 @@ struct BuiltinCallDescriptor {
 
   struct WasmFunctionTableGet : public Descriptor<WasmFunctionTableGet> {
     static constexpr auto kFunction = Builtin::kWasmFunctionTableGet;
-    using arguments_t = std::tuple<V<WordPtr>, V<WordPtr>, V<Word32>>;
+    using arguments_t = std::tuple<V<WordPtr>, V<WordPtr>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1415,8 +1414,7 @@ struct BuiltinCallDescriptor {
 
   struct WasmTableSetFuncRef : public Descriptor<WasmTableSetFuncRef> {
     static constexpr auto kFunction = Builtin::kWasmTableSetFuncRef;
-    using arguments_t =
-        std::tuple<V<WordPtr>, V<Word32>, V<WordPtr>, V<WasmFuncRef>>;
+    using arguments_t = std::tuple<V<WordPtr>, V<WordPtr>, V<WasmFuncRef>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1428,8 +1426,7 @@ struct BuiltinCallDescriptor {
 
   struct WasmTableSet : public Descriptor<WasmTableSet> {
     static constexpr auto kFunction = Builtin::kWasmTableSet;
-    using arguments_t =
-        std::tuple<V<WordPtr>, V<Word32>, V<WordPtr>, V<Object>>;
+    using arguments_t = std::tuple<V<WordPtr>, V<WordPtr>, V<Object>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1442,7 +1439,7 @@ struct BuiltinCallDescriptor {
   struct WasmTableInit : public Descriptor<WasmTableInit> {
     static constexpr auto kFunction = Builtin::kWasmTableInit;
     using arguments_t =
-        std::tuple<V<WordPtr>, V<Word32>, V<Word32>, V<Smi>, V<Smi>, V<Smi>>;
+        std::tuple<V<WordPtr>, V<Word32>, V<Word32>, V<Smi>, V<Smi>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1455,7 +1452,7 @@ struct BuiltinCallDescriptor {
   struct WasmTableCopy : public Descriptor<WasmTableCopy> {
     static constexpr auto kFunction = Builtin::kWasmTableCopy;
     using arguments_t =
-        std::tuple<V<WordPtr>, V<WordPtr>, V<WordPtr>, V<Smi>, V<Smi>, V<Smi>>;
+        std::tuple<V<WordPtr>, V<WordPtr>, V<WordPtr>, V<Smi>, V<Smi>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1467,7 +1464,7 @@ struct BuiltinCallDescriptor {
 
   struct WasmTableGrow : public Descriptor<WasmTableGrow> {
     static constexpr auto kFunction = Builtin::kWasmTableGrow;
-    using arguments_t = std::tuple<V<Smi>, V<WordPtr>, V<Word32>, V<Object>>;
+    using arguments_t = std::tuple<V<Smi>, V<WordPtr>, V<Object>>;
     using results_t = std::tuple<V<Smi>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1479,8 +1476,7 @@ struct BuiltinCallDescriptor {
 
   struct WasmTableFill : public Descriptor<WasmTableFill> {
     static constexpr auto kFunction = Builtin::kWasmTableFill;
-    using arguments_t =
-        std::tuple<V<WordPtr>, V<WordPtr>, V<Word32>, V<Smi>, V<Object>>;
+    using arguments_t = std::tuple<V<WordPtr>, V<WordPtr>, V<Smi>, V<Object>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1493,7 +1489,7 @@ struct BuiltinCallDescriptor {
   struct WasmArrayNewSegment : public Descriptor<WasmArrayNewSegment> {
     static constexpr auto kFunction = Builtin::kWasmArrayNewSegment;
     using arguments_t =
-        std::tuple<V<Word32>, V<Word32>, V<Word32>, V<Smi>, V<Smi>, V<Map>>;
+        std::tuple<V<Word32>, V<Word32>, V<Word32>, V<Smi>, V<Map>>;
     using results_t = std::tuple<V<WasmArray>>;
 
     static constexpr bool kNeedsFrameState = false;
@@ -1506,7 +1502,7 @@ struct BuiltinCallDescriptor {
   struct WasmArrayInitSegment : public Descriptor<WasmArrayInitSegment> {
     static constexpr auto kFunction = Builtin::kWasmArrayInitSegment;
     using arguments_t = std::tuple<V<Word32>, V<Word32>, V<Word32>, V<Smi>,
-                                   V<Smi>, V<Smi>, V<HeapObject>>;
+                                   V<Smi>, V<HeapObject>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;

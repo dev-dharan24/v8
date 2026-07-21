@@ -72,13 +72,6 @@ class MachineLoweringReducer : public Next {
     UNREACHABLE();
   }
 
-  V<Float64OrWord32> REDUCE(TypeHint)(V<Float64OrWord32> input,
-                                      TypeHintOp::Type) {
-    // As far as Machine operations are concerned, Int32/Uint32 are both Word32,
-    // and Float64/HoleyFloat64 are both Float64.
-    return input;
-  }
-
   V<Untagged> REDUCE(ChangeOrDeopt)(V<Untagged> input,
                                     V<EagerFrameState> frame_state,
                                     ChangeOrDeoptOp::Kind kind,
@@ -3080,10 +3073,13 @@ class MachineLoweringReducer : public Next {
       HeapObjectRef ref = MakeRef(broker, c->handle());
       if (!ref.IsString()) return StaticShape::kCantBe;
       StringRef sref = ref.AsString();
-      if (sref.IsSeqString() && sref.IsOneByteRepresentation()) {
-        return StaticShape::kIsSeqOneByte;
+      if (!sref.IsSeqString() || !sref.IsOneByteRepresentation()) {
+        return StaticShape::kCantBe;
       }
-      return StaticShape::kCantBe;
+      // A SeqOneByteString can still be internalized in place after this code
+      // is compiled.
+      if (sref.IsInternalizedString()) return StaticShape::kIsSeqOneByte;
+      return StaticShape::kUnknown;
     };
     StaticShape recv_shape = classify(receiver);
     StaticShape arg_shape = classify(compare_str);

@@ -98,6 +98,7 @@ struct EscapeAnalysisData {
         field_values(phase_zone),
         snapshots(phase_zone),
         keys_mappings(phase_zone),
+        loaded_values(phase_zone),
         alloc_dependencies(phase_zone),
         new_phis(phase_zone) {}
 
@@ -112,6 +113,12 @@ struct EscapeAnalysisData {
   FieldValuesTable field_values;
   ZoneAbslFlatHashMap<NodeBase*, Snapshot> snapshots;
   ZoneAbslFlatHashMap<ObjectField, Key> keys_mappings;
+
+  // When the CandidateAnalyzer encounters a LoadTaggedField, it must resolve it
+  // right away, rather than resolving it once its users are visited, so that if
+  // we have a store in between the load and its users, users still see the
+  // right value (cf escape-analysis-regress-531021852-1.js for an example).
+  ZoneAbslFlatHashMap<LoadTaggedField*, ValueNode*> loaded_values;
 
   // If there is a key `alloc1` with values `{ alloc2, alloc3 }`, then it means
   // that if `alloc1` cannot be elided, then neither can `alloc2` and `alloc3`.
@@ -169,6 +176,8 @@ struct EscapeAnalysisData {
   void MarkAsEscapedIfCandidate(ValueNode* node, int predecessor_index = -1);
 
   void MarkAsEscaped(InlinedAllocation* alloc);
+
+  bool HasEscaped(InlinedAllocation* alloc);
 
   ValueNode* Get(InlinedAllocation* base, int field);
   Key GetOrCreateKey(InlinedAllocation* base, int field);

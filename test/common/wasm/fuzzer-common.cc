@@ -70,7 +70,7 @@ bool CompileAllFunctionsForReferenceExecution(NativeModule* native_module,
     base::Vector<const uint8_t> func_code =
         wire_bytes_accessor.GetFunctionBytes(&func);
     FunctionBody func_body(func.sig, func.code.offset(), func_code.begin(),
-                           func_code.end(), SharedFlag{false});
+                           func_code.end());
     auto result = ExecuteLiftoffCompilation(
         &env, func_body,
         LiftoffOptions{.func_index = static_cast<int>(func.func_index),
@@ -1304,16 +1304,21 @@ int WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
   uint8_t flags_byte = data.empty() ? 0 : data[0];
   if (!data.empty()) data += 1;
 
-  // Enable Wasm type assertions half the time.
 #if defined(DEBUG) && defined(V8_USE_ADDRESS_SANITIZER)
+  // Disable register allocator verification on slow builds (Debug + ASan) to
+  // avoid timeouts in TurboFan/Turboshaft compilation on pathological inputs
+  // (see crbug.com/527760872).
+  FlagScope<bool> no_verify_allocator(&v8_flags.turbo_verify_allocation, false);
   // Disable type assertions on slow builds (Debug + ASan) to avoid timeouts in
   // TurboFan compilation (see crbug.com/520317061).
   const bool assert_types = false;
 #else
+  // Enable Wasm type assertions half the time.
   const bool assert_types = flags_byte & 1;
 #endif
   flags_byte >>= 1;
   FlagScope<bool> assert_types_scope(&v8_flags.wasm_assert_types, assert_types);
+
   // Enable rescheduling of operations in the Turboshaft graph half the time.
   const bool turbofan_random_rescheduling = flags_byte & 1;
   flags_byte >>= 1;

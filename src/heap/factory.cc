@@ -236,6 +236,9 @@ MaybeHandle<Code> Factory::CodeBuilder::BuildInternal(
         HeapObject::VerifyCodePointer(isolate_, raw_istream);
       }
 #endif
+#ifdef V8_ENABLE_GENERATED_CODE_VALIDATOR
+      GeneratedCodeValidator::Validate(isolate_, *code);
+#endif
     }
   }
 
@@ -2040,12 +2043,10 @@ Factory::NewPromiseResolveThenableJobTask(
 
 #if V8_ENABLE_WEBASSEMBLY
 
-DirectHandle<WasmTrustedInstanceData> Factory::NewWasmTrustedInstanceData(
-    SharedFlag shared) {
+DirectHandle<WasmTrustedInstanceData> Factory::NewWasmTrustedInstanceData() {
   Tagged<WasmTrustedInstanceData> result =
       TrustedCast<WasmTrustedInstanceData>(AllocateRawWithImmortalMap(
-          WasmTrustedInstanceData::kSize,
-          shared ? AllocationType::kSharedTrusted : AllocationType::kTrusted,
+          WasmTrustedInstanceData::kSize, AllocationType::kTrusted,
           read_only_roots().wasm_trusted_instance_data_map()));
   DisallowGarbageCollection no_gc;
   // Published after fields are initialized on the caller side.
@@ -2061,7 +2062,7 @@ DirectHandle<WasmTrustedInstanceData> Factory::NewWasmTrustedInstanceData(
 }
 
 DirectHandle<WasmDispatchTable> Factory::NewWasmDispatchTable(
-    int length, wasm::CanonicalValueType table_type, SharedFlag shared) {
+    int length, wasm::CanonicalValueType table_type) {
   CHECK_LE(length, WasmDispatchTable::kMaxLength);
 
   DirectHandle<TrustedManaged<WasmDispatchTableData>> offheap_data;
@@ -2070,15 +2071,13 @@ DirectHandle<WasmDispatchTable> Factory::NewWasmDispatchTable(
     size_t estimated_offheap_size = 0;
     offheap_data = TrustedManaged<WasmDispatchTableData>::From(
         isolate(), estimated_offheap_size,
-        std::make_shared<WasmDispatchTableData>(), shared);
+        std::make_shared<WasmDispatchTableData>());
   }
 
   int bytes = WasmDispatchTable::SizeFor(length);
-  Tagged<WasmDispatchTable> result =
-      UncheckedCast<WasmDispatchTable>(AllocateRawWithImmortalMap(
-          bytes,
-          shared ? AllocationType::kSharedTrusted : AllocationType::kTrusted,
-          read_only_roots().wasm_dispatch_table_map()));
+  Tagged<WasmDispatchTable> result = UncheckedCast<WasmDispatchTable>(
+      AllocateRawWithImmortalMap(bytes, AllocationType::kTrusted,
+                                 read_only_roots().wasm_dispatch_table_map()));
   DisallowGarbageCollection no_gc;
   result->WriteField<int>(WasmDispatchTable::kLengthOffset, length);
   result->WriteField<int>(WasmDispatchTable::kCapacityOffset, length);
@@ -2097,7 +2096,7 @@ DirectHandle<WasmDispatchTable> Factory::NewWasmDispatchTable(
 }
 
 DirectHandle<WasmDispatchTableForImports>
-Factory::NewWasmDispatchTableForImports(int length, SharedFlag shared) {
+Factory::NewWasmDispatchTableForImports(int length) {
   CHECK_LE(length, WasmDispatchTableForImports::kMaxLength);
 
   // Very rough estimate: half the imports need wrappers, each wrapper needs
@@ -2110,13 +2109,12 @@ Factory::NewWasmDispatchTableForImports(int length, SharedFlag shared) {
   DirectHandle<TrustedManaged<WasmDispatchTableData>> offheap_data =
       TrustedManaged<WasmDispatchTableData>::From(
           isolate(), estimated_offheap_size,
-          std::make_shared<WasmDispatchTableData>(), shared);
+          std::make_shared<WasmDispatchTableData>());
 
   int bytes = WasmDispatchTableForImports::SizeFor(length);
   Tagged<WasmDispatchTableForImports> result =
       UncheckedCast<WasmDispatchTableForImports>(AllocateRawWithImmortalMap(
-          bytes,
-          shared ? AllocationType::kSharedTrusted : AllocationType::kTrusted,
+          bytes, AllocationType::kTrusted,
           read_only_roots().wasm_dispatch_table_for_imports_map()));
   DisallowGarbageCollection no_gc;
   result->WriteField<int>(WasmDispatchTableForImports::kLengthOffset, length);
@@ -2490,7 +2488,6 @@ DirectHandle<WasmArray> Factory::NewWasmArrayFromMemory(
 
 DirectHandle<Object> Factory::NewWasmArrayFromElementSegment(
     DirectHandle<WasmTrustedInstanceData> trusted_instance_data,
-    DirectHandle<WasmTrustedInstanceData> shared_trusted_instance_data,
     uint32_t segment_index, uint32_t start_offset, uint32_t length,
     DirectHandle<Map> map, AllocationType allocation,
     wasm::CanonicalValueType element_type) {
@@ -2500,8 +2497,7 @@ DirectHandle<Object> Factory::NewWasmArrayFromElementSegment(
   // If the element segment has not been initialized yet, lazily initialize it
   // now.
   std::optional<MessageTemplate> opt_error = wasm::InitializeElementSegment(
-      isolate(), trusted_instance_data, shared_trusted_instance_data,
-      segment_index);
+      isolate(), trusted_instance_data, segment_index);
   if (opt_error.has_value()) {
     return direct_handle(Smi::FromEnum(opt_error.value()), isolate());
   }
@@ -2574,7 +2570,7 @@ Factory::NewSharedFunctionInfoForWasmExportedFunction(
 
 DirectHandle<SharedFunctionInfo> Factory::NewSharedFunctionInfoForWasmResume(
     DirectHandle<WasmResumeData> data) {
-  return NewSharedFunctionInfo({}, data, Builtin::kNoBuiltinId, 0, kDontAdapt);
+  return NewSharedFunctionInfo({}, data, Builtin::kNoBuiltinId, 1, kAdapt);
 }
 
 DirectHandle<SharedFunctionInfo>
@@ -5125,10 +5121,11 @@ Handle<JSPromise> Factory::NewJSPromiseWithoutHook() {
   return promise;
 }
 
-Handle<JSPromise> Factory::NewJSPromise() {
+Handle<JSPromise> Factory::NewJSPromise(DirectHandle<Object> parent) {
   Handle<JSPromise> promise = NewJSPromiseWithoutHook();
-  isolate()->RunAllPromiseHooks(PromiseHookType::kInit, promise,
-                                undefined_value());
+  DirectHandle<Object> hook_parent =
+      parent.is_null() ? DirectHandle<Object>(undefined_value()) : parent;
+  isolate()->RunAllPromiseHooks(PromiseHookType::kInit, promise, hook_parent);
   return promise;
 }
 
@@ -5371,16 +5368,13 @@ DirectHandle<DictionaryTemplateInfo> Factory::NewDictionaryTemplateInfo(
   return direct_handle(obj, isolate());
 }
 
-Handle<TrustedForeign> Factory::NewTrustedForeign(Address addr,
-                                                  SharedFlag shared) {
+Handle<TrustedForeign> Factory::NewTrustedForeign(Address addr) {
   // Statically ensure that it is safe to allocate foreigns in paged spaces.
   static_assert(sizeof(TrustedForeign) <= kMaxRegularHeapObjectSize);
   Tagged<Map> map = *trusted_foreign_map();
   Tagged<TrustedForeign> foreign =
       TrustedCast<TrustedForeign>(AllocateRawWithImmortalMap(
-          map->instance_size(),
-          shared ? AllocationType::kSharedTrusted : AllocationType::kTrusted,
-          map));
+          map->instance_size(), AllocationType::kTrusted, map));
   DisallowGarbageCollection no_gc;
   foreign->set_foreign_address(addr);
   return handle(foreign, isolate());
@@ -5471,28 +5465,20 @@ Handle<JSFunction> Factory::JSFunctionBuilder::BuildRaw(
       JSDispatchTable& jdt = isolate_->js_dispatch_table();
       Tagged<Code> old_code = jdt.GetCode(dispatch_handle);
 
-      // A write barrier is needed when settings code, because the update can
-      // race with marking which could leave the dispatch slot unmarked.
-      // TODO(olivf): This should be fixed by using a more traditional WB
-      // for dispatch handles (i.e. have a marking queue with dispatch handles
-      // instead of marking through the handle).
-      constexpr WriteBarrierMode mode_if_setting_code =
-          WriteBarrierMode::UPDATE_WRITE_BARRIER;
-
       // TODO(olivf): We should go through the cases where this is still
       // needed and maybe find some alternative to initialize it correctly
       // from the beginning.
       if (old_code->is_builtin()) {
-        jdt.SetCodeNoWriteBarrier(dispatch_handle, *code);
-        function->set_dispatch_handle(dispatch_handle, mode_if_setting_code);
+        jdt.SetCodeNoWriteBarrier(dispatch_handle, *code, isolate);
+        function->set_dispatch_handle(dispatch_handle, mode);
       } else {
         // On a transition of a feedback cell from one closure to many, make
         // sure that the code on the feedback cell isn't native context
         // specialized, and if it was, eagerly re-optimize.
         if (cell_transition == FeedbackCell::kOneToMany &&
             old_code->is_context_specialized()) {
-          jdt.SetCodeNoWriteBarrier(dispatch_handle, *code);
-          function->set_dispatch_handle(dispatch_handle, mode_if_setting_code);
+          jdt.SetCodeNoWriteBarrier(dispatch_handle, *code, isolate);
+          function->set_dispatch_handle(dispatch_handle, mode);
           DCHECK(old_code->kind() == CodeKind::MAGLEV ||
                  old_code->kind() == CodeKind::TURBOFAN_JS);
           if (!old_code->marked_for_deoptimization()) {

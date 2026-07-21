@@ -1138,6 +1138,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void RequestInterrupt(InterruptCallback callback, void* data);
   void InvokeApiInterruptCallbacks();
 
+  bool is_executing_api_interrupt() const { return api_interrupt_depth_ > 0; }
+
   void RequestInvalidateNoProfilingProtector();
 
   // Administration
@@ -1812,7 +1814,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   bool jitless() const { return jitless_; }
 
-  void set_stack_size(size_t v) { stack_size_ = v; }
+  void SetStackSize(size_t v);
   size_t stack_size() { return stack_size_; }
 
   base::RandomNumberGenerator* random_number_generator();
@@ -2398,9 +2400,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // Returns the isolate that owns the shared spaces.
   Isolate* shared_space_isolate() const {
     DCHECK(has_shared_space());
-    Isolate* isolate = shared_space_isolate_.value();
-    DCHECK(has_shared_space());
-    return isolate;
+    return shared_space_isolate_.value();
   }
 
   // Returns true when this isolate supports allocation in shared spaces.
@@ -2812,6 +2812,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   using InterruptEntry = std::pair<InterruptCallback, void*>;
   std::queue<InterruptEntry> api_interrupts_queue_;
+  int api_interrupt_depth_ = 0;
 
 #define GLOBAL_BACKING_STORE(type, name, initialvalue) type name##_;
   ISOLATE_INIT_LIST(GLOBAL_BACKING_STORE)
@@ -3162,6 +3163,8 @@ class StackLimitCheck {
   // it checks logical stack limit of a secondary stack stored in the isolate,
   // instead checking actual one.
   bool WasmHasOverflowed(uintptr_t gap = 0) const;
+  // Initial stack check for growable stacks. Called from a fast C call.
+  bool WasmGrowableStackHasOverflowed(uintptr_t gap) const;
 #endif
 
   // Use this to check for interrupt request in C++ code.

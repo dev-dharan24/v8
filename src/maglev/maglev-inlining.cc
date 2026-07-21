@@ -23,38 +23,28 @@ bool MaglevCallSiteInfoCompare::operator()(const MaglevCallSiteInfo* info1,
   return info1->score < info2->score;
 }
 
-bool MaglevInliner::IsSmallWithHeapNumberInputsOutputs(
-    MaglevCallSiteInfo* call_site) const {
-  bool has_heapnumber_input_output = false;
+int MaglevInliner::GetExistingInlinedSize(MaglevCallSiteInfo* call_site) const {
+  CallKnownJSFunction* call_node = call_site->generic_call_node;
+  if (!call_node->IsTargetInputConstant()) return 0;
 
-  if (call_site->generic_call_node->use_repr_hints().contains_any(
-          UseRepresentationSet{UseRepresentation::kFloat64,
-                               UseRepresentation::kHoleyFloat64,
-                               UseRepresentation::kTruncatedInt32})) {
-    // TruncatedInt32 uses do not necessarily mean that the input is a
-    // HeapNumber, but when emitted operation that truncate their inputs to
-    // Int32, Maglev doesn't distinguish between Smis and HeapNumbers.
-    // TODO(dmercadier): distinguish between Smis and HeapNumbers in the graph
-    // builder for operations that truncate their inputs, and then in turn, make
-    // sure that we're not setting {has_heapnumber_input_output} to true for a
-    // function that has so far only returned Smis.
-    has_heapnumber_input_output = true;
+  ValueNode* target_node = call_node->TargetInput().node();
+  HeapConstant* constant = target_node->TryCast<HeapConstant>();
+  if (!constant) return 0;
+
+  compiler::HeapObjectRef ref = constant->ref();
+  if (!ref.IsJSFunction()) return 0;
+
+  compiler::JSFunctionRef function = ref.AsJSFunction();
+  compiler::OptionalCodeRef code = function.code(broker());
+  if (!code) return 0;
+
+  int size = code->GetInlinedBytecodeSize();
+  if (size > 0) {
+    TRACE_INLINING(TraceIdent{} << "Existing opt code's inlined bytecode size: "
+                                << size);
   }
-
-  if (!has_heapnumber_input_output) {
-    for (ValueNode* input : call_site->caller_details.arguments) {
-      if (input->UnwrapIdentities()->is_float64_or_holey_float64()) {
-        has_heapnumber_input_output = true;
-        break;
-      }
-    }
-  }
-
-  if (!has_heapnumber_input_output) return false;
-  return call_site->bytecode_length <=
-         flags_.max_inlined_bytecode_size_small_with_heapnum_in_out;
+  return size;
 }
-
 bool MaglevInliner::CanInlineCall() {
   // We stop inlining entirely if the small budget is exhausted.
   // Inlining decisions after that become bad if we stop inlining small
@@ -77,13 +67,8 @@ bool MaglevInliner::InlineCallSites() {
                    << graph_->graph_labeller()->NodeId(
                           call_site->generic_call_node));
 
-    bool main_exhausted = graph_->total_inlined_bytecode_size() >
-                          flags_.max_inlined_bytecode_size_cumulative;
     bool small_exhausted = graph_->total_inlined_bytecode_size_small() >
                            flags_.max_inlined_bytecode_size_small_total;
-    bool is_small_with_heapnum_input_outputs =
-        IsSmallWithHeapNumberInputsOutputs(call_site);
-
     if (small_exhausted) {
       // We stop inlining entirely if the small budget is exhausted.
       // Inlining decisions after that become bad if we stop inlining small
@@ -98,19 +83,28 @@ bool MaglevInliner::InlineCallSites() {
       break;
     }
 
-    if (!is_small_with_heapnum_input_outputs && main_exhausted) {
-      graph_->compilation_info()->set_could_not_inline_all_candidates();
-      TRACE_INLINING(TraceIdent{}
-                     << TraceColor::kRed << "Main budget exhausted ("
-                     << graph_->total_inlined_bytecode_size() << " > "
-                     << flags_.max_inlined_bytecode_size_cumulative << ")"
-                     << TraceColor::kReset);
-      TRACE_INLINING(TraceSkip(shared));
-      continue;
+    bool is_small = IsSmallFunction(
+        call_site->bytecode_length, call_site->caller_details.arguments,
+        call_site->generic_call_node->use_repr_hints(), flags_);
+    if (!is_small) {
+      int estimated_size =
+          call_site->bytecode_length + GetExistingInlinedSize(call_site);
+      if (graph_->total_inlined_bytecode_size() + estimated_size >
+          flags_.max_inlined_bytecode_size_cumulative) {
+        graph_->compilation_info()->set_could_not_inline_all_candidates();
+        TRACE_INLINING(TraceIdent{}
+                       << TraceColor::kRed
+                       << "Main budget exhausted with candidate ("
+                       << graph_->total_inlined_bytecode_size() << " + "
+                       << estimated_size << " > "
+                       << flags_.max_inlined_bytecode_size_cumulative << ")"
+                       << TraceColor::kReset);
+        TRACE_INLINING(TraceSkip(shared));
+        continue;
+      }
     }
 
-    InliningResult result =
-        BuildInlineFunction(call_site, is_small_with_heapnum_input_outputs);
+    InliningResult result = BuildInlineFunction(call_site, is_small);
     if (result == InliningResult::kAbort) return false;
     if (result == InliningResult::kFail) continue;
     DCHECK_EQ(result, InliningResult::kDone);

@@ -802,11 +802,10 @@ DEFINE_BOOL(maglev_non_eager_inlining, false,
             "enable Maglev non-eager inlining")
 DEFINE_BOOL(turbolev_non_eager_inlining, true,
             "enable Turbolev non-eager inlining")
-DEFINE_BOOL(turbolev_non_eager_loop_peeling, false,
+DEFINE_BOOL(turbolev_non_eager_loop_peeling, true,
             "enable Turbolev non-eager loop peeling")
 DEFINE_BOOL(turbolev_eager_loop_peeling_osr, true,
             "use eager loop peeling in Turbolev OSR compiles")
-DEFINE_WEAK_IMPLICATION(turbolev_future, turbolev_non_eager_loop_peeling)
 DEFINE_DEVELOPER_FLAG(turbolev_trace_loop_peeling,
                       "trace turbolev non-eager loop peeling decisions")
 
@@ -1869,6 +1868,7 @@ DEFINE_BOOL_READONLY(turbolev_escape_analysis, false,
 #else
 DEFINE_EXPERIMENTAL_FEATURE(turbolev_escape_analysis,
                             "enable escape analysis for Turbolev")
+DEFINE_WEAK_IMPLICATION(turbolev_future, turbolev_escape_analysis)
 #endif
 DEFINE_DEVELOPER_FLAG(trace_turbolev_escape_analysis,
                       "enable tracing for Turbolev's escape analysis phase")
@@ -2642,7 +2642,7 @@ DEFINE_BOOL(concurrent_marking, true, "use concurrent marking")
 // stores.
 DEFINE_BOOL(concurrent_marking, false, "use concurrent marking")
 #endif
-DEFINE_INT(
+DEFINE_UINT(
     concurrent_marking_max_worker_num, 7,
     "max worker number of concurrent marking, 0 for NumberOfWorkerThreads")
 DEFINE_BOOL(concurrent_array_buffer_sweeping, true,
@@ -3503,6 +3503,9 @@ DEFINE_DEVELOPER_FLAG(serialization_statistics,
 // Regexp
 DEFINE_BOOL(regexp_optimization, true, "generate optimized regexp code")
 DEFINE_BOOL(regexp_unroll, true, "unroll small {} repeats when optimizing")
+DEFINE_BOOL(regexp_masked_dispatch, true,
+            "dispatch disjoint regexp alternations on the masked quick-check "
+            "value")
 DEFINE_BOOL(regexp_quick_check, true,
             "generate quickcheck code when optimizing")
 DEFINE_BOOL(regexp_interpret_all, false, "interpret all regexp code")
@@ -4097,7 +4100,11 @@ DEFINE_BOOL(prof, false,
 DEFINE_IMPLICATION(prof, prof_cpp)
 DEFINE_IMPLICATION(prof, log_code)
 
-DEFINE_BOOL(ll_prof, false, "Enable low-level linux profiler.")
+// Enable low-level linux profiler.
+// When active, V8 will log code events (like code creation and code moving)
+// to v8.log and will signal code-moving GC events to synchronize system-level
+// profilers (like Linux perf) with V8's heap relocations via fake mmaps.
+DEFINE_DEVELOPER_FLAG(ll_prof, "Enable low-level linux profiler.")
 
 #if V8_OS_LINUX || V8_OS_DARWIN
 #define DEFINE_PERF_PROF_BOOL(nam, cmt) DEFINE_BOOL(nam, false, cmt)
@@ -4154,6 +4161,10 @@ DEFINE_BOOL_READONLY(
 #undef DEFINE_PERF_PROF_BOOL
 #undef DEFINE_PERF_PROF_IMPLICATION
 
+// Specify the name of the file for fake gc mmap used in ll_prof.
+// V8 will perform a temporary mmap/munmap on this file during a code-moving GC
+// event, which injects a marker into the system-level profiler (e.g. perf)
+// stream to align/synchronize V8 code log timestamps with the system trace.
 DEFINE_STRING(gc_fake_mmap, "/tmp/__v8_gc__",
               "Specify the name of the file for fake gc mmap used in ll_prof")
 
@@ -4311,9 +4322,15 @@ DEFINE_BOOL(incremental_marking_for_gc_in_background, true,
 #if V8_CAN_CREATE_SHARED_HEAP_BOOL
 DEFINE_EXPERIMENTAL_FEATURE(shared_heap,
                             "Enables a shared heap between isolates.")
+DEFINE_BOOL(empty_shared_heap, false,
+            "Enables a shared heap, but not shared allocations")
+DEFINE_IMPLICATION(empty_shared_heap, shared_heap)
+DEFINE_NEG_IMPLICATION(empty_shared_heap, shared_string_table)
 #else
 DEFINE_BOOL_READONLY(shared_heap, false,
                      "Enables a shared heap between isolates.")
+DEFINE_BOOL_READONLY(empty_shared_heap, false,
+                     "Enables a shared heap, but not shared allocations")
 #endif
 
 DEFINE_BOOL(proto_assign_seq_opt, true,

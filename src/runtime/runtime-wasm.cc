@@ -901,17 +901,10 @@ RUNTIME_FUNCTION(Runtime_WasmTableInit) {
 
   DCHECK(!isolate->context().is_null());
 
-  DirectHandle<WasmTrustedInstanceData> shared_trusted_instance_data;
-  if (trusted_instance_data->module()->has_shared_part) {
-    // For now, we never pass the shared WTID to this runtime function.
-    DCHECK_NE(*trusted_instance_data, trusted_instance_data->shared_part());
-    shared_trusted_instance_data =
-        direct_handle(trusted_instance_data->shared_part(), isolate);
-  }
   std::optional<MessageTemplate> opt_error =
-      WasmTrustedInstanceData::InitTableEntries(
-          isolate, trusted_instance_data, shared_trusted_instance_data,
-          table_index, elem_segment_index, dst, src, count);
+      WasmTrustedInstanceData::InitTableEntries(isolate, trusted_instance_data,
+                                                table_index, elem_segment_index,
+                                                dst, src, count);
   if (opt_error.has_value()) {
     return ThrowWasmError(isolate, opt_error.value());
   }
@@ -1208,14 +1201,10 @@ RUNTIME_FUNCTION(Runtime_WasmArrayNewSegment) {
       return ThrowWasmError(
           isolate, MessageTemplate::kWasmTrapElementSegmentOutOfBounds);
     }
-    DirectHandle<WasmTrustedInstanceData> shared_instance =
-        trusted_instance_data->has_shared_part()
-            ? handle(trusted_instance_data->shared_part(), isolate)
-            : trusted_instance_data;
     DirectHandle<Object> result =
         isolate->factory()->NewWasmArrayFromElementSegment(
-            trusted_instance_data, shared_instance, segment_index, offset,
-            length, rtt, allocation, element_type);
+            trusted_instance_data, segment_index, offset, length, rtt,
+            allocation, element_type);
     if (IsSmi(*result)) {
       return ThrowWasmError(
           isolate, static_cast<MessageTemplate>(Cast<Smi>(*result).value()));
@@ -1292,12 +1281,8 @@ RUNTIME_FUNCTION(Runtime_WasmArrayInitSegment) {
 
     // If the element segment has not been initialized yet, lazily initialize it
     // now.
-    DirectHandle<WasmTrustedInstanceData> shared_instance =
-        trusted_instance_data->has_shared_part()
-            ? handle(trusted_instance_data->shared_part(), isolate)
-            : trusted_instance_data;
     std::optional<MessageTemplate> opt_error = wasm::InitializeElementSegment(
-        isolate, trusted_instance_data, shared_instance, segment_index);
+        isolate, trusted_instance_data, segment_index);
     if (opt_error.has_value()) {
       return ThrowWasmError(isolate, opt_error.value());
     }
@@ -1377,14 +1362,27 @@ int GetWasmFrameCount(Isolate* isolate, Tagged<WasmSuspenderObject> suspender) {
   int count = 0;
   for (StackFrameIterator it(isolate); !it.done(); it.Advance()) {
     StackFrame* frame = it.frame();
+#ifdef DEBUG
+    Tagged<WasmSuspenderObject> parent = suspender->parent();
+    wasm::StackMemory* end_stack = parent->stack();
+    DCHECK_NOT_NULL(end_stack);
+    bool suspender_contains_frame = false;
+    for (wasm::StackMemory* stack = isolate->isolate_data()->active_stack();
+         stack != end_stack; stack = stack->jmpbuf()->parent) {
+      if (stack->Contains(frame->fp())) {
+        suspender_contains_frame = true;
+        break;
+      }
+    }
+#endif
     if (frame->is_wasm()) {
       WasmFrame* wasm_frame = WasmFrame::cast(frame);
       count += wasm_frame->Summarize().size();
-      DCHECK(suspender->stack()->Contains(frame->fp()));
+      DCHECK(suspender_contains_frame);
     } else if (frame->is_javascript()) {
       // By construction, the first JS frame must be the JSPI entry point and is
       // outside of the captured stack. Stop the count.
-      DCHECK(!suspender->stack()->Contains(frame->fp()));
+      DCHECK(!suspender_contains_frame);
       break;
     }
   }
@@ -2113,12 +2111,8 @@ MaybeDirectHandle<FixedArray> GetElementSegment(
     return {Cast<FixedArray>(segment_raw), isolate};
   }
 
-  DirectHandle<WasmTrustedInstanceData> shared_instance =
-      instance->has_shared_part() ? handle(instance->shared_part(), isolate)
-                                  : instance;
-  std::optional<MessageTemplate> opt_error =
-      wasm::InitializeElementSegment(isolate, instance, shared_instance,
-                                     segment_index, wasm::kPrecreateExternal);
+  std::optional<MessageTemplate> opt_error = wasm::InitializeElementSegment(
+      isolate, instance, segment_index, wasm::kPrecreateExternal);
   if (opt_error.has_value()) {
     ThrowWasmError(isolate, opt_error.value());
     return {};

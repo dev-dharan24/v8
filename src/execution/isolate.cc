@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -2595,6 +2596,19 @@ void Isolate::RequestInterrupt(InterruptCallback callback, void* data) {
 
 void Isolate::InvokeApiInterruptCallbacks() {
   RCS_SCOPE(this, RuntimeCallCounterId::kInvokeApiInterruptCallbacks);
+  struct ApiInterruptScope {
+    explicit ApiInterruptScope(Isolate* isolate) : isolate_(isolate) {
+      DCHECK_LE(0, isolate_->api_interrupt_depth_);
+      DCHECK_LT(isolate_->api_interrupt_depth_,
+                std::numeric_limits<int>::max());
+      isolate_->api_interrupt_depth_++;
+    }
+    ~ApiInterruptScope() {
+      DCHECK_LT(0, isolate_->api_interrupt_depth_);
+      isolate_->api_interrupt_depth_--;
+    }
+    Isolate* const isolate_;
+  } scope{this};
   // Note: callback below should be called outside of execution access lock.
   while (true) {
     InterruptEntry entry;
@@ -7097,6 +7111,19 @@ base::RandomNumberGenerator* Isolate::fuzzer_rng() {
   return fuzzer_rng_;
 }
 
+void Isolate::SetStackSize(size_t v) {
+  stack_size_ = v;
+#if V8_ENABLE_WEBASSEMBLY
+  // During early isolate initialization (inside v8::Isolate::Initialize),
+  // SetStackSize is called before Isolate::Init allocates the first central
+  // Wasm stack. When that happens, wasm_stacks() is empty. Skip the bounds
+  // update since the central stack will query stack_size() upon creation.
+  if (!wasm_stacks().empty()) {
+    wasm_stacks()[0]->UpdateCentralStackLimit(this);
+  }
+#endif
+}
+
 int Isolate::GenerateIdentityHash(uint32_t mask) {
   int hash;
   int attempts = 0;
@@ -8184,7 +8211,11 @@ bool StackLimitCheck::WasmHasOverflowed(uintptr_t gap) const {
   uintptr_t sp = 0;
   uintptr_t limit = 0;
   auto fp = isolate_->thread_local_top()->c_entry_fp_;
-  if (fp != 0 && active_stack->Contains(fp)) {
+  // This must be called from a runtime function, so we must be on the central
+  // stack and the CEntry FP must be set.
+  DCHECK(isolate_->IsOnCentralStack());
+  DCHECK_NE(fp, 0);
+  if (active_stack->Contains(fp)) {
     // If wasm was running on a secondary stack, we had to switch to the central
     // stack to perform this check, and the current SP is not relevant in this
     // case. Check whether the wasm SP overflowed the wasm stack limit instead.
@@ -8201,6 +8232,20 @@ bool StackLimitCheck::WasmHasOverflowed(uintptr_t gap) const {
     sp = GetCurrentStackPosition();
     limit = stack_guard->real_climit();
   }
+  return sp - gap < limit;
+}
+
+bool StackLimitCheck::WasmGrowableStackHasOverflowed(uintptr_t gap) const {
+  // Initial stack overflow check for growable stacks.
+  // Called from a fast C call, check the current SP directly.
+  wasm::StackMemory* active_stack = isolate_->isolate_data()->active_stack();
+#ifdef USE_SIMULATOR
+  uintptr_t sp = Simulator::current(isolate_)->get_sp();
+#else
+  uintptr_t sp = GetCurrentStackPosition();
+#endif
+  DCHECK(active_stack->Contains(sp));
+  uintptr_t limit = reinterpret_cast<uintptr_t>(active_stack->jslimit());
   return sp - gap < limit;
 }
 #endif

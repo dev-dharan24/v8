@@ -23,6 +23,8 @@ struct LoopEffects;
 class KnownNodeAspects;
 class TraceLogger;
 
+enum class EnsureTypeResult { kAlreadyHadType, kTypeUpdated, kContradiction };
+
 using PossibleMaps = compiler::ZoneRefSet<Map>;
 
 #ifdef DEBUG
@@ -308,10 +310,10 @@ class NodeInfo {
                                    const NodeInfo* node_info,
                                    const PossibleMaps& possible_maps);
 
-  void SetPossibleMaps(const PossibleMaps& possible_maps,
-                       bool any_map_is_unstable, NodeType possible_type,
-                       compiler::JSHeapBroker* broker,
-                       const KnownNodeAspects& known_node_aspects) {
+  V8_NODISCARD bool SetPossibleMaps(
+      const PossibleMaps& possible_maps, bool any_map_is_unstable,
+      NodeType possible_type, compiler::JSHeapBroker* broker,
+      const KnownNodeAspects& known_node_aspects) {
     if (V8_UNLIKELY(v8_flags.trace_maglev_kna)) {
       TraceSetPossibleMaps(known_node_aspects, this, possible_maps);
     }
@@ -334,6 +336,7 @@ class NodeInfo {
     }
 #endif
     IntersectType(possible_type);
+    return !IsEmptyNodeType(type_);
   }
 
   // "Stale" means that 1. we've seen unstable maps, and 2. a side effect may
@@ -529,25 +532,32 @@ class KnownNodeAspects {
         GetTypeUnchecked(broker, node));
   }
 
-  bool EnsureType(compiler::JSHeapBroker* broker, ValueNode* node,
-                  NodeType type, NodeType* old_type = nullptr) {
+  EnsureTypeResult EnsureType(compiler::JSHeapBroker* broker, ValueNode* node,
+                              NodeType type, NodeType* old_type = nullptr) {
     NodeType static_type = node->GetStaticType(broker);
     if (old_type) *old_type = static_type;
-    // TODO(428667907): Ideally we should bail out early for the kNone type.
     if (NodeTypeIs(static_type, type, NodeTypeIsVariant::kAllowNone)) {
-      return true;
+      if (static_type == NodeType::kNone) {
+        return EnsureTypeResult::kContradiction;
+      }
+      return EnsureTypeResult::kAlreadyHadType;
     }
     NodeInfo* known_info = GetOrCreateInfoFor(broker, node);
     if (old_type) *old_type = known_info->type();
-    // TODO(428667907): Ideally we should bail out early for the kNone type.
     if (NodeTypeIs(known_info->type(), type, NodeTypeIsVariant::kAllowNone)) {
-      return true;
+      if (known_info->type() == NodeType::kNone) {
+        return EnsureTypeResult::kContradiction;
+      }
+      return EnsureTypeResult::kAlreadyHadType;
     }
     known_info->IntersectType(type);
     if (auto phi = node->TryCast<Phi>()) {
       known_info->IntersectType(phi->type());
     }
-    return false;
+    if (known_info->type() == NodeType::kNone) {
+      return EnsureTypeResult::kContradiction;
+    }
+    return EnsureTypeResult::kTypeUpdated;
   }
 
   void Merge(const KnownNodeAspects& other, Zone* zone);
@@ -957,6 +967,7 @@ class KnownMapsMerger {
         }
       }
       if (intersect_set_.is_empty()) {
+        // TODO(marja): Refactor to return false here explicitly.
         node_type_ = EmptyNodeType();
       }
     } else {
@@ -971,12 +982,15 @@ class KnownMapsMerger {
     }
   }
 
-  void UpdateKnownNodeAspects(ValueNode* object,
-                              KnownNodeAspects& known_node_aspects) {
+  // Returns false if the object now has the empty type, true otherwise.
+  V8_NODISCARD bool UpdateKnownNodeAspects(
+      ValueNode* object, KnownNodeAspects& known_node_aspects) {
     // Update known maps.
     auto node_info = known_node_aspects.GetOrCreateInfoFor(broker_, object);
-    node_info->SetPossibleMaps(intersect_set_, any_map_is_unstable_, node_type_,
-                               broker_, known_node_aspects);
+    if (!node_info->SetPossibleMaps(intersect_set_, any_map_is_unstable_,
+                                    node_type_, broker_, known_node_aspects)) {
+      return false;
+    }
     // Make sure known_node_aspects.side_effects_require_invalidation is updated
     // in case any_map_is_unstable changed to true for this object
     // -- this can happen if this was an intersection with the universal set
@@ -1002,6 +1016,7 @@ class KnownMapsMerger {
       // TODO(victorgomes): Add a DCHECK_SLOW that checks if the maps already
       // exist in the CompilationDependencySet.
     }
+    return true;
   }
 
   bool known_maps_are_subset_of_requested_maps() const {

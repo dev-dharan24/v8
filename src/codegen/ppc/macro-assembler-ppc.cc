@@ -808,8 +808,10 @@ void MacroAssembler::RecordWriteField(Register object, int offset,
 
   AddS64(slot_address, object, Operand(offset - kHeapObjectTag));
   if (v8_flags.slow_debug_code) {
+    UseScratchRegisterScope temps(this);
+    Register scratch = temps.Acquire();
     Label ok;
-    andi(r0, slot_address, Operand(kTaggedSize - 1));
+    andi(scratch, slot_address, Operand(kTaggedSize - 1));
     beq(&ok, cr0);
     stop();
     bind(&ok);
@@ -829,7 +831,8 @@ void MacroAssembler::RecordWriteField(Register object, int offset,
 
 void MacroAssembler::Zero(const MemOperand& dest) {
   ASM_CODE_COMMENT(this);
-  Register scratch = r0;
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
 
   mov(scratch, Operand::Zero());
   StoreU64(scratch, dest);
@@ -837,7 +840,8 @@ void MacroAssembler::Zero(const MemOperand& dest) {
 
 void MacroAssembler::Zero(const MemOperand& dest1, const MemOperand& dest2) {
   ASM_CODE_COMMENT(this);
-  Register scratch = r0;
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
 
   mov(scratch, Operand::Zero());
   StoreU64(scratch, dest1);

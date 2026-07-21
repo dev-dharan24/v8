@@ -96,6 +96,8 @@ ValueNode* EscapeAnalysisData::ResolveBase(ValueNode* node,
   switch (node->opcode()) {
     case Opcode::kLoadTaggedField: {
       LoadTaggedField* load = node->Cast<LoadTaggedField>();
+      auto it = loaded_values.find(load);
+      if (it != loaded_values.end()) return it->second;
       return ResolveLoadBase(load->ValueInput().node(), load->offset(), load,
                              predecessor_index);
     }
@@ -197,6 +199,10 @@ void EscapeAnalysisData::MarkAsEscaped(InlinedAllocation* alloc) {
   }
 }
 
+bool EscapeAnalysisData::HasEscaped(InlinedAllocation* alloc) {
+  return candidates.at(alloc) == CandidateStatus::kCannotElide;
+}
+
 namespace {
 
 void UpdateVirtualObjects(DeoptFrame* deopt_frame,
@@ -244,21 +250,19 @@ void AddUsesToInputs(
   }
 }
 
-ValueNode* GetUpdatedValue(
+ValueNode* GetUpdatedValueAndAddDeoptUse(
     ValueNode* value,
     const std::unordered_map<ValueNode*, VirtualObject*>& vobj_map,
     EscapeAnalysisData& data) {
   ValueNode* resolved = data.ResolveBase(value);
-  if (resolved != value) {
-    // TODO(dmercadier): we can't reduce the use-count of {value} here, because
-    // when we duplicate DeoptFrames we don't increase use-counts to account
-    // for uses in the cloned DeoptFrame. This is sound because we will also
-    // never remove the uses corresponding to the original DeoptFrame that was
-    // dropped (which means that the use-count of {value} or any input of the
-    // current DeoptFrame cannot go down to 0). However, this whole thing sounds
-    // a bit messy and it would be better to track more accurate use counts.
-    resolved->add_use();
-  }
+
+  // We didn't increment use-count when cloning the DeoptFrame (because the
+  // VirtualObjects weren't ready yet), so we need to do it now.
+  // TODO(dmercadier): we can't decrement use-count of the original DeoptFrame
+  // because it could be cloned multiple times, which would lead to wrongly
+  // decrementing multiple times. Figure out a way to get accurate use-counts
+  // after escape analysis.
+  resolved->add_use();
 
   // If {resolved} is a VirtualObject, we need to add uses to its inputs.
   auto it = vobj_map.find(resolved);
@@ -273,12 +277,13 @@ void UpdateInterpretedFrame(
     InterpretedDeoptFrame& frame,
     const std::unordered_map<ValueNode*, VirtualObject*>& vobj_map,
     EscapeAnalysisData& data) {
-  frame.closure() = GetUpdatedValue(frame.closure(), vobj_map, data);
+  frame.closure() =
+      GetUpdatedValueAndAddDeoptUse(frame.closure(), vobj_map, data);
 
   frame.frame_state()->ForEachValue(
       frame.unit(),
       [&vobj_map, &data](ValueNode*& value, interpreter::Register owner) {
-        value = GetUpdatedValue(value, vobj_map, data);
+        value = GetUpdatedValueAndAddDeoptUse(value, vobj_map, data);
       });
 }
 
@@ -286,10 +291,11 @@ void UpdateInlinedArgumentsFrame(
     InlinedArgumentsDeoptFrame& frame,
     const std::unordered_map<ValueNode*, VirtualObject*>& vobj_map,
     EscapeAnalysisData& data) {
-  frame.closure() = GetUpdatedValue(frame.closure(), vobj_map, data);
+  frame.closure() =
+      GetUpdatedValueAndAddDeoptUse(frame.closure(), vobj_map, data);
 
   for (ValueNode*& value : frame.arguments()) {
-    value = GetUpdatedValue(value, vobj_map, data);
+    value = GetUpdatedValueAndAddDeoptUse(value, vobj_map, data);
   }
 }
 
@@ -300,18 +306,21 @@ void UpdateConstructInvokeStubFrame(
   // Note that while the receiver cannot be elided, it could still be a
   // LoadTaggedField from an elided base, in which case it still need to be
   // updated to bypass the load.
-  frame.receiver() = GetUpdatedValue(frame.receiver(), vobj_map, data);
-  frame.context() = GetUpdatedValue(frame.context(), vobj_map, data);
+  frame.receiver() =
+      GetUpdatedValueAndAddDeoptUse(frame.receiver(), vobj_map, data);
+  frame.context() =
+      GetUpdatedValueAndAddDeoptUse(frame.context(), vobj_map, data);
 }
 
 void UpdateBuiltinContinuationFrame(
     BuiltinContinuationDeoptFrame& frame,
     const std::unordered_map<ValueNode*, VirtualObject*>& vobj_map,
     EscapeAnalysisData& data) {
-  frame.context() = GetUpdatedValue(frame.context(), vobj_map, data);
+  frame.context() =
+      GetUpdatedValueAndAddDeoptUse(frame.context(), vobj_map, data);
 
   for (ValueNode*& value : frame.parameters()) {
-    value = GetUpdatedValue(value, vobj_map, data);
+    value = GetUpdatedValueAndAddDeoptUse(value, vobj_map, data);
   }
 }
 
@@ -691,6 +700,9 @@ class CandidateAnalyzer {
 
   ProcessResult Process(LoadTaggedField* node, const ProcessingState&) {
     // Shouldn't make its input escape.
+    ValueNode* resolved =
+        data_.ResolveLoadBase(node->ValueInput(), node->offset(), node);
+    data_.loaded_values.insert_or_assign(node, resolved);
     return ProcessResult::kContinue;
   }
 
@@ -889,11 +901,16 @@ class FieldValuesTracker : public CandidateAnalyzer {
       state = block->state();
     }
 
-    bool created_phi = false;
+    bool need_revisit = false;
     auto merge_field_values =
         [&](Key key,
             base::Vector<ValueNode* const> predecessors) -> ValueNode* {
       DCHECK_NOT_NULL(key.data().base);
+      if (data_.HasEscaped(key.data().base)) {
+        // No need to bother introducing phis since this allocation has escaped.
+        return nullptr;
+      }
+
       bool all_predecessors_equal = true;
       for (ValueNode* pred : predecessors) {
         if (pred == nullptr) {
@@ -914,14 +931,29 @@ class FieldValuesTracker : public CandidateAnalyzer {
         return predecessors[0];
       }
 
-#ifdef DEBUG
-      // All predecessors should have the same value_representation.
+      // Check representation mismatch
+      DCHECK_GT(predecessors.size(), 0);
       ValueRepresentation first_pred_repr =
           predecessors[0]->value_representation();
+      bool representation_mismatch = false;
       for (int i = 1; i < predecessor_count; i++) {
-        DCHECK_EQ(first_pred_repr, predecessors[i]->value_representation());
+        if (first_pred_repr != predecessors[i]->value_representation()) {
+          representation_mismatch = true;
+          break;
+        }
       }
-#endif
+
+      if (representation_mismatch) {
+        // This can happen due to type confusion on dead branches where we
+        // perform type-unsafe stores (e.g. storing a Float64 to a field that
+        // is tracked as Tagged on another path).
+        TRACE("Representation mismatch for key " << key.data().offset << " of "
+                                                 << PRINT_NODE(key.data().base)
+                                                 << " -> escaping base");
+        data_.MarkAsEscaped(key.data().base);
+        need_revisit = true;
+        return nullptr;
+      }
 
       DCHECK(state.has_value());
       // The "owner" field of Phis is just used for exception phis late in the
@@ -949,7 +981,7 @@ class FieldValuesTracker : public CandidateAnalyzer {
       }
       phi->change_representation(predecessors[0]->value_representation());
       TRACE(">> Created new phi: " << PRINT_NODE(phi));
-      created_phi = true;
+      need_revisit = true;
       RegisterNewPhi(phi, block, key);
 
       // We need to call `ProcessPhi` because an input of this phi could be an
@@ -962,7 +994,7 @@ class FieldValuesTracker : public CandidateAnalyzer {
     field_values().StartNewSnapshot(base::VectorOf(predecessors_snapshots),
                                     merge_field_values);
 
-    return created_phi;
+    return need_revisit;
   }
 
   BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
@@ -1021,6 +1053,14 @@ class FieldValuesTracker : public CandidateAnalyzer {
 
     int backedge_index = header->predecessor_count() - 1;
     for (auto& [phi, key] : *new_phis().at(header)) {
+      InlinedAllocation* alloc = key.data().base;
+      if (data_.HasEscaped(alloc)) {
+        // If {alloc} was marked as escaping while visiting the loop, there is
+        // no need to patch its backedge, in particular since calling
+        // `fields_values().Get(key)` could produce a garbage value.
+        continue;
+      }
+
       ValueNode* backedge_val = field_values().Get(key);
       DCHECK_NOT_NULL(backedge_val);
       TRACE(">> Updating loop phi backedge: "
@@ -1173,8 +1213,8 @@ class DeoptFrameUpdater {
 
   template <class NodeT>
   ProcessResult Process(NodeT* node, const ProcessingState& state) {
-    DCHECK_IMPLIES(node->properties().can_eager_deopt(),
-                   NodeT::kProperties.can_eager_deopt());
+    DCHECK_IMPLIES(node->properties().has_eager_deopt_info(),
+                   NodeT::kProperties.has_eager_deopt_info());
     DCHECK_IMPLIES(node->properties().can_lazy_deopt(),
                    NodeT::kProperties.can_lazy_deopt());
 
@@ -1183,7 +1223,7 @@ class DeoptFrameUpdater {
     // if they have elided object inputs that would warrant cloning them. We
     // should instead first inspect the DeoptInfo to see if it has any input
     // that needs to be updated, and only then clone it.
-    if constexpr (NodeT::kProperties.can_eager_deopt()) {
+    if constexpr (NodeT::kProperties.has_eager_deopt_info()) {
       TRACE("> Will UpdateEagerDeoptInfo");
       UpdateEagerDeoptInfo(node);
     }
@@ -1198,7 +1238,7 @@ class DeoptFrameUpdater {
 
   template <class NodeT>
   void UpdateEagerDeoptInfo(NodeT* node) {
-    static_assert(NodeT::kProperties.can_eager_deopt());
+    static_assert(NodeT::kProperties.has_eager_deopt_info());
     DeoptFrame* new_frame_state =
         DeepClone(node->eager_deopt_info()->top_frame(), zone());
     node->SetEagerDeoptInfo(zone(), new_frame_state,
@@ -1375,6 +1415,12 @@ class Elider {
       TRACE("> Inserting new phis");
       DCHECK(block->has_state());
       for (auto& [phi, key] : *data_.new_phis.at(block)) {
+        if (data_.HasEscaped(key.data().base)) {
+          // {new_phis} can contain phis for objects that were marked as
+          // escaping while revisiting a loop; we skip those.
+          continue;
+        }
+
         block->AddPhi(phi);
       }
     }
@@ -1528,9 +1574,9 @@ class Elider {
       DCHECK(keys_mappings().contains(addr));
       Key key = keys_mappings().at(addr);
       ValueNode* replacement = field_values().Get(key);
-      DCHECK_NOT_NULL(replacement);
 
-      if (replacement->value_representation() != node->value_representation()) {
+      if (replacement == nullptr || (replacement->value_representation() !=
+                                     node->value_representation())) {
         // We have to be in unreachable code. Replacing by a DeadValue node
         // instead to avoid mismatches in the graph.
         // Note that this may sound a  bit risky: the mismatch could be because

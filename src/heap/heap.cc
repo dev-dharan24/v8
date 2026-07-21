@@ -2260,6 +2260,10 @@ void Heap::PerformGarbageCollection(GarbageCollector collector,
   std::vector<Isolate*> paused_clients =
       PauseConcurrentThreadsInClients(collector);
 
+  if (v8_flags.empty_shared_heap) {
+    VerifyEmptySharedHeap();
+  }
+
   FreeLinearAllocationAreas();
 
   tracer()->StartInSafepoint(atomic_pause_start_time);
@@ -2360,6 +2364,16 @@ void Heap::PerformHeapVerification() {
     isolate()->global_safepoint()->IterateClientIsolates([](Isolate* client) {
       HeapVerifier::VerifyHeapIfEnabled(client->heap());
     });
+  }
+}
+
+void Heap::VerifyEmptySharedHeap() {
+  DCHECK(v8_flags.empty_shared_heap);
+  if (isolate()->has_shared_space()) {
+    CHECK_EQ(shared_allocation_space()->SizeOfObjects(), 0);
+    CHECK_EQ(shared_lo_allocation_space()->SizeOfObjects(), 0);
+    CHECK_EQ(shared_trusted_allocation_space()->SizeOfObjects(), 0);
+    CHECK_EQ(shared_trusted_lo_allocation_space()->SizeOfObjects(), 0);
   }
 }
 
@@ -3800,7 +3814,12 @@ namespace {
 thread_local Address pending_layout_change_object_address = kNullAddress;
 
 #ifdef V8_ENABLE_SANDBOX
-class ExternalPointerSlotInvalidator
+// Invalidates slots for external and CppHeap pointers. These are pointers in
+// tables that can get compacted/evacuated and thus have to maintain information
+// about whether a slot is valid. Note that it's fine to overwrite slots with
+// new valid handles. Invalidaton is only necessary when the object
+// representation changes.
+class ExternalPointerSlotInvalidator final
     : public HeapVisitor<ExternalPointerSlotInvalidator> {
  public:
   explicit ExternalPointerSlotInvalidator(Isolate* isolate)
@@ -3822,6 +3841,15 @@ class ExternalPointerSlotInvalidator
             slot.tag_range(), host.address());
     space->NotifyExternalPointerFieldInvalidated(slot.address(),
                                                  slot.tag_range());
+    num_invalidated_slots++;
+  }
+
+  void VisitCppHeapPointer(Tagged<HeapObject> host,
+                           CppHeapPointerSlot slot) override {
+    DCHECK_EQ(target_, host);
+    CppHeapPointerTable::Space* space =
+        isolate_->heap()->cpp_heap_pointer_space();
+    space->NotifyCppHeapPointerFieldInvalidated(slot.address());
     num_invalidated_slots++;
   }
 
@@ -3884,9 +3912,9 @@ void Heap::NotifyObjectLayoutChange(
     DCHECK(!page->is_trusted());
   }
 
-  // During external pointer table compaction, the external pointer table
-  // records addresses of fields that index into the external pointer table. As
-  // such, it needs to be informed when such a field is invalidated.
+  // During pointer table compaction, the external and cpp heap pointer tables
+  // record addresses of fields that index into the pointer tables. As
+  // such, they need to be informed when such a field is invalidated.
   if (invalidate_external_pointer_slots ==
       InvalidateExternalPointerSlots{true}) {
     // Currently, the only time this function receives
@@ -3898,7 +3926,7 @@ void Heap::NotifyObjectLayoutChange(
 #ifdef V8_ENABLE_SANDBOX
     if (V8_ENABLE_SANDBOX_BOOL) {
       ExternalPointerSlotInvalidator slot_invalidator(isolate());
-      int num_invalidated_slots = slot_invalidator.Visit(object);
+      const int num_invalidated_slots = slot_invalidator.Visit(object);
       USE(num_invalidated_slots);
       DCHECK_GT(num_invalidated_slots, 0);
     }

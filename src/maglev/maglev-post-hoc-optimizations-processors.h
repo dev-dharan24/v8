@@ -485,7 +485,7 @@ class AnyUseMarkingProcessor {
           node->input(0).node()->Cast<InlinedAllocation>();
       // Since we don't analyze if allocations will escape until a fixpoint,
       // this could drop an use of an allocation and turn it non-escaping.
-      if (alloc->HasBeenElided()) {
+      if (alloc->HasBeenAnalysed() && alloc->HasBeenElided()) {
         // Skip first input.
         for (int i = 1; i < node->input_count(); i++) {
           DropInputUses(node->input(i));
@@ -557,7 +557,7 @@ class DeadNodeSweepingProcessor {
     // it access the allocation offsets.
     int size = 0;
     for (auto alloc : node->allocation_list()) {
-      if (alloc->HasEscaped()) {
+      if (!alloc->HasBeenAnalysed() || alloc->HasEscaped()) {
         alloc->set_offset(size);
         size += alloc->size();
       }
@@ -572,7 +572,7 @@ class DeadNodeSweepingProcessor {
 
   ProcessResult Process(InlinedAllocation* node, const ProcessingState& state) {
     // Remove inlined allocation that became non-escaping.
-    if (!node->HasEscaped()) {
+    if (node->HasBeenAnalysed() && node->HasBeenElided()) {
       if (v8_flags.trace_maglev_escape_analysis) {
         std::cout << "* Removing allocation node " << PrintNodeLabel(node)
                   << std::endl;
@@ -703,7 +703,15 @@ class CommonSubexpressionEliminationProcessor {
   ProcessResult Process(NodeT* node, const ProcessingState& state) {
     if constexpr (ShouldCSE(Node::opcode_of<NodeT>) &&
                   IsFixedInputNode<NodeT>()) {
-      return TryCSE(node);
+      // A value node is CSE'd by overwriting it in place with an Identity to
+      // its equivalent. The Identity stores the equivalent in input slot 0, so
+      // a zero-input value cannot be eliminated here. Checks produce no value
+      // and are just removed, so they stay eligible regardless of input count.
+      // TODO(victorgomes): Support CSE of zero-input value nodes.
+      if constexpr (!std::is_base_of_v<ValueNode, NodeT> ||
+                    NodeT::kInputCount >= 1) {
+        return TryCSE(node);
+      }
     }
     return ProcessResult::kContinue;
   }

@@ -438,6 +438,7 @@
   'regress/regress-crbug-1041232': [SKIP],
   'regress/regress-499721612': [SKIP],
   'regress/wasm/regress-1010272': [SKIP],
+  'regress/wasm/regress-531302064': [SKIP],
   'wasm/atomics-stress': [SKIP],
   'wasm/atomics64-stress': [SKIP],
   'wasm/atomics-memory64': [SKIP],
@@ -694,6 +695,7 @@
   # DrumBrake interpreter's InterpreterHandle handling.
   'sandbox/regress-527689557-1': [SKIP],
   'sandbox/regress-527689557-2': [SKIP],
+  'sandbox/regress-535518222': [SKIP],
 }],  # not has_wasm_interpreter
 
 ['has_wasm_interpreter and variant == jitless', {
@@ -1055,6 +1057,7 @@
   'wasm/regress-526041421': [SKIP],
   'wasm/regress-529842414': [SKIP],
   'wasm/regress-531123009': [SKIP],
+  'wasm/regress-532625494': [SKIP],
   'wasm/simd-relaxed-lane-select': [SKIP],
   'wasm/speculative-inlining': [SKIP],
   'wasm/stringrefs-regressions': [SKIP],
@@ -2903,6 +2906,8 @@
   'es6/typedarray-of': [SKIP],
   'compiler/osr-block-scope': [SKIP],
   'regress/regress-425583995': [SKIP],
+  'regress/regress-490446682': [SKIP],
+  'regress/regress-506499280-extended': [SKIP],
 
   # Needs temporal:
   'regress/regress-463593768': [SKIP],

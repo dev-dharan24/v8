@@ -514,11 +514,9 @@ ReduceResult MaglevReducer<BaseT>::BuildStoreTrustedPointerField(
 template <typename BaseT>
 bool MaglevReducer<BaseT>::CanElideWriteBarrier(ValueNode* object,
                                                 ValueNode* value) {
-  // Ideally, all callers would handle the "value has an empty type" outside.
-  // But this requires some more wiring to work. TODO(marja): Enable this:
-  // DCHECK(!IsEmptyNodeType(GetType(value)));
+  DCHECK(!IsEmptyNodeType(GetType(value)));
   if (value->Is<RootConstant>() || value->Is<ConsStringMap>()) return true;
-  if (!IsEmptyNodeType(GetType(value)) && CheckType(value, NodeType::kSmi)) {
+  if (CheckType(value, NodeType::kSmi)) {
     return true;
   }
 
@@ -584,12 +582,16 @@ ReduceResult MaglevReducer<BaseT>::BuildStoreMap(ValueNode* object,
   NodeType object_type = StaticTypeForMap(map, broker());
   NodeInfo* node_info = GetOrCreateInfoFor(object);
   if (map.is_stable()) {
-    node_info->SetPossibleMaps(PossibleMaps{map}, false, object_type, broker(),
-                               known_node_aspects());
+    if (!node_info->SetPossibleMaps(PossibleMaps{map}, false, object_type,
+                                    broker(), known_node_aspects())) {
+      return EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
+    }
     broker()->dependencies()->DependOnStableMap(map);
   } else {
-    node_info->SetPossibleMaps(PossibleMaps{map}, true, object_type, broker(),
-                               known_node_aspects());
+    if (!node_info->SetPossibleMaps(PossibleMaps{map}, true, object_type,
+                                    broker(), known_node_aspects())) {
+      return EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
+    }
     known_node_aspects().MarkSideEffectsRequireInvalidation();
   }
   return ReduceResult::Done();
@@ -1029,10 +1031,12 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceArrayPrototypeAt(
                                     ? LoadType::kSmi
                                     : LoadType::kUnknown;
                 if (auto constant = TryGetInt32Constant(index)) {
-                  auto const_res = TryBuildLoadFixedArrayElementConstantIndex(
-                      elements, constant.value(), type);
-                  if (const_res.IsDone()) {
-                    element = const_res.value();
+                  std::optional<ValueNode*> maybe_element;
+                  GET_OPTVALUE_OR_ABORT(
+                      maybe_element, TryBuildLoadFixedArrayElementConstantIndex(
+                                         elements, constant.value(), type));
+                  if (maybe_element) {
+                    element = *maybe_element;
                   } else {
                     GET_VALUE_OR_ABORT(element,
                                        AddNewNode<LoadFixedArrayElement>(
@@ -1484,17 +1488,8 @@ ReduceResult MaglevReducer<BaseT>::GetTruncatedInt32ForToNumber(
   switch (representation) {
     case ValueRepresentation::kTagged: {
       NodeType old_type;
-      // TODO(dmercadier): make EnsureType return a 3-value enum, something like
-      // kAlreadyTargetType, kNeedsCheck, and kImpossible, and handle
-      // kImpossible by emitting an unconditional deopt, instead of having to
-      // check after EnsureType whether its input now has type kNone or not.
-      RecordType(value, allowed_input_type, &old_type);
-
-      // Check for the empty type first, so that we don't emit unsafe conversion
-      // nodes below.
-      if (IsEmptyNodeType(old_type) || IsEmptyNodeType(value)) {
-        return EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
-      }
+      RETURN_IF_ABORT(EnsureType(value, allowed_input_type,
+                                 DeoptimizeReason::kWrongValue, &old_type));
 
       if (NodeTypeIsSmi(old_type)) {
         // Smi untagging can be cached as an int32 alternative, not just a
@@ -1936,7 +1931,8 @@ void MaglevReducer<BaseT>::FlushNodesToBlock() {
 template <typename BaseT>
 bool MaglevReducer<BaseT>::CanInlineCall(
     const MaglevCompilationUnit* current_unit,
-    compiler::SharedFunctionInfoRef shared, float call_frequency) {
+    compiler::SharedFunctionInfoRef shared, float call_frequency,
+    base::Vector<ValueNode*> arguments, UseRepresentationSet use_repr_hints) {
   auto tracer_ = tracer();
   if (static_cast<int>(graph()->inlined_functions().size()) >=
       SourcePosition::MaxInliningId()) {
@@ -1957,7 +1953,10 @@ bool MaglevReducer<BaseT>::CanInlineCall(
   }
   compiler::BytecodeArrayRef bytecode = shared.GetBytecodeArray(broker());
   const CompilationFlags& flags = graph()->compilation_info()->flags();
-  if (call_frequency < flags.min_inlining_frequency) {
+  bool is_small =
+      IsSmallFunction(bytecode.length(), arguments, use_repr_hints, flags);
+
+  if (!is_small && call_frequency < flags.min_inlining_frequency) {
     TRACE_CANNOT_INLINE("call frequency ("
                         << call_frequency << ") < minimum threshold ("
                         << flags.min_inlining_frequency << ")");
@@ -2068,7 +2067,11 @@ ReduceResult MaglevReducer<BaseT>::BuildCheckMaps(
                                           GetCheckType(known_info->type())));
   }
 
-  merger.UpdateKnownNodeAspects(object, known_node_aspects());
+  if (!merger.UpdateKnownNodeAspects(object, known_node_aspects())) {
+    // If the type is empty, it means that the Check inserted above will deopt.
+    // From here on, the code is dead.
+    return BuildAbort(AbortReason::kUnreachable);
+  }
   return ReduceResult::Done();
 }
 
@@ -2616,14 +2619,32 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOfWithFeedback(
 }
 
 template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceFunctionPrototypeHasInstance(
+    compiler::JSFunctionRef target, CallArguments& args) {
+  // We can't reduce Function#hasInstance when there is no receiver function.
+  if (args.receiver_mode() == ConvertReceiverMode::kNullOrUndefined) {
+    return {};
+  }
+  if (args.count() != 1) {
+    return {};
+  }
+  compiler::OptionalJSObjectRef maybe_receiver_constant =
+      TryGetConstant<JSObject>(args.receiver());
+  if (!maybe_receiver_constant) {
+    return {};
+  }
+  if (!maybe_receiver_constant->map(broker()).is_callable()) {
+    return {};
+  }
+  return BuildOrdinaryHasInstance(GetConstant(target.context(broker())),
+                                  args[0], maybe_receiver_constant.value(),
+                                  nullptr);
+}
+
+template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::BuildCheckSmi(ValueNode* object) {
   if (object->StaticTypeIs(broker(), NodeType::kSmi)) return object;
-  // Check for the empty type first so that we catch the case where
-  // GetType(object) is already empty.
-  if (IsEmptyNodeType(IntersectType(GetType(object), NodeType::kSmi))) {
-    return EmitUnconditionalDeopt(DeoptimizeReason::kSmi);
-  }
-  if (EnsureType(object, NodeType::kSmi)) return object;
+  RETURN_IF_DONE(EnsureType(object, NodeType::kSmi, DeoptimizeReason::kSmi));
   // For non-tagged constants, we may be able to skip the runtime check: every
   // non-tagged arm of the switch below emits a value-range check, which is
   // exactly what `Smi::IsValid` proves. For tagged inputs the runtime check
@@ -2668,10 +2689,11 @@ ReduceResult MaglevReducer<BaseT>::BuildSmiUntag(ValueNode* node) {
   // This is called when converting inputs in AddNewNode. We might already have
   // an empty type for `node` here. Make sure we don't add unsafe conversion
   // nodes in that case by checking for the empty node type explicitly.
-  if (IsEmptyNodeType(node) || !NodeTypeCanBe(GetType(node), NodeType::kSmi)) {
+  EnsureTypeResult ensure_res =
+      known_node_aspects().EnsureType(broker(), node, NodeType::kSmi);
+  if (ensure_res == EnsureTypeResult::kContradiction) {
     return EmitUnconditionalDeopt(DeoptimizeReason::kNotASmi);
-  }
-  if (EnsureType(node, NodeType::kSmi)) {
+  } else if (ensure_res == EnsureTypeResult::kAlreadyHadType) {
     return AddNewNodeNoInputConversion<UnsafeSmiUntag>({node});
   } else {
     return AddNewNodeNoInputConversion<CheckedSmiUntag>({node});
@@ -2681,14 +2703,8 @@ ReduceResult MaglevReducer<BaseT>::BuildSmiUntag(ValueNode* node) {
 template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::BuildCheckString(ValueNode* object) {
   NodeType known_type;
-  // Check for the empty type first so that we catch the case where
-  // GetType(object) is already empty.
-  if (IsEmptyNodeType(IntersectType(GetType(object), NodeType::kString))) {
-    return EmitUnconditionalDeopt(DeoptimizeReason::kNotAString);
-  }
-  if (EnsureType(object, NodeType::kString, &known_type)) {
-    return ReduceResult::Done();
-  }
+  RETURN_IF_DONE(EnsureType(object, NodeType::kString,
+                            DeoptimizeReason::kNotAString, &known_type));
   return AddNewNode<CheckString>({object}, GetCheckType(known_type));
 }
 
@@ -2725,16 +2741,11 @@ template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::TryBuildCheckInt32Condition(
     ValueNode* lhs, ValueNode* rhs, AssertCondition condition,
     DeoptimizeReason reason) {
-  auto lhs_const = TryGetInt32Constant(lhs);
-  if (lhs_const) {
-    auto rhs_const = TryGetInt32Constant(rhs);
-    if (rhs_const) {
-      if (detail::CheckConditionIn32(lhs_const.value(), rhs_const.value(),
-                                     condition)) {
-        return ReduceResult::Done();
-      }
-      return EmitUnconditionalDeopt(reason);
+  if (auto result = TryFoldInt32Condition(condition, lhs, rhs)) {
+    if (result.value()) {
+      return ReduceResult::Done();
     }
+    return EmitUnconditionalDeopt(reason);
   }
   return AddNewNode<CheckInt32Condition>({lhs, rhs}, condition, reason);
 }
@@ -2757,7 +2768,12 @@ ReduceResult MaglevReducer<BaseT>::BuildNumberOrOddballToFloat64OrHoleyFloat64(
   NodeType old_type;
   TaggedToFloat64ConversionType conversion_type =
       GetTaggedToFloat64ConversionType(allowed_input_type);
-  if (EnsureType(node, allowed_input_type, &old_type)) {
+  EnsureTypeResult ensure_res = known_node_aspects().EnsureType(
+      broker(), node, allowed_input_type, &old_type);
+  if (ensure_res == EnsureTypeResult::kContradiction) {
+    return EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
+  }
+  if (ensure_res == EnsureTypeResult::kAlreadyHadType) {
     if (old_type == NodeType::kSmi) {
       ValueNode* untagged_smi;
       GET_VALUE_OR_ABORT(untagged_smi, BuildSmiUntag(node));
@@ -3205,7 +3221,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldInt32BinaryOperation(
         // TODO(victorgomes): This should actually be NodeType::kInt32, but we
         // don't have it. The idea here is that the value is either 0 or 1, so
         // we can cast Uint32 to Int32 without a check.
-        RecordType(sign_bit, NodeType::kSmi);
+        RETURN_IF_ABORT(RecordType(sign_bit, NodeType::kSmi));
         ValueNode* result;
         GET_VALUE_OR_ABORT(result,
                            AddNewNode<Int32Add>({shifted_quot, sign_bit}));
@@ -3326,6 +3342,34 @@ bool MaglevReducer<BaseT>::TryFoldInt32CompareOperation(Operation op,
     default:
       UNREACHABLE();
   }
+}
+
+template <typename BaseT>
+std::optional<bool> MaglevReducer<BaseT>::TryFoldInt32Condition(
+    AssertCondition condition, ValueNode* left, ValueNode* right) {
+  if (left == right) {
+    switch (condition) {
+      case AssertCondition::kEqual:
+      case AssertCondition::kLessThanEqual:
+      case AssertCondition::kGreaterThanEqual:
+      case AssertCondition::kUnsignedLessThanEqual:
+      case AssertCondition::kUnsignedGreaterThanEqual:
+        return true;
+      case AssertCondition::kNotEqual:
+      case AssertCondition::kLessThan:
+      case AssertCondition::kGreaterThan:
+      case AssertCondition::kUnsignedLessThan:
+      case AssertCondition::kUnsignedGreaterThan:
+        return false;
+    }
+  }
+  const auto lhs_const = TryGetInt32Constant(left);
+  const auto rhs_const = TryGetInt32Constant(right);
+  if (lhs_const.has_value() && rhs_const.has_value()) {
+    return detail::CheckConditionIn32(lhs_const.value(), rhs_const.value(),
+                                      condition);
+  }
+  return {};
 }
 
 template <typename BaseT>
@@ -4323,14 +4367,8 @@ ReduceResult MaglevReducer<BaseT>::BuildCheckInstanceType(ValueNode* object,
                                                           InstanceType first,
                                                           InstanceType last) {
   NodeType known_type;
-  // Check for the empty type first so that we catch the case where
-  // GetType(object) is already empty or disjoint.
-  if (IsEmptyNodeType(IntersectType(GetType(object), target_type))) {
-    return EmitUnconditionalDeopt(DeoptimizeReason::kWrongInstanceType);
-  }
-  if (EnsureType(object, target_type, &known_type)) {
-    return ReduceResult::Done();
-  }
+  RETURN_IF_DONE(EnsureType(object, target_type,
+                            DeoptimizeReason::kWrongInstanceType, &known_type));
   return AddNewNode<CheckInstanceType>({object}, GetCheckType(known_type),
                                        first, last);
 }
@@ -5642,13 +5680,15 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceRegExpPrototypeTest(
   ValueNode* search_string = args[0];
   RETURN_IF_ABORT(BuildCheckString(search_string));
 
-  // lastIndex is a plain Object field: it can hold any value, so the untag
-  // below must be the checked one.
   ValueNode* last_index;
   GET_VALUE_OR_ABORT(
       last_index, BuildLoadTaggedField(receiver, JSRegExp::kLastIndexOffset));
+  // RegExpPrototypeTestFast requires lastIndex to be a positive Smi.
+  RETURN_IF_ABORT(BuildCheckSmi(last_index));
+  // Virtual object tracking might return an Int32Constant, which cannot be
+  // untagged.
   ValueNode* last_index_int32;
-  GET_VALUE_OR_ABORT(last_index_int32, BuildSmiUntag(last_index));
+  GET_VALUE_OR_ABORT(last_index_int32, GetInt32(last_index));
   RETURN_IF_ABORT(TryBuildCheckInt32Condition(
       last_index_int32, GetInt32Constant(0), AssertCondition::kGreaterThanEqual,
       DeoptimizeReason::kNotASmi));
@@ -5832,6 +5872,35 @@ ReduceResult SubgraphBase<DerivedT, BaseT>::TrimPredecessorsAndBind(
   if (predecessors_so_far == 0) return ReduceResult::DoneWithAbort();
   static_cast<DerivedT*>(this)->Bind(label);
   return ReduceResult::Done();
+}
+
+inline bool IsSmallFunction(int bytecode_length,
+                            base::Vector<ValueNode*> arguments,
+                            UseRepresentationSet use_repr_hints,
+                            const CompilationFlags& flags) {
+  // TruncatedInt32 uses do not necessarily mean that the input is a
+  // HeapNumber, but when emitted operation that truncate their inputs to
+  // Int32, Maglev doesn't distinguish between Smis and HeapNumbers.
+  // TODO(dmercadier): distinguish between Smis and HeapNumbers in the graph
+  // builder for operations that truncate their inputs, and then in turn, make
+  // sure that we're not setting {has_heapnumber_input_output} to true for a
+  // function that has so far only returned Smis.
+  constexpr UseRepresentationSet kHeapNumRepresentations{
+      UseRepresentation::kFloat64, UseRepresentation::kHoleyFloat64,
+      UseRepresentation::kTruncatedInt32};
+
+  const bool has_heapnumber_input_output =
+      use_repr_hints.contains_any(kHeapNumRepresentations) ||
+      std::ranges::any_of(arguments, [](ValueNode* input) {
+        return input->UnwrapIdentities()->is_float64_or_holey_float64();
+      });
+
+  const int limit =
+      has_heapnumber_input_output
+          ? flags.max_inlined_bytecode_size_small_with_heapnum_in_out
+          : flags.max_inlined_bytecode_size_small;
+
+  return bytecode_length <= limit;
 }
 
 }  // namespace maglev

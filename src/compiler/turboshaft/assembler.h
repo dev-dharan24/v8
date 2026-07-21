@@ -1574,26 +1574,9 @@ class AssemblerOpInterface : public Next {
   // Methods to be used by the reducers to reducer operations with the whole
   // reducer stack.
 
-  V<Float64OrWord32> TypeHint(V<Float64OrWord32> input, TypeHintOp::Type type) {
-    return ReduceIfReachableTypeHint(input, type);
-  }
-
   void PrepareForLoop(V<EagerFrameState> frame_state,
                       FeedbackSource feedback = FeedbackSource()) {
     ReduceIfReachablePrepareForLoop(frame_state, feedback);
-  }
-
-  V<Word32> TypeHintUint32(V<Word32> input) {
-    return V<Word32>::Cast(TypeHint(input, TypeHintOp::Type::kUint32));
-  }
-  V<Word32> TypeHintInt32(V<Word32> input) {
-    return V<Word32>::Cast(TypeHint(input, TypeHintOp::Type::kInt32));
-  }
-  V<Float64> TypeHintFloat64(V<Float64> input) {
-    return V<Float64>::Cast(TypeHint(input, TypeHintOp::Type::kFloat64));
-  }
-  V<Float64> TypeHintHoleyFloat64(V<Float64> input) {
-    return V<Float64>::Cast(TypeHint(input, TypeHintOp::Type::kHoleyFloat64));
   }
 
   V<Object> GenericBinop(V<Object> left, V<Object> right,
@@ -3497,13 +3480,10 @@ class AssemblerOpInterface : public Next {
   // provided; the return value is the potentially-updated value.
   // Returns a V<Tuple<WordPtr, WordPtr>> when *both* {memory_start} and
   // {memory_size} are provided.
-  V<AnyOrNone> WasmStackCheck(
+  V<None> WasmStackCheck(
       WasmStackCheckOp::Kind kind,
-      OptionalV<WasmTrustedInstanceData> trusted_instance_data = {},
-      OptionalV<WordPtr> memory_start = {},
-      OptionalV<WordPtr> memory_size = {}) {
-    return ReduceIfReachableWasmStackCheck(trusted_instance_data, memory_start,
-                                           memory_size, kind);
+      OptionalV<WasmTrustedInstanceData> trusted_instance_data = {}) {
+    return ReduceIfReachableWasmStackCheck(trusted_instance_data, kind);
   }
 
   void MemoryCopy(V<WordPtr> dst_base, V<WordPtr> src_base,

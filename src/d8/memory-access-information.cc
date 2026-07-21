@@ -16,8 +16,48 @@
 
 namespace v8 {
 
+namespace {
+int width_from_suffix(char c) {
+  switch (c) {
+    case 'b':
+      return 1;
+    case 'w':
+      return 2;
+    case 'l':
+    case 'd':
+      return 4;
+    case 'q':
+      return 8;
+    default:
+      return 8;
+  }
+}
+}  // namespace
+
 MemoryAccessInformation ParseMemoryAccessInformationFromInstruction(
     const char* insn_pos, struct user_regs_struct& regs) {
+  if (memcmp(insn_pos, "rep movs", 8) == 0) {
+    int width = width_from_suffix(insn_pos[8]);
+    return {.kind = MemoryAccessInformation::kRepMovs,
+            .result_reg = nullptr,
+            .xmm_reg_index = -1,
+            .k_reg_index = -1,
+            .access_width = width,
+            .dest_width = width,
+            .extension = MemoryAccessInformation::kNoExtend};
+  } else if (memcmp(insn_pos, "rep ", 4) == 0 ||
+             memcmp(insn_pos, "repne ", 6) == 0) {
+    // Treat other repeating string instructions as a write, which is safely
+    // ignored.
+    return {.kind = MemoryAccessInformation::kWrite,
+            .result_reg = nullptr,
+            .xmm_reg_index = -1,
+            .k_reg_index = -1,
+            .access_width = 8,
+            .dest_width = 8,
+            .extension = MemoryAccessInformation::kNoExtend};
+  }
+
   const char* space_pos = strchr(insn_pos, ' ');
   CHECK_NOT_NULL(space_pos);
   size_t mnem_len = space_pos - insn_pos;
@@ -49,21 +89,6 @@ MemoryAccessInformation ParseMemoryAccessInformationFromInstruction(
     dest_suffix = suffix;
   }
 
-  auto width_from_suffix = [](char c) -> int {
-    switch (c) {
-      case 'b':
-        return 1;
-      case 'w':
-        return 2;
-      case 'l':
-      case 'd':
-        return 4;
-      case 'q':
-        return 8;
-      default:
-        return 8;
-    }
-  };
   access_width = width_from_suffix(suffix);
   int dest_width = width_from_suffix(dest_suffix);
 
@@ -189,6 +214,18 @@ MemoryAccessInformation ParseMemoryAccessInformationFromInstruction(
     return {.kind = MemoryAccessInformation::kRead,
             .result_reg = matched_reg,
             .xmm_reg_index = -1,
+            .access_width = access_width,
+            .dest_width = dest_width,
+            .extension = extension};
+  }
+
+  if (op[0] == 'k' && op[1] >= '0' && op[1] <= '7' &&
+      (op[2] == ',' || op[2] == ' ' || op[2] == '\0')) {
+    int reg_num = op[1] - '0';
+    return {.kind = MemoryAccessInformation::kRead,
+            .result_reg = nullptr,
+            .xmm_reg_index = -1,
+            .k_reg_index = reg_num,
             .access_width = access_width,
             .dest_width = dest_width,
             .extension = extension};

@@ -354,6 +354,7 @@ class ExceptionHandlerInfo;
   V(TruncateCheckedNumberAsSafeIntToInt32)                            \
   V(TruncateUnsafeNumberAsSafeIntToInt32)                             \
   V(TruncateFloat64AsSafeIntToInt32)                                  \
+  V(TruncateHoleyFloat64AsSafeIntToInt32)                             \
   V(TruncateCheckedNumberOrOddballToInt32)                            \
   V(TruncateUnsafeNumberOrOddballToInt32)                             \
   V(TruncateFloat64ToInt32)                                           \
@@ -735,6 +736,7 @@ constexpr bool IsTruncatingToInt32(Opcode opcode) {
     case Opcode::kTruncateCheckedNumberAsSafeIntToInt32:
     case Opcode::kTruncateUnsafeNumberAsSafeIntToInt32:
     case Opcode::kTruncateFloat64AsSafeIntToInt32:
+    case Opcode::kTruncateHoleyFloat64AsSafeIntToInt32:
     case Opcode::kTruncateCheckedNumberOrOddballToInt32:
     case Opcode::kTruncateUnsafeNumberOrOddballToInt32:
       return true;
@@ -4737,6 +4739,21 @@ class TruncateFloat64AsSafeIntToInt32
   void PrintParams(std::ostream&) const {}
 };
 
+class TruncateHoleyFloat64AsSafeIntToInt32
+    : public FixedInputValueNodeT<1, TruncateHoleyFloat64AsSafeIntToInt32> {
+ public:
+  explicit TruncateHoleyFloat64AsSafeIntToInt32(uint64_t bitfield)
+      : Base(bitfield) {}
+
+  static constexpr OpProperties kProperties =
+      OpProperties::EagerDeopt() | OpProperties::Int32();
+  DECLARE_UNOP(HoleyFloat64)
+
+  void SetValueLocationConstraints() { UNREACHABLE(); }
+  void GenerateCode(MaglevAssembler*, const ProcessingState&) { UNREACHABLE(); }
+  void PrintParams(std::ostream&) const {}
+};
+
 class TruncateCheckedNumberOrOddballToInt32
     : public FixedInputValueNodeT<1, TruncateCheckedNumberOrOddballToInt32> {
  public:
@@ -5832,6 +5849,27 @@ struct VirtualHeapObjectShape {
 #undef FIELD_LIST
 };
 
+class VirtualObject;
+// To avoid infinite recursion when iterating recursive VirtualObjects, we use
+// VirtualObjectAncestors to keep track of already-visited VirtualObjects and to
+// avoid revisiting them. It's a simple ad-hoc linked list of VirtualObjects.
+// The reasoning behind using a linked-list (rather than say, a
+// absl::flat_hash_set) is that:
+//    1. The vast majority of VirtualObjects will not be deeply nested, so the
+//       linear search of ancestors should be very cheap.
+//    2. It's stack-allocated, meaning cheap to create and no need for any heap
+//       allocation.
+struct VirtualObjectAncestors {
+  const VirtualObject* object;
+  const VirtualObjectAncestors* parent;
+  bool Contains(const VirtualObject* obj) const {
+    for (const VirtualObjectAncestors* cur = this; cur; cur = cur->parent) {
+      if (cur->object == obj) return true;
+    }
+    return false;
+  }
+};
+
 // VirtualObject is a ValueNode only for convenience, it should never be added
 // to the Maglev graph.
 class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
@@ -5976,11 +6014,13 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
   template <typename Function>
   inline void ForEachNestedRuntimeInput(
       VirtualObjectList virtual_objects, Function&& f,
-      ForEachSlotIterationMode mode = ForEachSlotIterationMode::kDefault);
+      ForEachSlotIterationMode mode = ForEachSlotIterationMode::kDefault,
+      const VirtualObjectAncestors* ancestors = nullptr);
   template <typename Function>
   inline void ForEachNestedRuntimeInput(
       VirtualObjectList virtual_objects, Function&& f,
-      ForEachSlotIterationMode mode = ForEachSlotIterationMode::kDefault) const;
+      ForEachSlotIterationMode mode = ForEachSlotIterationMode::kDefault,
+      const VirtualObjectAncestors* ancestors = nullptr) const;
 
   template <typename Function>
   inline std::optional<VirtualObject*> Merge(const VirtualObject* other,
@@ -6516,7 +6556,18 @@ class InlinedAllocation : public FixedInputValueNodeT<1, InlinedAllocation> {
     non_escaping_use_count_ = std::max(non_escaping_use_count_ - n, 0);
   }
   void AddNonEscapingUses(int n = 1) {
-    DCHECK(!HasBeenAnalysed());
+    // In Maglev, AddNonEscapingUse is always called before the PostHocPhase,
+    // which is where InlinedAllocations are marked as HasBeenAnalyzed.
+    // In Turbolev, however, InlinedAllocations are marked as HasBeenAnalyzed
+    // during the TurbolevEscapeAnalysis phase, which isn't the last phase of
+    // the pipeline, and subsequent phases can end up calling AddNonEscapingUses
+    // on nodes that have been analyzed. This is safe as long it's only called
+    // on objects that are marked as HasEscaped: for objects marked as
+    // HasBeenElided, adding a non-escaping use basically means that we've added
+    // them as input to a DeoptFrame, but this is only allowed if the
+    // VirtualObjects of this DeoptFrame are in the right state, which is hard
+    // to guarantee.
+    DCHECK(!HasBeenAnalysed() || HasEscaped());
     non_escaping_use_count_ += n;
   }
   bool HasEscapingUses() const {
@@ -6582,7 +6633,8 @@ void ValueNode::remove_use() {
 template <typename Function>
 inline void VirtualObject::ForEachNestedRuntimeInput(
     VirtualObjectList virtual_objects, Function&& f,
-    ForEachSlotIterationMode mode) const {
+    ForEachSlotIterationMode mode,
+    const VirtualObjectAncestors* ancestors) const {
   ForEachSlot(
       [&](ValueNode* value, const vobj::Field& desc) -> bool {
         value = value->UnwrapIdentities();
@@ -6606,8 +6658,12 @@ inline void VirtualObject::ForEachNestedRuntimeInput(
             // Check if it has escaped.
             if (inner_vobject &&
                 (!alloc->HasBeenAnalysed() || alloc->HasBeenElided())) {
-              inner_vobject->ForEachNestedRuntimeInput(virtual_objects, f,
-                                                       mode);
+              if (ancestors && ancestors->Contains(inner_vobject)) {
+                break;
+              }
+              VirtualObjectAncestors next_ancestors{inner_vobject, ancestors};
+              inner_vobject->ForEachNestedRuntimeInput(virtual_objects, f, mode,
+                                                       &next_ancestors);
             } else {
               f(value);
             }
@@ -6625,7 +6681,7 @@ inline void VirtualObject::ForEachNestedRuntimeInput(
 template <typename Function>
 inline void VirtualObject::ForEachNestedRuntimeInput(
     VirtualObjectList virtual_objects, Function&& f,
-    ForEachSlotIterationMode mode) {
+    ForEachSlotIterationMode mode, const VirtualObjectAncestors* ancestors) {
   ForEachSlot(
       [&](ValueNode*& value, const vobj::Field& desc) -> bool {
         // Subtle: this modifies the location of the caller's `value` in-place.
@@ -6653,8 +6709,12 @@ inline void VirtualObject::ForEachNestedRuntimeInput(
             // Check if it has escaped.
             if (inner_vobject &&
                 (!alloc->HasBeenAnalysed() || alloc->HasBeenElided())) {
-              inner_vobject->ForEachNestedRuntimeInput(virtual_objects, f,
-                                                       mode);
+              if (ancestors && ancestors->Contains(inner_vobject)) {
+                break;
+              }
+              VirtualObjectAncestors next_ancestors{inner_vobject, ancestors};
+              inner_vobject->ForEachNestedRuntimeInput(virtual_objects, f, mode,
+                                                       &next_ancestors);
             } else {
               f(value);
             }

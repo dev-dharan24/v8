@@ -344,15 +344,17 @@ ConcurrentMarking::ConcurrentMarking(Heap* heap, WeakObjects* weak_objects)
   // Concurrent marking requires atomic object field writes.
   CHECK(!v8_flags.concurrent_marking);
 #endif
-  int max_tasks;
+  uint32_t max_tasks;
   if (v8_flags.concurrent_marking_max_worker_num == 0) {
-    max_tasks = V8::GetCurrentPlatform()->NumberOfWorkerThreads();
+    int num_threads = V8::GetCurrentPlatform()->NumberOfWorkerThreads();
+    DCHECK_GE(num_threads, 0);
+    max_tasks = static_cast<uint32_t>(num_threads);
   } else {
     max_tasks = v8_flags.concurrent_marking_max_worker_num;
   }
 
   task_state_.reserve(max_tasks + 1);
-  for (int i = 0; i <= max_tasks; ++i) {
+  for (uint32_t i = 0; i <= max_tasks; ++i) {
     task_state_.emplace_back(std::make_unique<TaskState>());
   }
 }
@@ -422,6 +424,9 @@ void ConcurrentMarking::RunMajor(JobDelegate* delegate,
           done = true;
           break;
         }
+        SYNCHRONIZATION_POINT_TEST_ONLY(
+            is_joining_thread ? "ConcurrentMarkerMajorPerItemMainThread"
+                              : "ConcurrentMarkerMajorPerItemBgThread");
         DCHECK(!HeapLayout::InReadOnlySpace(object));
         DCHECK_EQ(HeapUtils::GetOwnerHeap(object), heap_);
         objects_processed++;
@@ -521,6 +526,7 @@ V8_INLINE size_t ConcurrentMarking::RunMinorImpl(JobDelegate* delegate,
                                                  TaskState* task_state) {
   static constexpr size_t kBytesUntilInterruptCheck = 64 * KB;
   static constexpr int kObjectsUntilInterruptCheck = 1000;
+  [[maybe_unused]] const bool is_joining_thread = delegate->IsJoiningThread();
   size_t marked_bytes = 0;
   size_t current_marked_bytes = 0;
   int objects_processed = 0;
@@ -544,6 +550,9 @@ V8_INLINE size_t ConcurrentMarking::RunMinorImpl(JobDelegate* delegate,
                    GCTracer::Scope::MINOR_MS_BACKGROUND_MARKING_CLOSURE,
                    ThreadKind::kBackground);
     while (marking_worklists_local.Pop(&heap_object)) {
+      SYNCHRONIZATION_POINT_TEST_ONLY(
+          is_joining_thread ? "ConcurrentMarkerMinorPerItemMainThread"
+                            : "ConcurrentMarkerMinorPerItemBgThread");
       if (IsYoungObjectInLab(new_space_allocator, heap_allocator,
                              heap_object)) {
         visitor.marking_worklists_local().PushOnHold(heap_object);
