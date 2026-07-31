@@ -1575,6 +1575,11 @@ TNode<JSArray> StringBuiltinsAssembler::StringToArray(
 
     TNode<FixedArray> elements =
         CAST(AllocateFixedArray(PACKED_ELEMENTS, length));
+    // The allocation above may have internalized a shared subject, forwarding
+    // it to a ThinString or freeing an external resource, which would leave
+    // the pointer below pointing at unrelated heap data.
+    to_direct.BailIfTransitioned(&fill_thehole_and_call_runtime);
+
     // Don't allocate anything while {string_data} is live!
     TNode<RawPtrT> string_data =
         to_direct.PointerToData(&fill_thehole_and_call_runtime);
@@ -1973,24 +1978,25 @@ void StringBuiltinsAssembler::CopyStringCharacters(
 // |character_count| > 0.
 template <typename T>
 TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
-    TNode<T> from, TNode<BoolT> from_is_one_byte, TNode<IntPtrT> from_index,
-    TNode<IntPtrT> character_count, Label* if_bailout) {
+    TNode<T> from, TNode<String> tagged_source, TNode<BoolT> from_is_one_byte,
+    TNode<IntPtrT> from_index, TNode<IntPtrT> character_count,
+    Label* if_bailout) {
   CSA_DCHECK(this, IntPtrGreaterThan(character_count, IntPtrConstant(0)));
 
   Label end(this), one_byte_sequential(this), two_byte_sequential(this);
   TVARIABLE(String, var_result);
 
-  // The AllocateNonEmptySeq*String calls below may trigger a GC, during which
-  // {from} (a sequential string on entry) can be internalized in place and
-  // forwarded to a ThinString. Reading it as a sequential string afterwards
-  // would interpret the ThinString's fields as character data, so re-check
-  // after each allocation and bail to the runtime if the map changed. In the
-  // external case {from} is a raw pointer and cannot transition.
-  auto bail_if_not_sequential = [&]() {
+  // Allocations may trigger a GC that internalizes {tagged_source}, which
+  // can forward-to-ThinString or free the external resource. Re-check and
+  // bail to the runtime if the source transitioned.
+  auto bail_if_source_transitioned = [&]() {
     if constexpr (std::is_same_v<T, String>) {
-      GotoIfNot(IsSequentialString(from), if_bailout);
+      GotoIfNot(IsSequentialString(tagged_source), if_bailout);
+    } else {
+      GotoIfNot(IsExternalStringMap(LoadMap(tagged_source)), if_bailout);
     }
   };
+  static_assert(std::is_same_v<T, String> || std::is_same_v<T, RawPtrT>);
 
   Branch(from_is_one_byte, &one_byte_sequential, &two_byte_sequential);
 
@@ -1999,7 +2005,7 @@ TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
   {
     TNode<String> result = AllocateNonEmptySeqOneByteString(
         Unsigned(TruncateIntPtrToInt32(character_count)));
-    bail_if_not_sequential();
+    bail_if_source_transitioned();
 
     CopyStringCharacters<T>(from, result, from_index, IntPtrConstant(0),
                             character_count, String::ONE_BYTE_ENCODING,
@@ -2075,7 +2081,7 @@ TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
     {
       TNode<String> result = AllocateNonEmptySeqOneByteString(
           Unsigned(TruncateIntPtrToInt32(character_count)));
-      bail_if_not_sequential();
+      bail_if_source_transitioned();
 
       CopyStringCharacters<T>(from, result, from_index, IntPtrConstant(0),
                               character_count, String::TWO_BYTE_ENCODING,
@@ -2088,7 +2094,7 @@ TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
     {
       TNode<String> result = AllocateNonEmptySeqTwoByteString(
           Unsigned(TruncateIntPtrToInt32(character_count)));
-      bail_if_not_sequential();
+      bail_if_source_transitioned();
 
       CopyStringCharacters<T>(from, result, from_index, IntPtrConstant(0),
                               character_count, String::TWO_BYTE_ENCODING,
@@ -2172,8 +2178,9 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
     // encoding at this point.
     GotoIf(to_direct.is_external(), &external_string);
 
-    var_result = AllocAndCopyStringCharacters(direct_string, is_one_byte,
-                                              offset, substr_length, &runtime);
+    var_result =
+        AllocAndCopyStringCharacters(direct_string, direct_string, is_one_byte,
+                                     offset, substr_length, &runtime);
     Goto(&end);
   }
 
@@ -2183,8 +2190,9 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
     const TNode<RawPtrT> fake_sequential_string =
         to_direct.PointerToString(&runtime);
 
-    var_result = AllocAndCopyStringCharacters(
-        fake_sequential_string, is_one_byte, offset, substr_length, &runtime);
+    var_result = AllocAndCopyStringCharacters(fake_sequential_string,
+                                              direct_string, is_one_byte,
+                                              offset, substr_length, &runtime);
 
     Goto(&end);
   }

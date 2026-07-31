@@ -685,6 +685,9 @@ DEFINE_NEG_IMPLICATION(maglev_as_top_tier, turbolev)
 
 DEFINE_BOOL(maglev_inlining, true,
             "enable inlining in the maglev optimizing compiler")
+DEFINE_BOOL(
+    maglev_disable_builtin_reducers, false,
+    "disable eager builtin reducers in the maglev graph builder (for testing)")
 DEFINE_BOOL(maglev_loop_peeling, true,
             "enable loop peeling in the maglev optimizing compiler")
 DEFINE_BOOL(maglev_optimistic_peeled_loops, true,
@@ -1058,8 +1061,6 @@ DEFINE_NEG_IMPLICATION(disable_optimizing_compilers,
 DEFINE_IMPLICATION(disable_optimizing_compilers, liftoff)
 DEFINE_NEG_IMPLICATION(disable_optimizing_compilers, wasm_tier_up)
 DEFINE_NEG_IMPLICATION(disable_optimizing_compilers, wasm_dynamic_tiering)
-// Disable translation of asm.js to Wasm.
-DEFINE_NEG_IMPLICATION(disable_optimizing_compilers, validate_asm)
 #endif  // V8_ENABLE_WEBASSEMBLY
 // Field type tracking is only used by TurboFan, so can be disabled.
 DEFINE_NEG_IMPLICATION(disable_optimizing_compilers, track_field_types)
@@ -1613,6 +1614,8 @@ DEFINE_INT(max_optimized_bytecode_size, 60 * KB,
            "maximum bytecode size to "
            "be considered for turbofan optimization; too high values may cause "
            "the compiler to hit (release) assertions")
+DEFINE_INT(max_maglev_optimized_bytecode_size, 512 * KB,
+           "maximum bytecode size to be considered for maglev optimization")
 DEFINE_FLOAT(min_inlining_frequency, 0.15, "minimum frequency for inlining")
 DEFINE_WEAK_VALUE_IMPLICATION(maglev, min_inlining_frequency, 0.05)
 DEFINE_BOOL(stress_inline, false,
@@ -2055,6 +2058,8 @@ DEFINE_BOOL(stress_wasm_stack_switching, false,
             "with a regular (non-JSPI) export")
 DEFINE_INT(wasm_stack_switching_stack_size, V8_DEFAULT_STACK_SIZE_KB,
            "default size of stacks for wasm stack-switching (in kB)")
+DEFINE_INT(wasm_stack_pool_capacity_mb, 500,
+           "default capacity for the wasm stack pool in MB, -1 for unlimited")
 // 1 will be rounded up to the smallest possible initial stack size, which
 // depends on the stack limit margin and the platform's page size.
 DEFINE_VALUE_IMPLICATION(wasm_growable_stacks,
@@ -2101,28 +2106,11 @@ DEFINE_DEVELOPER_FLAG(
 DEFINE_ALIAS_BOOL_WITH_COMMENT(experimental_wasm_pgo_from_file,
                                wasm_pgo_from_file, TEMPORARY_WASM_ALIAS_COMMENT)
 
-DEFINE_BOOL(validate_asm, false,
-            "validate asm.js modules and translate them to Wasm (deprecated)")
-// Directly interpret asm.js code as regular JavaScript code.
-// asm.js validation is disabled since it triggers wasm code generation.
-DEFINE_NEG_IMPLICATION(jitless, validate_asm)
-
 #if V8_ENABLE_DRUMBRAKE
 // Wasm is put into interpreter-only mode. We repeat flag implications down
 // here to ensure they're applied correctly by setting the --jitless flag.
-DEFINE_NEG_IMPLICATION(jitless, asm_wasm_lazy_compilation)
 DEFINE_NEG_IMPLICATION(jitless, wasm_lazy_compilation)
 #endif  // V8_ENABLE_DRUMBRAKE
-
-DEFINE_DEVELOPER_FLAG(
-    suppress_asm_messages,
-    "don't emit asm.js related messages (for golden file testing)")
-DEFINE_DEVELOPER_FLAG(trace_asm_time, "print asm.js timing info to the console")
-DEFINE_DEVELOPER_FLAG(trace_asm_scanner,
-                      "print tokens encountered by asm.js scanner")
-DEFINE_DEVELOPER_FLAG(trace_asm_parser,
-                      "verbose logging of asm.js parse failures")
-DEFINE_BOOL(stress_validate_asm, false, "try to validate everything as asm.js")
 
 DEFINE_DEBUG_BOOL(dump_wasm_module, false, "dump wasm module bytes")
 DEFINE_STRING(dump_wasm_module_path, nullptr,
@@ -2278,9 +2266,6 @@ DEFINE_DEVELOPER_FLAG(print_wasm_code, "print WebAssembly code")
 DEFINE_INT(print_wasm_code_function_index, -1,
            "print WebAssembly code for function at index")
 DEFINE_DEVELOPER_FLAG(print_wasm_stub_code, "print WebAssembly stub code")
-DEFINE_BOOL(asm_wasm_lazy_compilation, true,
-            "enable lazy compilation for asm.js translated to wasm (see "
-            "--validate-asm)")
 DEFINE_BOOL(wasm_lazy_compilation, true,
             "enable lazy compilation for all wasm modules")
 DEFINE_DEBUG_BOOL(trace_wasm_lazy_compilation, false,
@@ -2400,13 +2385,7 @@ DEFINE_BOOL(drumbrake_register_optimization, true,
 DEFINE_BOOL(drumbrake_fuzzing_mode, false,
             "enable drumbrake fuzzer mode (for testing)")
 
-// Directly interpret asm.js code as regular JavaScript code, instead of
-// translating it to Wasm bytecode first and then interpreting that with
-// DrumBrake. (validate_asm=false turns off asm.js to Wasm compilation.)
-DEFINE_NEG_IMPLICATION(wasm_jitless, validate_asm)
-
-// --wasm-jitless resets {asm-,}wasm-lazy-compilation.
-DEFINE_NEG_IMPLICATION(wasm_jitless, asm_wasm_lazy_compilation)
+// --wasm-jitless resets --wasm-lazy-compilation and --wasm-tier-up.
 DEFINE_NEG_IMPLICATION(wasm_jitless, wasm_lazy_compilation)
 DEFINE_NEG_IMPLICATION(wasm_jitless, wasm_tier_up)
 
@@ -2993,6 +2972,10 @@ DEFINE_BOOL(enable_apx_f_cmovcc, false,
 DEFINE_IMPLICATION(enable_apx_f_setzucc, enable_apx_f)
 DEFINE_IMPLICATION(enable_apx_f_cmovcc, enable_apx_f)
 #endif
+#ifdef V8_ENABLE_AVX10_1
+DEFINE_BOOL(enable_avx10_1, false,
+            "enable use of AVX10.1 instructions if available")
+#endif
 DEFINE_STRING(arm_arch, ARM_ARCH_DEFAULT,
               "generate instructions for the selected ARM architecture if "
               "available: armv6, armv7, armv7+sudiv or armv8")
@@ -3146,6 +3129,7 @@ DEFINE_BOOL(lazy_streaming, true,
             "use lazy compilation during streaming compilation")
 DEFINE_BOOL(max_lazy, false, "ignore eager compilation hints")
 DEFINE_IMPLICATION(max_lazy, lazy)
+DEFINE_BOOL(compile_hints_magic, false, "enable magic compile hints comments")
 DEFINE_DEVELOPER_FLAG(trace_opt, "trace optimized compilation")
 DEFINE_DEVELOPER_FLAG(
     trace_opt_status,
@@ -3644,11 +3628,6 @@ DEFINE_BOOL_READONLY(
 #endif  // V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_RISCV32
         // || V8_TARGET_ARCH_RISCV64
 
-DEFINE_BOOL(regexp_bytecode_analysis, false, "analyze regexp bytecode")
-DEFINE_DEVELOPER_FLAG(trace_regexp_bytecode_analysis,
-                      "trace regexp bytecode analysis")
-DEFINE_IMPLICATION(trace_regexp_bytecode_analysis, regexp_bytecode_analysis)
-
 DEFINE_DEVELOPER_FLAG(trace_read_only_promotion,
                       "trace the read-only promotion pass")
 DEFINE_DEVELOPER_FLAG(trace_read_only_promotion_verbose,
@@ -4107,7 +4086,7 @@ DEFINE_IMPLICATION(prof, log_code)
 DEFINE_DEVELOPER_FLAG(ll_prof, "Enable low-level linux profiler.")
 
 #if V8_OS_LINUX || V8_OS_DARWIN
-#define DEFINE_PERF_PROF_BOOL(nam, cmt) DEFINE_BOOL(nam, false, cmt)
+#define DEFINE_PERF_PROF_BOOL(nam, cmt) DEFINE_DEVELOPER_FLAG(nam, cmt)
 #define DEFINE_PERF_PROF_IMPLICATION DEFINE_IMPLICATION
 #else
 #define DEFINE_PERF_PROF_BOOL(nam, cmt) DEFINE_BOOL_READONLY(nam, false, cmt)
@@ -4457,6 +4436,7 @@ DEFINE_NEG_IMPLICATION(disallow_unsafe_flags, maglev_break_on_entry)
 #ifdef USE_SIMULATOR
 DEFINE_NOT_EXPLICITLY_SET_IMPLICATION(disallow_unsafe_flags, stop_sim_at)
 #endif
+DEFINE_NOT_EXPLICITLY_SET_IMPLICATION(disallow_unsafe_flags, gc_fake_mmap)
 
 // Runs a program as security POC. This mode is used to determine whether a bug
 // in a program is a security problem. V8 supports many different configurations

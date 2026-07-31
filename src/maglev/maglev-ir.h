@@ -177,6 +177,7 @@ class ExceptionHandlerInfo;
   V(Float64RoundToFloat32)              \
   V(Float64Round)                       \
   V(Float64Compare)                     \
+  V(Float64SameValue)                   \
   V(Float64ToBoolean)                   \
   V(Float64Ieee754Unary)                \
   V(Float64Ieee754Binary)               \
@@ -199,7 +200,7 @@ class ExceptionHandlerInfo;
   V(TaggedIndexConstant)            \
   V(TrustedConstant)
 // clang-format off
-// LINT.ThenChange(/src/maglev/maglev-graph-processor.h:maglev_constant_nodes, /src/maglev/maglev-regalloc.cc:maglev_constant_nodes)
+// LINT.ThenChange(/src/maglev/maglev-graph-processor.h:maglev_constant_nodes, /src/maglev/maglev-graph-processor.h:maglev_backward_constant_nodes, /src/maglev/maglev-regalloc.cc:maglev_constant_nodes)
 // clang-format on
 
 #define INLINE_BUILTIN_NODE_LIST(V) \
@@ -718,6 +719,17 @@ constexpr bool IsSimpleFieldStore(Opcode opcode) {
 constexpr bool IsElementsArrayWrite(Opcode opcode) {
   return opcode == Opcode::kMaybeGrowFastElements ||
          opcode == Opcode::kEnsureWritableFastElements;
+}
+// Writes that cannot mutate the payload of an existing FixedArray:
+// double-array stores write a FixedDoubleArray (a heap object cannot be
+// both), and elements-kind transitions write the object's map/elements
+// fields and, when the representation changes, copy into a freshly
+// allocated backing store.
+constexpr bool PreservesTaggedKeyedProperties(Opcode opcode) {
+  return opcode == Opcode::kStoreFixedDoubleArrayElement ||
+         opcode == Opcode::kStoreFixedHoleyDoubleArrayElement ||
+         opcode == Opcode::kTransitionElementsKind ||
+         opcode == Opcode::kTransitionElementsKindOrCheckMap;
 }
 constexpr bool IsTypedArrayStore(Opcode opcode) {
   return opcode == Opcode::kStoreIntTypedArrayElement ||
@@ -3763,6 +3775,20 @@ class Float64Compare : public FixedInputValueNodeT<2, Float64Compare> {
 
  private:
   using OperationBitField = NextBitField<Operation, kOperationBits>;
+};
+
+// https://tc39.es/ecma262/#sec-samevalue restricted to Number inputs: unlike
+// Float64Compare, NaN is same-value as itself and +0 is not same-value as -0.
+class Float64SameValue : public FixedInputValueNodeT<2, Float64SameValue> {
+ public:
+  explicit Float64SameValue(uint64_t bitfield) : Base(bitfield) {}
+
+  DECLARE_BINOP(Float64, Float64)
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
+
+  NodeType type() const { return NodeType::kBoolean; }
 };
 
 class Float64ToBoolean : public FixedInputValueNodeT<1, Float64ToBoolean> {
@@ -7875,7 +7901,7 @@ class DebugBreak : public FixedInputNodeT<0, DebugBreak> {
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 };
 
-class Dead : public NodeT<Dead> {
+class Dead : public FixedInputNodeT<0, Dead> {
  public:
   static constexpr OpProperties kProperties =
       OpProperties::ForValueRepresentation(ValueRepresentation::kNone);
@@ -7985,26 +8011,19 @@ class GetTemplateObject : public FixedInputValueNodeT<1, GetTemplateObject> {
 };
 
 class HasInPrototypeChain
-    : public FixedInputValueNodeT<1, HasInPrototypeChain> {
+    : public FixedInputValueNodeT<2, HasInPrototypeChain> {
  public:
-  explicit HasInPrototypeChain(uint64_t bitfield,
-                               compiler::HeapObjectRef prototype)
-      : Base(bitfield), prototype_(prototype) {}
+  explicit HasInPrototypeChain(uint64_t bitfield) : Base(bitfield) {}
   // The implementation can enter user code in the deferred call (due to
   // proxied getPrototypeOf).
   static constexpr OpProperties kProperties =
       OpProperties::DeferredCall() | OpProperties::CanCallUserCode();
-  DECLARE_UNOP(Tagged)
-
-  compiler::HeapObjectRef prototype() { return prototype_; }
+  DECLARE_INPUTS(Object, Prototype)
+  DECLARE_INPUT_TYPES(Tagged, Tagged)
 
   int MaxCallStackArgs() const;
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
-  void PrintParams(std::ostream&) const;
-
- private:
-  compiler::HeapObjectRef prototype_;
 };
 
 class BuiltinStringFromCharCode
@@ -8210,8 +8229,9 @@ class ProcessWasmArgument
  public:
   explicit ProcessWasmArgument(uint64_t bitfield) : Base(bitfield) {}
 
-  static constexpr OpProperties kProperties =
-      OpProperties::EagerDeopt() | OpProperties::TaggedValue();
+  static constexpr OpProperties kProperties = OpProperties::EagerDeopt() |
+                                              OpProperties::TaggedValue() |
+                                              OpProperties::NotIdempotent();
 
   DECLARE_INPUTS(Value)
   DECLARE_INPUT_TYPES(Tagged)
@@ -8623,13 +8643,15 @@ class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
  public:
   explicit LoadTaggedField(uint64_t bitfield, const int offset, NodeType type,
                            bool is_const, PropertyKey property_key,
-                           IsArrayLength is_array_length)
+                           IsArrayLength is_array_length,
+                           compiler::OptionalMapRef stable_field_map = {})
       : Base(
             bitfield | IsConstantLoadField::encode(is_const) |
             IsArrayLengthField::encode(is_array_length == IsArrayLength::kYes)),
         offset_(offset),
         type_(type),
-        property_key_(property_key) {}
+        property_key_(property_key),
+        stable_field_map_(stable_field_map) {}
 
   static constexpr OpProperties kProperties = OpProperties::CanRead();
   DECLARE_UNOP(Tagged)
@@ -8638,9 +8660,19 @@ class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
   NodeType type() const { return type_; }
   bool is_const() const { return IsConstantLoadField::decode(bitfield()); }
   PropertyKey property_key() const { return property_key_; }
+  compiler::OptionalMapRef stable_field_map() const {
+    return stable_field_map_;
+  }
   IsArrayLength is_array_length() const {
     return IsArrayLengthField::decode(bitfield()) ? IsArrayLength::kYes
                                                   : IsArrayLength::kNo;
+  }
+
+  Range range() const {
+    if (type() == NodeType::kSmi) {
+      return Range::Smi();
+    }
+    return Range::All();
   }
 
   void SetValueLocationConstraints();
@@ -8648,14 +8680,16 @@ class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
   void PrintParams(std::ostream&) const;
 
   auto options() const {
-    return std::tuple{offset(), type(), is_const(), property_key(),
-                      is_array_length()};
+    return std::tuple{offset(),          type(),
+                      is_const(),        property_key(),
+                      is_array_length(), stable_field_map()};
   }
 
  private:
   const int offset_;
   const NodeType type_;
   PropertyKey property_key_;
+  compiler::OptionalMapRef stable_field_map_;
   using IsConstantLoadField = NextBitField<bool, 1>;
   using IsArrayLengthField = IsConstantLoadField::Next<bool, 1>;
 };
@@ -9760,23 +9794,24 @@ class LoadNamedFromSuperGeneric
 };
 
 class LoadDictionaryField
-    : public FixedInputValueNodeT<2, LoadDictionaryField> {
+    : public FixedInputValueNodeT<3, LoadDictionaryField> {
  public:
   explicit LoadDictionaryField(uint64_t bitfield, compiler::NameRef name,
                                int dictionary_index,
-                               compiler::FeedbackSource feedback)
+                               compiler::FeedbackSource feedback, bool is_super)
       : Base(bitfield),
         name_(name),
         dictionary_index_(dictionary_index),
-        feedback_(feedback) {
+        feedback_(feedback),
+        is_super_(is_super) {
     set_temporaries_needed(3);
   }
 
   static constexpr OpProperties kProperties =
       OpProperties::JSCall() | OpProperties::DeferredCall();
 
-  DECLARE_INPUTS(Context, Object)
-  DECLARE_INPUT_TYPES(Tagged, Tagged)
+  DECLARE_INPUTS(Context, Object, Receiver)
+  DECLARE_INPUT_TYPES(Tagged, Tagged, Tagged)
 
   int MaxCallStackArgs() const;
   void SetValueLocationConstraints();
@@ -9786,15 +9821,17 @@ class LoadDictionaryField
   compiler::NameRef name() const { return name_; }
   int dictionary_index() const { return dictionary_index_; }
   compiler::FeedbackSource feedback() const { return feedback_; }
+  bool is_super() const { return is_super_; }
 
   auto options() const {
-    return std::tuple{name_, dictionary_index_, feedback_};
+    return std::tuple{name_, dictionary_index_, feedback_, is_super_};
   }
 
  private:
   const compiler::NameRef name_;
   const int dictionary_index_;
   const compiler::FeedbackSource feedback_;
+  const bool is_super_;
 };
 
 class SetNamedGeneric : public FixedInputValueNodeT<3, SetNamedGeneric> {
@@ -10510,6 +10547,7 @@ class CallBuiltin : public VarargsValueNodeT<0, CallBuiltin> {
   V(ArrayPrototypeSplice, NodeType::kJSReceiver)                         \
   V(ArrayUnshift, NodeType::kNumber)                                     \
   V(ArrayBufferIsView, NodeType::kBoolean)                               \
+  V(CloneFastJSArray, NodeType::kJSArray)                                \
   V(ObjectAssign, NodeType::kJSReceiver)                                 \
   V(ObjectCreate, NodeType::kAnyHeapObject)                              \
   V(ObjectIs, NodeType::kBoolean)                                        \

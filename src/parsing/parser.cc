@@ -926,7 +926,9 @@ void Parser::PostProcessParseResult(IsolateT* isolate, ParseInfo* info,
     if (scope->is_script_scope()) {
       for (Variable* var : *scope->locals()) {
         var->set_is_used();
-        var->SetMaybeAssigned();
+        if (var->mode() != VariableMode::kConst || flags().is_repl_mode()) {
+          var->SetMaybeAssigned();
+        }
       }
     }
 
@@ -3797,17 +3799,6 @@ void Parser::SetLanguageMode(Scope* scope, LanguageMode mode) {
   ++use_counts_[feature];
   scope->SetLanguageMode(mode);
 }
-
-#if V8_ENABLE_WEBASSEMBLY
-void Parser::SetAsmModule() {
-  // Store the usage count; The actual use counter on the isolate is
-  // incremented after parsing is done.
-  ++use_counts_[v8::Isolate::kUseAsm];
-  DCHECK(scope()->is_declaration_scope());
-  scope()->AsDeclarationScope()->set_is_asm_module(true);
-  info_->set_contains_asm_module(true);
-}
-#endif  // V8_ENABLE_WEBASSEMBLY
 
 Expression* Parser::ExpressionListToExpression(
     const ScopedPtrList<Expression>& args) {

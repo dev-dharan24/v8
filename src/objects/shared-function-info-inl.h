@@ -27,7 +27,6 @@
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/hole.h"
 #include "src/objects/instance-type-inl.h"
-#include "src/objects/objects-inl.h"
 #include "src/objects/oddball-predicates-inl.h"
 #include "src/objects/scope-info-inl.h"
 #include "src/objects/script-inl.h"
@@ -435,9 +434,8 @@ SharedFunctionInfo::Inlineability SharedFunctionInfo::GetInlineability(
 
   if (!IsUserJavaScript()) return kIsNotUserCode;
 
-  // If there is no bytecode array, it is either not compiled or it is compiled
-  // with WebAssembly for the asm.js pipeline. In either case we don't want to
-  // inline.
+  // If there is no bytecode array, the function is not compiled, so we don't
+  // want to inline.
   if (!HasBytecodeArray()) return kHasNoBytecode;
 
   if (GetBytecodeArray(isolate)->length() >
@@ -485,10 +483,6 @@ BIT_FIELD_ACCESSORS(SharedFunctionInfo, relaxed_flags, has_duplicate_parameters,
 
 BIT_FIELD_ACCESSORS(SharedFunctionInfo, relaxed_flags, native,
                     SharedFunctionInfo::IsNativeBit)
-#if V8_ENABLE_WEBASSEMBLY
-BIT_FIELD_ACCESSORS(SharedFunctionInfo, relaxed_flags, is_asm_wasm_broken,
-                    SharedFunctionInfo::IsAsmWasmBrokenBit)
-#endif  // V8_ENABLE_WEBASSEMBLY
 BIT_FIELD_ACCESSORS(SharedFunctionInfo, relaxed_flags,
                     requires_instance_members_initializer,
                     SharedFunctionInfo::RequiresInstanceMembersInitializerBit)
@@ -1025,10 +1019,6 @@ void SharedFunctionInfo::FlushBaselineCode() {
 }
 
 #if V8_ENABLE_WEBASSEMBLY
-bool SharedFunctionInfo::HasAsmWasmData() const {
-  return IsAsmWasmData(GetTrustedData(GetCurrentIsolateForSandbox()));
-}
-
 bool SharedFunctionInfo::HasWasmFunctionData(IsolateForSandbox isolate) const {
   return IsWasmFunctionData(GetTrustedData(isolate));
 }
@@ -1045,19 +1035,6 @@ bool SharedFunctionInfo::HasWasmCapiFunctionData(
 
 bool SharedFunctionInfo::HasWasmResumeData() const {
   return IsWasmResumeData(GetUntrustedData());
-}
-
-DEF_GETTER(SharedFunctionInfo, asm_wasm_data, Tagged<AsmWasmData>) {
-  DCHECK(HasAsmWasmData());
-  return GetTrustedData<AsmWasmData, kAsmWasmDataIndirectPointerTag>(
-      GetCurrentIsolateForSandbox());
-}
-
-void SharedFunctionInfo::set_asm_wasm_data(Tagged<AsmWasmData> data,
-                                           WriteBarrierMode mode) {
-  DCHECK(GetUntrustedData() == Smi::FromEnum(Builtin::kCompileLazy) ||
-         HasUncompiledData(GetCurrentIsolateForSandbox()) || HasAsmWasmData());
-  SetTrustedData(data, mode);
 }
 
 DEF_GETTER(SharedFunctionInfo, wasm_function_data, Tagged<WasmFunctionData>) {
@@ -1246,7 +1223,6 @@ bool SharedFunctionInfo::IsUserJavaScript() const {
 
 bool SharedFunctionInfo::IsSubjectToDebugging() const {
 #if V8_ENABLE_WEBASSEMBLY
-  if (HasAsmWasmData()) return false;
   if (HasWasmExportedFunctionData(GetCurrentIsolateForSandbox())) return false;
 #endif  // V8_ENABLE_WEBASSEMBLY
   return IsUserJavaScript();

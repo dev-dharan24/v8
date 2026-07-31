@@ -39,6 +39,7 @@
 namespace v8 {
 namespace internal {
 namespace wasm {
+class InterpreterHandle;
 class NativeModule;
 class WasmCode;
 struct WasmFunction;
@@ -579,7 +580,8 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   DECL_OPTIONAL_ACCESSORS(native_context, Tagged<NativeContext>)
   DECL_ACCESSORS(memory_objects, Tagged<FixedArray>)
 #if V8_ENABLE_DRUMBRAKE
-  DECL_OPTIONAL_ACCESSORS(interpreter_object, Tagged<Tuple2>)
+  DECL_PROTECTED_POINTER_ACCESSORS(interpreter_handle,
+                                   TrustedManaged<wasm::InterpreterHandle>)
 #endif  // V8_ENABLE_DRUMBRAKE
   // `untagged_globals_buffer`: Storage for non-ref globals.
   DECL_ACCESSORS(untagged_globals_buffer, Tagged<ByteArray>)
@@ -673,7 +675,7 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   V(kMemoryObjectsOffset, kTaggedSize)                                    \
   V(kUntaggedGlobalsBufferOffset, kTaggedSize)                            \
   V(kTaggedGlobalsBufferOffset, kTaggedSize)                              \
-  IF_WASM_DRUMBRAKE(V, kInterpreterObjectOffset, kTaggedSize)             \
+  IF_WASM_DRUMBRAKE(V, kProtectedInterpreterHandleOffset, kTaggedSize)    \
   V(kTablesOffset, kTaggedSize)                                           \
   V(kProtectedDispatchTablesOffset, kTaggedSize)                          \
   V(kProtectedTagsTableOffset, kTaggedSize)                               \
@@ -712,7 +714,6 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   V(kTaggedGlobalsBufferOffset, "tagged_globals_buffer")                      \
   V(kImportedMutableGlobalsBuffersOffset, "imported_mutable_globals_buffers") \
   V(kImportedMutableGlobalsOffsetsOffset, "imported_mutable_globals_offsets") \
-  IF_WASM_DRUMBRAKE(V, kInterpreterObjectOffset, "interpreter_object")        \
   V(kTablesOffset, "tables")                                                  \
   V(kFuncRefsOffset, "func_refs")                                             \
   V(kManagedObjectMapsOffset, "managed_object_maps")                          \
@@ -728,6 +729,8 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   V(kProtectedDispatchTablesOffset, "dispatch_tables")                     \
   V(kProtectedDispatchTableForImportsOffset, "dispatch_table_for_imports") \
   V(kProtectedTagsTableOffset, "tags_table")                               \
+  IF_WASM_DRUMBRAKE(V, kProtectedInterpreterHandleOffset,                  \
+                    "interpreter_handle")                                  \
   V(kProtectedManagedNativeModuleOffset, "managed_native_module")
 
 #define WASM_INSTANCE_FIELD_OFFSET(offset, _) offset,
@@ -765,14 +768,6 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
 
   void SetRawMemory(uint32_t memory_index, uint8_t* mem_start, size_t mem_size);
 
-#if V8_ENABLE_DRUMBRAKE
-  // Get the interpreter object associated with the given wasm object.
-  // If no interpreter object exists yet, it is created automatically.
-  static DirectHandle<Tuple2> GetOrCreateInterpreterObject(
-      DirectHandle<WasmInstanceObject>);
-  static DirectHandle<Tuple2> GetInterpreterObject(
-      DirectHandle<WasmInstanceObject>);
-#endif  // V8_ENABLE_DRUMBRAKE
 
   static DirectHandle<WasmTrustedInstanceData> New(
       Isolate*, DirectHandle<WasmModuleObject>,
@@ -1238,14 +1233,12 @@ class WasmExportedFunction : public JSFunction {
       Isolate* isolate, DirectHandle<WasmTrustedInstanceData> instance_data,
       DirectHandle<WasmFuncRef> func_ref,
       DirectHandle<WasmInternalFunction> internal_function, int arity,
-      DirectHandle<Code> export_wrapper, wasm::ModuleOrigin origin,
-      int func_index, wasm::Promise promise);
+      DirectHandle<Code> export_wrapper, int func_index, wasm::Promise promise);
 
   // Returns the generic wrapper, or a cached compiled wrapper, or
   // a freshly-compiled wrapper.
   static DirectHandle<Code> GetWrapper(Isolate* isolate,
-                                       const wasm::CanonicalSig* sig,
-                                       wasm::ModuleOrigin origin);
+                                       const wasm::CanonicalSig* sig);
 
   // Return a null-terminated string with the debug name in the form
   // 'js-to-wasm:<sig>'.
@@ -1676,38 +1669,6 @@ V8_OBJECT class WasmExceptionTag : public Struct {
   friend class TorqueGeneratedWasmExceptionTagAsserts;
 
   TaggedMember<Smi> index_;
-} V8_OBJECT_END;
-
-// Data annotated to the asm.js Module function. Used for later instantiation of
-// that function.
-V8_OBJECT class AsmWasmData : public ExposedTrustedObject {
- public:
-  static Handle<AsmWasmData> New(
-      Isolate* isolate, std::shared_ptr<wasm::NativeModule> native_module,
-      uint64_t uses_bitset);
-
-  inline Tagged<TrustedManaged<wasm::NativeModule>> managed_native_module()
-      const;
-  inline void set_managed_native_module(
-      Tagged<TrustedManaged<wasm::NativeModule>> value,
-      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline bool has_managed_native_module() const;
-  inline void clear_managed_native_module();
-
-  inline uint64_t uses_bitset() const;
-  inline void set_uses_bitset(uint64_t value);
-
-  DECL_PRINTER(AsmWasmData)
-  DECL_VERIFIER(AsmWasmData)
-
-  class BodyDescriptor;
-
- private:
-  friend class TorqueGeneratedAsmWasmDataAsserts;
-
-  ProtectedTaggedMember<TrustedManaged<wasm::NativeModule>>
-      managed_native_module_;
-  UnalignedValueMember<uint64_t> uses_bitset_;
 } V8_OBJECT_END;
 
 V8_OBJECT class WasmTypeInfo : public HeapObject {

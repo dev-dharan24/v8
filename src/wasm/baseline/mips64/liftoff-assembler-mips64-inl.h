@@ -335,7 +335,9 @@ void LiftoffAssembler::PrepareTailCall(int num_callee_stack_params,
   }
 
   // Set the new stack and frame pointer.
-  daddiu(sp, fp, -stack_param_delta * 8);
+  // WebAssembly allows functions to have up to 1000 parameters
+  // (see kV8MaxWasmFunctionParams).
+  Daddu(sp, fp, Operand(-stack_param_delta * 8));
   Pop(ra, fp);
 }
 
@@ -2958,8 +2960,8 @@ void LiftoffAssembler::emit_i8x16_alltrue(LiftoffRegister dst,
 
 void LiftoffAssembler::emit_i8x16_bitmask(LiftoffRegister dst,
                                           LiftoffRegister src) {
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   srli_b(scratch0, src.fp().toW(), 7);
   srli_h(scratch1, scratch0, 7);
   or_v(scratch0, scratch0, scratch1);
@@ -3083,8 +3085,8 @@ void LiftoffAssembler::emit_i16x8_alltrue(LiftoffRegister dst,
 
 void LiftoffAssembler::emit_i16x8_bitmask(LiftoffRegister dst,
                                           LiftoffRegister src) {
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   srli_h(scratch0, src.fp().toW(), 15);
   srli_w(scratch1, scratch0, 15);
   or_v(scratch0, scratch0, scratch1);
@@ -3207,8 +3209,8 @@ void LiftoffAssembler::emit_i32x4_alltrue(LiftoffRegister dst,
 
 void LiftoffAssembler::emit_i32x4_bitmask(LiftoffRegister dst,
                                           LiftoffRegister src) {
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   srli_w(scratch0, src.fp().toW(), 31);
   srli_d(scratch1, scratch0, 31);
   or_v(scratch0, scratch0, scratch1);
@@ -3311,11 +3313,11 @@ void LiftoffAssembler::emit_i64x2_alltrue(LiftoffRegister dst,
 
 void LiftoffAssembler::emit_i64x2_bitmask(LiftoffRegister dst,
                                           LiftoffRegister src) {
-  srli_d(kSimd128RegZero, src.fp().toW(), 63);
-  shf_w(kSimd128ScratchReg, kSimd128RegZero, 0x02);
-  slli_d(kSimd128ScratchReg, kSimd128ScratchReg, 1);
-  or_v(kSimd128RegZero, kSimd128RegZero, kSimd128ScratchReg);
-  copy_u_b(dst.gp(), kSimd128RegZero, 0);
+  srli_d(kSimd128ScratchReg, src.fp().toW(), 63);
+  shf_w(kSimd128ScratchReg1, kSimd128ScratchReg, 0x02);
+  slli_d(kSimd128ScratchReg1, kSimd128ScratchReg1, 1);
+  or_v(kSimd128ScratchReg, kSimd128ScratchReg, kSimd128ScratchReg1);
+  copy_u_b(dst.gp(), kSimd128ScratchReg, 0);
 }
 
 void LiftoffAssembler::emit_i64x2_shl(LiftoffRegister dst, LiftoffRegister lhs,
@@ -3442,8 +3444,8 @@ void LiftoffAssembler::emit_f32x4_min(LiftoffRegister dst, LiftoffRegister lhs,
   MSARegister dst_msa = dst.fp().toW();
   MSARegister lhs_msa = lhs.fp().toW();
   MSARegister rhs_msa = rhs.fp().toW();
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   // If inputs are -0.0. and +0.0, then write -0.0 to scratch1.
   // scratch1 = (lhs == rhs) ?  (lhs | rhs) : (rhs | rhs).
   fseq_w(scratch0, lhs_msa, rhs_msa);
@@ -3464,8 +3466,8 @@ void LiftoffAssembler::emit_f32x4_max(LiftoffRegister dst, LiftoffRegister lhs,
   MSARegister dst_msa = dst.fp().toW();
   MSARegister lhs_msa = lhs.fp().toW();
   MSARegister rhs_msa = rhs.fp().toW();
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   // If inputs are -0.0. and +0.0, then write +0.0 to scratch1.
   // scratch1 = (lhs == rhs) ?  (lhs | rhs) : (rhs | rhs).
   fseq_w(scratch0, lhs_msa, rhs_msa);
@@ -3577,8 +3579,8 @@ void LiftoffAssembler::emit_f64x2_min(LiftoffRegister dst, LiftoffRegister lhs,
   MSARegister dst_msa = dst.fp().toW();
   MSARegister lhs_msa = lhs.fp().toW();
   MSARegister rhs_msa = rhs.fp().toW();
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   // If inputs are -0.0. and +0.0, then write -0.0 to scratch1.
   // scratch1 = (lhs == rhs) ?  (lhs | rhs) : (rhs | rhs).
   fseq_d(scratch0, lhs_msa, rhs_msa);
@@ -3599,8 +3601,8 @@ void LiftoffAssembler::emit_f64x2_max(LiftoffRegister dst, LiftoffRegister lhs,
   MSARegister dst_msa = dst.fp().toW();
   MSARegister lhs_msa = lhs.fp().toW();
   MSARegister rhs_msa = rhs.fp().toW();
-  MSARegister scratch0 = kSimd128RegZero;
-  MSARegister scratch1 = kSimd128ScratchReg;
+  MSARegister scratch0 = kSimd128ScratchReg;
+  MSARegister scratch1 = kSimd128ScratchReg1;
   // If inputs are -0.0. and +0.0, then write +0.0 to scratch1.
   // scratch1 = (lhs == rhs) ?  (lhs | rhs) : (rhs | rhs).
   fseq_d(scratch0, lhs_msa, rhs_msa);
@@ -3651,17 +3653,17 @@ void LiftoffAssembler::emit_f64x2_relaxed_max(LiftoffRegister dst,
 void LiftoffAssembler::emit_f64x2_convert_low_i32x4_s(LiftoffRegister dst,
                                                       LiftoffRegister src) {
   xor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
-  ilvr_w(kSimd128RegZero, kSimd128RegZero, src.fp().toW());
-  slli_d(kSimd128RegZero, kSimd128RegZero, 32);
-  srai_d(kSimd128RegZero, kSimd128RegZero, 32);
-  ffint_s_d(dst.fp().toW(), kSimd128RegZero);
+  ilvr_w(kSimd128ScratchReg, kSimd128RegZero, src.fp().toW());
+  slli_d(kSimd128ScratchReg, kSimd128ScratchReg, 32);
+  srai_d(kSimd128ScratchReg, kSimd128ScratchReg, 32);
+  ffint_s_d(dst.fp().toW(), kSimd128ScratchReg);
 }
 
 void LiftoffAssembler::emit_f64x2_convert_low_i32x4_u(LiftoffRegister dst,
                                                       LiftoffRegister src) {
   xor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
-  ilvr_w(kSimd128RegZero, kSimd128RegZero, src.fp().toW());
-  ffint_u_d(dst.fp().toW(), kSimd128RegZero);
+  ilvr_w(kSimd128ScratchReg, kSimd128RegZero, src.fp().toW());
+  ffint_u_d(dst.fp().toW(), kSimd128ScratchReg);
 }
 
 void LiftoffAssembler::emit_f64x2_promote_low_f32x4(LiftoffRegister dst,

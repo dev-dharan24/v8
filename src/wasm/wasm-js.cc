@@ -27,6 +27,7 @@
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/js-function.h"
 #include "src/objects/managed-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/shared-function-info.h"
 #include "src/objects/templates.h"
@@ -1106,8 +1107,7 @@ void WebAssemblyInstanceImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
     if (!i::wasm::GetWasmEngine()
              ->SyncInstantiate(i_isolate, &thrower, module_object,
-                               ImportsAsMaybeReceiver(ffi),
-                               i::MaybeDirectHandle<i::JSArrayBuffer>())
+                               ImportsAsMaybeReceiver(ffi))
              .ToHandle(&instance_obj)) {
       return js_api_scope.AssertException();
     }
@@ -2286,20 +2286,19 @@ i::DirectHandle<i::JSFunction> NewPromisingWasmExportedFunction(
   if (func_index >= num_imported_functions) {
     implicit_arg = trusted_instance_data;
   } else {
-    implicit_arg = i_isolate->factory()->NewWasmImportData(
-        direct_handle(i::TrustedCast<i::WasmImportData>(
-                          trusted_instance_data->dispatch_table_for_imports()
-                              ->implicit_arg(func_index)),
-                      i_isolate),
-        i::SharedFlag{false});
+    implicit_arg = i_isolate->factory()->NewWasmImportData(direct_handle(
+        i::TrustedCast<i::WasmImportData>(
+            trusted_instance_data->dispatch_table_for_imports()->implicit_arg(
+                func_index)),
+        i_isolate));
   }
 
   i::DirectHandle<i::WasmInternalFunction> internal =
       i_isolate->factory()->NewWasmInternalFunction(
-          implicit_arg, func_index, i::SharedFlag{false},
+          implicit_arg, func_index,
           trusted_instance_data->GetCallTarget(func_index), sig);
   i::DirectHandle<i::WasmFuncRef> func_ref =
-      i_isolate->factory()->NewWasmFuncRef(internal, rtt, i::SharedFlag{false});
+      i_isolate->factory()->NewWasmFuncRef(internal, rtt);
   if (func_index < num_imported_functions) {
     i::TrustedCast<i::WasmImportData>(implicit_arg)->set_call_origin(*internal);
   }
@@ -2331,10 +2330,6 @@ void WebAssemblyPromising(const v8::FunctionCallbackInfo<v8::Value>& info) {
   i::DirectHandle<i::WasmExportedFunctionData> data(
       wasm_exported_function->shared()->wasm_exported_function_data(),
       i_isolate);
-  if (i::wasm::is_asmjs_module(data->instance_data()->module())) {
-    thrower.TypeError("Argument 0 must be a WebAssembly exported function");
-    return;
-  }
   i::DirectHandle<i::JSFunction> result =
       NewPromisingWasmExportedFunction(i_isolate, data, thrower);
   info.GetReturnValue().Set(Utils::ToLocal(i::Cast<i::JSObject>(result)));

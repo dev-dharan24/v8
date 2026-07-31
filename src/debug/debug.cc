@@ -1393,7 +1393,8 @@ void Debug::PrepareStepOnThrow() {
     if (last_step_action() == StepInto) {
       // Deoptimize frame to ensure calls are checked for step-in.
       Deoptimizer::DeoptimizeFunction(frame->function(),
-                                      LazyDeoptimizeReason::kDebugger);
+                                      LazyDeoptimizeReason::kDebugger,
+                                      frame->LookupCode());
     }
     FrameSummaries summaries = frame->Summarize();
     for (size_t i = summaries.size(); i != 0; i--, current_frame_count--) {
@@ -1596,7 +1597,8 @@ void Debug::PrepareStep(StepAction step_action) {
         if (last_step_action() == StepInto) {
           // Deoptimize frame to ensure calls are checked for step-in.
           Deoptimizer::DeoptimizeFunction(js_frame->function(),
-                                          LazyDeoptimizeReason::kDebugger);
+                                          LazyDeoptimizeReason::kDebugger,
+                                          js_frame->LookupCode());
         }
         HandleScope inner_scope(isolate_);
         std::vector<Handle<SharedFunctionInfo>> infos;
@@ -2902,6 +2904,19 @@ void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
       DirectHandle<JSFunction> function(frame->function(), isolate_);
       DirectHandle<SharedFunctionInfo> shared(function->shared(), isolate_);
 
+      // If the top frame is optimized, deoptimize it. A debugger pause can
+      // execute arbitrary JS (e.g. via evaluation or inspector listeners),
+      // which can modify heap state (like detaching typed arrays). We must
+      // deoptimize the execution stack to discard any load-eliminated values
+      // (like backing store pointers or array lengths) that could be
+      // invalidated. We only need to deoptimize the topmost frame because any
+      // caller frames are at a call site, which acts as a memory serialization
+      // barrier, forcing them to reload all heap state upon return anyway.
+      if (frame->is_optimized()) {
+        Deoptimizer::DeoptimizeFunction(
+            *function, LazyDeoptimizeReason::kDebugger, frame->LookupCode());
+      }
+
       // kScheduled breaks are triggered by the stack check. While we could
       // pause here, the JSFunction didn't have time yet to create and push
       // it's context. Instead, we step into the function and pause at the
@@ -3421,7 +3436,8 @@ void Debug::PrepareRestartFrame(JavaScriptFrame* frame,
                                 int inlined_frame_index) {
   if (frame->is_optimized()) {
     Deoptimizer::DeoptimizeFunction(frame->function(),
-                                    LazyDeoptimizeReason::kDebugger);
+                                    LazyDeoptimizeReason::kDebugger,
+                                    frame->LookupCode());
   }
 
   thread_local_.restart_frame_id_ = frame->id();

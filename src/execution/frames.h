@@ -487,8 +487,7 @@ class V8_EXPORT_PRIVATE FrameSummary {
    public:
     WasmFrameSummary(Isolate* isolate,
                      Handle<WasmTrustedInstanceData> instance_data,
-                     wasm::WasmCode* code, int byte_offset, int function_index,
-                     bool at_to_number_conversion);
+                     wasm::WasmCode* code, int byte_offset, int function_index);
 
     Handle<Object> receiver() const;
     uint32_t function_index() const;
@@ -505,12 +504,10 @@ class V8_EXPORT_PRIVATE FrameSummary {
       return instance_data_;
     }
     DirectHandle<NativeContext> native_context() const;
-    bool at_to_number_conversion() const { return at_to_number_conversion_; }
     DirectHandle<StackFrameInfo> CreateStackFrameInfo() const;
 
    private:
     Handle<WasmTrustedInstanceData> instance_data_;
-    bool at_to_number_conversion_;
     wasm::WasmCode* code_;
     int byte_offset_;
     int function_index_;
@@ -1411,7 +1408,6 @@ class WasmFrame : public TypedFrame {
   int GetInnermostFunctionIndex() const;
   Tagged<Script> script() const;
   Tagged<Object> context() const override;
-  bool at_to_number_conversion() const;
   bool is_inspectable() const;
 
   FrameSummaries Summarize(AllowAllocation allow_allocation = AllowAllocation{
@@ -1486,7 +1482,6 @@ class WasmInterpreterEntryFrame final : public WasmFrame {
   Tagged<HeapObject> unchecked_code() const override;
 
   // Accessors.
-  Tagged<Tuple2> interpreter_object() const;
   V8_EXPORT_PRIVATE Tagged<WasmInstanceObject> wasm_instance() const override;
   Tagged<WasmTrustedInstanceData> trusted_instance_data() const override;
 

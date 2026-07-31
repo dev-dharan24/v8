@@ -20,6 +20,7 @@
 #include "src/objects/literal-objects-inl.h"
 #include "src/objects/lookup.h"
 #include "src/objects/map-updater.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects.h"
 #include "src/objects/property-descriptor-object.h"
 #include "src/objects/property-descriptor.h"
@@ -696,7 +697,7 @@ MaybeDirectHandle<JSObject> CreateLiteral(Isolate* isolate,
   }
   auto vector = Cast<FeedbackVector>(maybe_vector);
   FeedbackSlot literals_slot(FeedbackVector::ToSlot(literals_index));
-  CHECK(literals_slot.ToInt() < vector->length());
+  CHECK_LT(literals_slot.ToInt(), vector->length().value());
   Handle<Object> literal_site(Cast<Object>(vector->Get(literals_slot)),
                               isolate);
   Handle<AllocationSite> site;

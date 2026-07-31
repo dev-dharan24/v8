@@ -8,6 +8,7 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "src/base/container-utils.h"
+#include "src/base/iterator.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/diagnostics/code-tracer.h"
 #include "src/interpreter/bytecode-register.h"
@@ -132,11 +133,21 @@ ValueNode* EscapeAnalysisData::ResolveLoadBase(ValueNode* base, int offset,
       return fallback;
     }
     DCHECK(key.valid());
-    if (predecessor_index == -1) {
-      return field_values.Get(key);
-    } else {
-      return field_values.GetPredecessorValue(key, predecessor_index);
+    ValueNode* val = predecessor_index == -1 ? field_values.Get(key)
+                                             : field_values.GetPredecessorValue(
+                                                   key, predecessor_index);
+    if (val == nullptr) {
+      // The key is valid, but the value is nullptr (e.g. because it is
+      // uninitialized on this path, or merged to nullptr due to predecessor
+      // mismatch). For now, we also just mark {alloc} as escaping when this
+      // happens.
+      // TODO(dmercadier): We should also avoid marking {alloc} as escaping
+      // here. We could insert a special marker in the graph and in the Elider
+      // mark this branch as Unreachable.
+      MarkAsEscaped(alloc);
+      return fallback;
     }
+    return val;
   }
   return fallback;
 }
@@ -186,9 +197,19 @@ void EscapeAnalysisData::MarkAsEscapedIfCandidate(ValueNode* node,
 }
 
 void EscapeAnalysisData::MarkAsEscaped(InlinedAllocation* alloc) {
+  if (HasEscaped(alloc)) return;
   TRACE("Marking candidate:" << NODE_ID(alloc) << " as escaping");
   if (!(alloc->HasBeenAnalysed() && alloc->HasEscaped())) alloc->SetEscaped();
   candidates.at(alloc) = CandidateStatus::kCannotElide;
+
+  // Trigger revisits
+  DCHECK(alloc_definition_loop.contains(alloc));
+  BasicBlock* defining_loop = alloc_definition_loop.at(alloc);
+  for (auto& loop : base::Reversed(loop_stack)) {
+    if (loop.header == defining_loop) break;
+    loop.has_escaped_candidate = true;
+  }
+
   if (alloc_dependencies.contains(alloc)) {
     for (InlinedAllocation* other : *alloc_dependencies.at(alloc)) {
       if (candidates.contains(other) &&
@@ -447,6 +468,111 @@ void EscapeAnalysis::Run(Graph* graph, MaglevCompilationInfo* compilation_info,
 
   analyzer.ElideCandidates();
 }
+
+// The AnalyzerPrePass is a simple straightword pass over the graph whose goal
+// is to:
+//
+//    1. Figure out whether any allocation is not guaranteed to escape. If we
+//       find such an allocation, then EscapeAnalysis::AnalyzeCandidates will
+//       run the CandidateAnalyzer which will do more expensive state tracking
+//       and loop fixpoints to figure precisely what can definitely be elided
+//       and how.
+//
+//    2. Figure out which allocations are guaranteed to eventually escape. The
+//       CandidateAnalyzer can then ignore them, thus saving memory (no need to
+//       track their fields) and time (no need to revisit loops because of
+//       them).
+class AnalyzerPrePass {
+ public:
+  explicit AnalyzerPrePass(EscapeAnalysisData& data)
+      : data_(data), tracer_(data.compilation_info) {}
+  void PreProcessGraph(Graph* graph) {}
+  void PostProcessGraph(Graph* graph) {}
+  BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
+    if (block->is_exception_handler_block()) {
+      data_.has_exception_handler = true;
+    }
+    return BlockProcessResult::kContinue;
+  }
+  BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
+    return BlockProcessResult::kContinue;
+  }
+  void PostPhiProcessing() {}
+
+// List of nodes that might not make their inputs escape. This list should be
+// kept in sync with the overloads in the CandidateAnalyzer and in the Elider;
+// HasSpecificProcess at the end of this file will trigger a static_assert if
+// this list falls out of sync.
+#define NOT_ESCAPING_OPS(V)                 \
+  V(StoreMap)                               \
+  V(StoreTaggedFieldNoWriteBarrier)         \
+  V(StoreTaggedFieldWithWriteBarrier)       \
+  V(StoreFixedArrayElementNoWriteBarrier)   \
+  V(StoreFixedArrayElementWithWriteBarrier) \
+  V(StoreFixedDoubleArrayElement)           \
+  V(StoreInt32)                             \
+  V(StoreFloat64)                           \
+  V(AssertEscapeAnalysisElided)             \
+  V(CheckMaps)                              \
+  V(CheckMapsWithMigration)                 \
+  V(CheckMapsWithMigrationAndDeopt)         \
+  V(AssumeMap)                              \
+  V(LoadTaggedField)                        \
+  V(LoadFloat64)                            \
+  V(LoadFixedDoubleArrayElement)            \
+  V(LoadFixedArrayElement)                  \
+  V(BranchIfReferenceEqual)
+
+#define PROCESS_NOT_ESCAPING(Op)                               \
+  ProcessResult Process(maglev::Op*, const ProcessingState&) { \
+    return ProcessResult::kContinue;                           \
+  }
+  NOT_ESCAPING_OPS(PROCESS_NOT_ESCAPING)
+#undef PROCESS_NOT_ESCAPING
+#undef NOT_ESCAPING_OPS
+
+  ProcessResult Process(InlinedAllocation* node, const ProcessingState&) {
+    auto [it, inserted] =
+        data_.candidates.try_emplace(node, CandidateStatus::kCanMaybeElide);
+    if (!inserted) {
+      // If {node} is already recorded, it must be because it got marked as
+      // CannotElide as the backedge of a loop phi (since otherwise we always
+      // visit definitions before uses).
+      DCHECK_EQ(it->second, CandidateStatus::kCannotElide);
+      DCHECK(node->HasEscaped());
+    }
+    return ProcessResult::kContinue;
+  }
+
+  ProcessResult Process(Phi* node, const ProcessingState& state) {
+    // Phis make their input escape but need a special overload in order to keep
+    // the overloads in this class in sync with the CandidateAnalyzer and the
+    // Elider (cf the HasSpecificProcess check).
+    return Process(static_cast<NodeBase*>(node), state);
+  }
+
+  template <class NodeT>
+  ProcessResult Process(NodeT* node, const ProcessingState&) {
+    // Any operation that isn't whitelisted in NOT_ESCAPING_OPS is assumed to
+    // make its inputs escape.
+    for (Input input : node->inputs()) {
+      if (InlinedAllocation* alloc =
+              input.node()->template TryCast<InlinedAllocation>()) {
+        data_.candidates[alloc] = CandidateStatus::kCannotElide;
+        if (!alloc->HasBeenAnalysed()) {
+          alloc->SetEscaped();
+        } else {
+          DCHECK(alloc->HasEscaped());
+        }
+      }
+    }
+    return ProcessResult::kContinue;
+  }
+
+ private:
+  EscapeAnalysisData& data_;
+  Tracer tracer_;
+};
 
 class CandidateAnalyzer {
  public:
@@ -745,7 +871,11 @@ class CandidateAnalyzer {
   void ProcessPhi(Phi* phi) {
     // TODO(dmercadier): enable merging escape analysis candidates when they
     // flow into Phis.
-    for (int i = 0; i < phi->input_count(); i++) {
+    // When visiting a loop header for the 1st time, the backedge predecessor
+    // has no snapshot yet, and thus no value to look up: its inputs are handled
+    // by CheckLoopPhiInvalidation when reaching the JumpLoop instead.
+    DCHECK_LE(data_.merged_predecessor_count, phi->input_count());
+    for (int i = 0; i < data_.merged_predecessor_count; i++) {
       ValueNode* input = phi->input_node(i);
       // Note the `, i` in the call to MarkAsEscapedIfCandidate: this is the
       // reason for this overload: not all Phi inputs dominate the current block
@@ -846,38 +976,37 @@ class FieldValuesTracker : public CandidateAnalyzer {
       : CandidateAnalyzer(data),
         data_(data),
         block_snapshots_(data.zone),
+        old_phis_(data.zone),
         tracer_(data.compilation_info) {}
 
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
     TRACE("PreProcessBasicBlock " << BLOCK_ID(block));
+    if (block->is_loop()) {
+      data_.loop_stack.push_back({block, false});
+    }
+    old_phis_.clear();
 
     auto new_phis_it = new_phis().find(block);
     if (new_phis_it != new_phis().end()) {
       // We are revisiting this block because of a loop.
       TRACE("> clearing previous new Phis");
-      new_phis_it->second->clear();
+      if (block->is_loop()) {
+        old_phis_.swap(*new_phis_it->second);
+      } else {
+        new_phis_it->second->clear();
+      }
     }
 
-    if (block->is_exception_handler_block()) {
-      // TODO(dmercadier): we would need to compute the state from the
-      // predecessors, but predecessors are not available. For now, we're just
-      // nuking everything. While iterating the graph, we could record exception
-      // handlers predecessor in a side table fairly easily.
-      base::SmallVector<InlinedAllocation*, 8> to_mark_as_escaped;
-      for (auto candidate : data_.candidates) {
-        to_mark_as_escaped.push_back(candidate.first);
-      }
-      for (InlinedAllocation* alloc : to_mark_as_escaped) {
-        data_.MarkAsEscaped(alloc);
-      }
-    }
+    // The PrePass should make escape analysis bail on exception handlers.
+    DCHECK(!block->is_exception_handler_block());
 
     CreateSnapshotFor(block);
 
     return BlockProcessResult::kContinue;
   }
 
-  bool CreateSnapshotFor(BasicBlock* block) {
+  bool CreateSnapshotFor(BasicBlock* block,
+                         bool is_loop_fixpoint_check = false) {
     TRACE("> CreateSnapshotFor " << BLOCK_ID(block));
     DCHECK(field_values().IsSealed());
     base::SmallVector<Snapshot, 4> predecessors_snapshots;
@@ -894,6 +1023,7 @@ class FieldValuesTracker : public CandidateAnalyzer {
     });
 
     int predecessor_count = static_cast<int>(predecessors_snapshots.size());
+    data_.merged_predecessor_count = predecessor_count;
 
     std::optional<MergePointInterpreterFrameState*> state;
     DCHECK_IMPLIES(predecessor_count > 1, block->has_state());
@@ -955,6 +1085,41 @@ class FieldValuesTracker : public CandidateAnalyzer {
         return nullptr;
       }
 
+      // Trying to find an already-created Phi for this field. If we find it, we
+      // reuse it, for 2 reasons:
+      //
+      //   - performance (always): we avoid reallocating a new phi.
+      //
+      //   - correctness / termination (when {is_loop_fixpoint_check} is true):
+      //     if there is already a Phi for this field, we reuse it and do not
+      //     trigger a revisit of the loop. Creating a brand new phi would
+      //     trigger loop revisits forever (since it always sets {need_revisit}
+      //     to true).
+      //
+      // Note that when {is_loop_fixpoint_check} is false (for example, when an
+      // outer loop revisits an inner loop), the forward-edge predecessors of
+      // the inner loop header may have changed across outer-loop iterations.
+      // Therefore, we update any changed inputs on the reused Phi to match the
+      // incoming predecessors.
+      for (auto [phi, other_key] : old_phis_) {
+        if (other_key != key) continue;
+        DCHECK_EQ(phi->input_count(), predecessors.size());
+        bool any_input_changed = false;
+        for (int i = 0; i < phi->input_count(); i++) {
+          if (phi->input_node(i) != predecessors[i]) {
+            DCHECK(!is_loop_fixpoint_check);
+            phi->change_input(i, predecessors[i]);
+            any_input_changed = true;
+          }
+        }
+        DCHECK_IMPLIES(is_loop_fixpoint_check, !any_input_changed);
+        RegisterNewPhi(phi, block, key);
+        if (any_input_changed) {
+          CandidateAnalyzer::ProcessPhi(phi);
+        }
+        return phi;
+      }
+
       DCHECK(state.has_value());
       // The "owner" field of Phis is just used for exception phis late in the
       // Maglev backend (register allocator / code generator), which new Phis
@@ -963,12 +1128,19 @@ class FieldValuesTracker : public CandidateAnalyzer {
       // `Register::invalid_value`.
       constexpr interpreter::Register kFakeOwner =
           interpreter::Register::invalid_value();
+
+      // When visiting a loop with multiple forward edge for the 1st time, we
+      // may need to insert a phi to merge the forward values but we won't have
+      // a backedge value yet. Still, we'll create a valid loop phi with enough
+      // inputs and we'll set itself as backedge input.
+      int phi_input_count =
+          block->is_loop() ? block->predecessor_count() : predecessor_count;
       // TODO(dmercadier): instead of creating a proper Phi (which are 64 bytes
       // long + inputs!), we could have a custom "PseudoPhi" (name tbd)
       // structure that contains the bare minimum and would basically just be a
       // vector of Union(ValueNodes, PseudoPhi)., and only create real Phis in
       // the elider once we're sure that we're going to need them.
-      Phi* phi = NodeBase::New<Phi>(zone(), predecessor_count, state.value(),
+      Phi* phi = NodeBase::New<Phi>(zone(), phi_input_count, state.value(),
                                     kFakeOwner);
 #ifdef V8_ENABLE_MAGLEV_GRAPH_PRINTER
       // TODO(dmercadier): should we register Phis only once we're sure that
@@ -978,6 +1150,10 @@ class FieldValuesTracker : public CandidateAnalyzer {
 #endif
       for (int i = 0; i < predecessor_count; i++) {
         phi->set_input(i, predecessors[i]);
+      }
+      if (block->is_loop() && predecessor_count < phi_input_count) {
+        DCHECK_EQ(predecessor_count, phi_input_count - 1);
+        phi->set_input(phi_input_count - 1, predecessors[0]);
       }
       phi->change_representation(predecessors[0]->value_representation());
       TRACE(">> Created new phi: " << PRINT_NODE(phi));
@@ -999,30 +1175,56 @@ class FieldValuesTracker : public CandidateAnalyzer {
 
   BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
     DCHECK(!field_values().IsSealed());
-    bool already_had_snapshot = block_snapshots_[block].has_value();
-
     Snapshot snapshot = field_values().Seal();
     block_snapshots_[block] = MaybeSnapshot{snapshot};
 
     if (JumpLoop* jump_loop = block->control_node()->TryCast<JumpLoop>()) {
       BasicBlock* loop_header = jump_loop->target();
 
-      if (already_had_snapshot) {
-        // We only consider revisiting the loop once, ie, if the backedge didn't
-        // already have a snapshot.
+      // Loop phis backedges need to be patched in 2 situations:
+      //
+      //   - this is a loop with multiple forward edges that was requiring Phis
+      //     to merge forward values. In that case, during the first visit of
+      //     the loop, this Phi was created with itself as backedge (because it
+      //     needs a backedge value to be a valid loop phi); and we're now
+      //     patching this with the correct value of the backedge.
+      //
+      //   - we have just revisited the loop, and when creating the loop phis
+      //     initially we were using the old backedge value (since it's the only
+      //     one that we had); and we're now patching it with the correct value.
+      //
+      // Note that the fact that a loop phi needs to be patched isn't a reason
+      // to revisit the loop: while visiting the loop, phis are treated as
+      // opaque and we don't make any decisions that depend on the values of
+      // the inputs of a Phi. So, changing the backedge input of loop phis
+      // will not lead to making any different decision when revisiting the
+      // loop.
+      //
+      // Also note that PatchLoopPhisBackedges needs to be called before popping
+      // the current loop from `data_.loop_stack` to ensure that if
+      // `MarkAsEscaped(alloc)` is called inside it, it will find the current
+      // loop on the stack if needed.
+      PatchLoopPhisBackedges(loop_header, snapshot);
 
-        // Note however that the loop header might already have loop phis from
-        // the previous visit, in which case we might need to update them.
-        PatchLoopPhisBackedges(loop_header, snapshot);
+      DCHECK_GT(data_.loop_stack.size(), 1);
+      DCHECK_EQ(data_.loop_stack.back().header, loop_header);
+      bool has_escaped_candidate =
+          data_.loop_stack.back().has_escaped_candidate;
+      data_.loop_stack.pop_back();
 
-        return BlockProcessResult::kContinue;
+      auto prev_header_phis = new_phis().find(loop_header);
+      if (prev_header_phis != new_phis().end()) {
+        old_phis_ = std::move(*prev_header_phis->second);
+        prev_header_phis->second->clear();
       }
 
       // TODO(dmercadier): we could try to reuse the snapshot created by
       // CreateSnapshotFor when revisiting the loop, instead of discarding it
       // and recomputing it afterwards.
-      if (CheckLoopPhiInvalidation(loop_header) ||
-          CreateSnapshotFor(loop_header)) {
+      bool needs_revisit = has_escaped_candidate ||
+                           CheckLoopPhiInvalidation(loop_header) ||
+                           CreateSnapshotFor(loop_header, true);
+      if (needs_revisit) {
         TRACE("> Will revisit loop");
         // Discarding temporary snapshot.
         if (!field_values().IsSealed()) field_values().Seal();
@@ -1033,9 +1235,6 @@ class FieldValuesTracker : public CandidateAnalyzer {
       } else {
         // Discarding temporary snapshot.
         if (!field_values().IsSealed()) field_values().Seal();
-        // Discarding the backedge's snapshot, so that if we're currently in a
-        // nested loop, we can still revisit it if we revisit the outer loop.
-        block_snapshots_.erase(block);
       }
     }
 
@@ -1062,6 +1261,21 @@ class FieldValuesTracker : public CandidateAnalyzer {
       }
 
       ValueNode* backedge_val = field_values().Get(key);
+
+      if (InlinedAllocation* backedge_alloc =
+              data_.TryGetCandidateInlinedAllocation(backedge_val)) {
+        // The backedge is an allocation that flows into a newly created loop
+        // phi (which will be turned into a regular phi during the Elider
+        // phase). We need to mark it as escaping. Note however that this
+        // doesn't need to trigger a revisit of the loop: within the loop, 1)
+        // any decisions make on the fact that {backedge_alloc} can be elided
+        // still holds since it only escapes after the loop and 2) we never make
+        // decisions based on the inputs of Phis, so the fact that the backedge
+        // of {phi} is now escaping doesn't invalidate any decision made in the
+        // loop.
+        data_.MarkAsEscaped(backedge_alloc);
+      }
+
       DCHECK_NOT_NULL(backedge_val);
       TRACE(">> Updating loop phi backedge: "
             << PRINT_NODE(phi) << " backedge "
@@ -1094,6 +1308,11 @@ class FieldValuesTracker : public CandidateAnalyzer {
       }
     }
     return invalidated;
+  }
+  ProcessResult Process(InlinedAllocation* node, const ProcessingState& state) {
+    BasicBlock* current_loop = data_.loop_stack.back().header;
+    data_.alloc_definition_loop[node] = current_loop;
+    return CandidateAnalyzer::Process(node, state);
   }
 
   ProcessResult Process(AssertEscapeAnalysisElided* node,
@@ -1159,13 +1378,55 @@ class FieldValuesTracker : public CandidateAnalyzer {
  private:
   EscapeAnalysisData& data_;
   ZoneAbslFlatHashMap<BasicBlock*, MaybeSnapshot> block_snapshots_;
+
+  // Stores the Phi nodes created at the loop header during the previous
+  // iteration of the loop analysis.
+  //
+  // When merging the loop entry and backedge values on a revisit, we look up
+  // the keys in this vector to reuse the existing Phis (updating their backedge
+  // inputs in-place if they changed) rather than allocating new ones.
+  // This is required to:
+  //   1) Prevent duplicating Phi nodes in the Zone on every revisit.
+  //   2) Ensure the loop analysis converges (otherwise, creating new Phis on
+  //   every merge would trigger infinite loop revisits).
+  //
+  // This must be cleared before analyzing non-loop merges to prevent loop Phis
+  // from being incorrectly reused inside the loop body.
+  ZoneVector<std::pair<Phi*, Key>> old_phis_;
+
   Tracer tracer_;
 };
 
 void EscapeAnalysis::AnalyzeCandidates() {
   TRACE("EscapeAnalysis::AnalyzeCandidates");
-  GraphProcessor<FieldValuesTracker> processor(data_);
-  processor.ProcessGraph(data_.graph);
+
+  // Running a very quick pre-pass over the graph to spot candidates that
+  // definitely escape and that thus don't need to be tracked. This makes the
+  // main analysis faster and in some cases we can even just not run the main
+  // analysis at all because the pre-pass will figure out that all candidates
+  // actually escape.
+  TRACE("Running the prepass...");
+  // TODO(dmercadier): we should run the PrePass with the last processor before
+  // Escape Analysis to save time. To do so, it would be nice if the PrePass
+  // didn't need the EscapeAnalysisData. We can achieve this by not relying on
+  // `data_.candidates` but instead use the HasEscaped bit of InlinedAllocation.
+  GraphProcessor<AnalyzerPrePass> prepass(data_);
+  prepass.ProcessGraph(data_.graph);
+
+  if (!HasElidableCandidates()) {
+    TRACE("> No candidates after the pre-pass; stopping here.");
+    return;
+  }
+
+  TRACE("Running the main analysis...");
+  GraphProcessor<FieldValuesTracker> main_analysis(data_);
+  main_analysis.ProcessGraph(data_.graph);
+
+  // Sanity check: {loop_stack} should be empty (except for its dummy initial
+  // input), since for each loop we should have pushed once at the beginning and
+  // popped once at the end.
+  DCHECK_EQ(data_.loop_stack.size(), 1);
+  DCHECK_EQ(data_.loop_stack.back().header, nullptr);
 
 #ifdef DEBUG
   if (v8_flags.trace_turbolev_escape_analysis) {
@@ -1181,6 +1442,7 @@ void EscapeAnalysis::AnalyzeCandidates() {
 }
 
 bool EscapeAnalysis::HasElidableCandidates() const {
+  if (data_.has_exception_handler) return false;
   for (auto candidate : data_.candidates) {
     if (candidate.second != CandidateStatus::kCannotElide) {
       return true;
@@ -1415,12 +1677,6 @@ class Elider {
       TRACE("> Inserting new phis");
       DCHECK(block->has_state());
       for (auto& [phi, key] : *data_.new_phis.at(block)) {
-        if (data_.HasEscaped(key.data().base)) {
-          // {new_phis} can contain phis for objects that were marked as
-          // escaping while revisiting a loop; we skip those.
-          continue;
-        }
-
         block->AddPhi(phi);
       }
     }
@@ -1611,18 +1867,16 @@ class Elider {
     return ProcessResult::kContinue;
   }
 
-  maglev::ProcessResult Process(maglev::LoadTaggedField* node,
-                                const maglev::ProcessingState& state) {
+  ProcessResult Process(LoadTaggedField* node, const ProcessingState& state) {
     return ProcessLoad(node, node->ValueInput().node(), node->offset());
   }
 
-  maglev::ProcessResult Process(maglev::LoadFloat64* node,
-                                const maglev::ProcessingState& state) {
+  ProcessResult Process(LoadFloat64* node, const ProcessingState& state) {
     return ProcessLoad(node, node->ValueInput().node(), node->offset());
   }
 
-  maglev::ProcessResult Process(maglev::LoadFixedDoubleArrayElement* node,
-                                const maglev::ProcessingState& state) {
+  ProcessResult Process(LoadFixedDoubleArrayElement* node,
+                        const ProcessingState& state) {
     if (Int32Constant* cst =
             node->IndexInput().node()->TryCast<Int32Constant>()) {
       int offset = FixedDoubleArray::OffsetOfElementAt(cst->value());
@@ -1813,11 +2067,21 @@ constexpr bool HasSpecificProcess() {
   return static_cast<Signature>(&T::Process) != &T::template Process<NodeT>;
 }
 
-// Static assertion check for a single node type
-#define CHECK_SYNCHRONIZED_OVERLOAD(NodeT)                                 \
-  static_assert(HasSpecificProcess<CandidateAnalyzer, NodeT>() ==          \
-                    HasSpecificProcess<Elider, NodeT>(),                   \
-                "CandidateAnalyzer and Elider must be synchronized: both " \
+// Static assertion check for a single node type.
+// Note that It's not required for correctness that the AnalyzerPrePass has the
+// same Process overloads as the CandidateAnalyzer, but keeping them in sync
+// makes sure that the pre-pass doesn't wrongly treat an operation as escaping
+// even though it's not.
+// On the other hand, keeping the CandidateAnalyzer and Elider is required for
+// correctness; cf comment at the beginning of this anonymous namespace.
+#define CHECK_SYNCHRONIZED_OVERLOAD(NodeT)                                    \
+  static_assert(HasSpecificProcess<CandidateAnalyzer, NodeT>() ==             \
+                    HasSpecificProcess<AnalyzerPrePass, NodeT>(),             \
+                "CandidateAnalyzer and Elider must be synchronized: both "    \
+                "must either overload or not overload Process(" #NodeT "*)"); \
+  static_assert(HasSpecificProcess<CandidateAnalyzer, NodeT>() ==             \
+                    HasSpecificProcess<Elider, NodeT>(),                      \
+                "CandidateAnalyzer and Elider must be synchronized: both "    \
                 "must either overload or not overload Process(" #NodeT "*)");
 
 // Run the check for all Maglev node types automatically

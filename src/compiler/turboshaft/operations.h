@@ -1363,6 +1363,7 @@ struct FixedArityOperationT : OperationT<Derived> {
   V(word64_reverse_bits, Word64ReverseBits)                \
   V(float32_select, Float32Select)                         \
   V(float64_select, Float64Select)                         \
+  V(float64_min_max, Float64MinMax)                        \
   V(int32_abs_with_overflow, Int32AbsWithOverflow)         \
   V(int64_abs_with_overflow, Int64AbsWithOverflow)         \
   V(word32_rol, Word32Rol)                                 \
@@ -5855,10 +5856,11 @@ struct LoadFieldByIndexOp : FixedArityOperationT<2, LoadFieldByIndexOp> {
   auto options() const { return std::tuple{}; }
 };
 
-struct LoadDictionaryFieldOp : FixedArityOperationT<3, LoadDictionaryFieldOp> {
+struct LoadDictionaryFieldOp : FixedArityOperationT<4, LoadDictionaryFieldOp> {
   InternalIndex index;
   compiler::NameRef name;
   FeedbackSource feedback;
+  bool is_super;
 
   THROWING_OP_BOILERPLATE(RegisterRepresentation::Tagged())
   static constexpr OpEffects effects =
@@ -5866,28 +5868,32 @@ struct LoadDictionaryFieldOp : FixedArityOperationT<3, LoadDictionaryFieldOp> {
 
   base::Vector<const MaybeRegisterRepresentation> inputs_rep(
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
-    return MaybeRepVector<MaybeRegisterRepresentation::Tagged()>();
+    return MaybeRepVector<MaybeRegisterRepresentation::Tagged(),
+                          MaybeRegisterRepresentation::Tagged()>();
   }
 
   V<JSReceiver> object() const { return Base::input<JSReceiver>(0); }
-  V<Context> context() const { return Base::input<Context>(1); }
+  V<Object> receiver() const { return Base::input<Object>(1); }
+  V<Context> context() const { return Base::input<Context>(2); }
   V<LazyFrameState> frame_state() const {
-    return Base::input<LazyFrameState>(2);
+    return Base::input<LazyFrameState>(3);
   }
 
-  LoadDictionaryFieldOp(V<JSReceiver> object, V<Context> context,
-                        V<LazyFrameState> frame_state, size_t index,
-                        compiler::NameRef name, const FeedbackSource& feedback,
+  LoadDictionaryFieldOp(V<JSReceiver> object, V<Object> receiver,
+                        V<Context> context, V<LazyFrameState> frame_state,
+                        size_t index, compiler::NameRef name,
+                        const FeedbackSource& feedback, bool is_super,
                         LazyDeoptOnThrow lazy_deopt_on_throw)
-      : Base(object, context, frame_state),
+      : Base(object, receiver, context, frame_state),
         index(InternalIndex(index)),
         name(name),
         feedback(feedback),
+        is_super(is_super),
         lazy_deopt_on_throw(lazy_deopt_on_throw) {}
 
-  // 3. Add lazy_deopt_on_throw to options()
   auto options() const {
-    return std::tuple{index.raw_value(), name, feedback, lazy_deopt_on_throw};
+    return std::tuple{index.raw_value(), name, feedback, is_super,
+                      lazy_deopt_on_throw};
   }
 };
 
@@ -6237,7 +6243,8 @@ struct TypedArrayLengthOp : FixedArityOperationT<1, TypedArrayLengthOp> {
       // it's pure.
       OpEffects()
           // We rely on the input being a JSTypedArray.
-          .CanDependOnChecks();
+          .CanDependOnChecks()
+          .CanReadMemory();
   base::Vector<const RegisterRepresentation> outputs_rep() const {
     return RepVector<RegisterRepresentation::WordPtr()>();
   }

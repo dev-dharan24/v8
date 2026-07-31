@@ -114,6 +114,7 @@ class RecomputeKnownNodeAspectsProcessor {
 
     if (block->is_exception_handler_block()) {
       known_node_aspects_->ClearAvailableExpressions();
+      known_node_aspects_->ClearTaggedKeyedProperties();
     }
 
     // We might now have more accurate types for phi inputs; recompute the phi
@@ -265,6 +266,9 @@ class RecomputeKnownNodeAspectsProcessor {
   }
 
   V8_NODISCARD ProcessResult RecordType(ValueNode* node, NodeType type);
+  V8_NODISCARD ProcessResult RecordMaps(ValueNode* object,
+                                        const compiler::ZoneRefSet<Map>& maps);
+  V8_NODISCARD ProcessResult OnContradiction();
 
   void Merge(BasicBlock* block) {
     while (block->is_edge_split_block()) {
@@ -316,9 +320,6 @@ class RecomputeKnownNodeAspectsProcessor {
   V(CheckedFloat64ToInt32, int32, Number)                                  \
   V(CheckedHoleyFloat64ToInt32, int32, Number)                             \
   V(CheckedNumberToInt32, int32, Number)                                   \
-  /* TODO(victorgomes): pass node->conversion_type() rather than always */ \
-  /* NumberOrOddball for CheckedNumberOrOddballToFloat64. */               \
-  V(CheckedNumberOrOddballToFloat64, float64, NumberOrOddball)             \
   V(CheckedNumberToFloat64, float64, Number)                               \
   V(CheckedHoleyFloat64ToFloat64, float64, Number)                         \
   V(ChangeInt32ToFloat64, float64, Number)                                 \
@@ -329,6 +330,10 @@ class RecomputeKnownNodeAspectsProcessor {
 
   SAFE_CONVERSION_LIST(DECLARE_ProcessNode)
 #undef DECLARE_ProcessNode
+
+  ProcessResult ProcessNode(CheckedNumberOrOddballToFloat64* node);
+  ProcessResult ProcessNode(UnsafeNumberOrOddballToFloat64* node);
+  ProcessResult ProcessNode(HoleyFloat64ToSilencedFloat64* node);
 
 // TODO(victorgomes): Ideally we would like to check we already know the type,
 // but currently we cannot. The issue is that if the GraphBuilder emits a
@@ -356,12 +361,36 @@ class RecomputeKnownNodeAspectsProcessor {
   PROCESS_UNSAFE_CONV(UnsafeFloat64ToInt32, int32, Number)
   PROCESS_UNSAFE_CONV(UnsafeHoleyFloat64ToInt32, int32, Number)
   PROCESS_UNSAFE_CONV(ChangeIntPtrToFloat64, float64, Number)
-  PROCESS_UNSAFE_CONV(UnsafeNumberOrOddballToFloat64, float64, NumberOrOddball)
   PROCESS_UNSAFE_CONV(UnsafeNumberToFloat64, float64, Number)
-  PROCESS_UNSAFE_CONV(HoleyFloat64ToSilencedFloat64, float64, Number)
+  // Note: NumberOrOddball->Float64 conversions (such as
+  // UnsafeNumberOrOddballToFloat64 and HoleyFloat64ToSilencedFloat64) lose
+  // oddball identity and are promoted to float64 alternative by explicit
+  // handlers if and only if KNA has statically proven the input is strictly
+  // NodeType::kNumber without oddballs.
 #undef PROCESS_UNSAFE_CONV
 
+  ProcessResult ProcessNode(CheckMaps* node) {
+    // Re-establish map knowledge implied by an emitted check, so that later
+    // phases re-running check building (e.g. the graph optimizer) do not
+    // pessimize checks that the graph builder could fold.
+    return RecordMaps(node->ReceiverInput().node(), node->maps());
+  }
+
   ProcessResult ProcessNode(LoadTaggedField* node) {
+    // Re-establish the static type recorded at graph building time (field
+    // representation / stable field map derived).
+    if (node->type() != NodeType::kUnknown) {
+      ProcessResult result = RecordType(node, node->type());
+      if (result != ProcessResult::kContinue) return result;
+    }
+    if (node->stable_field_map().has_value()) {
+      compiler::MapRef map = node->stable_field_map().value();
+      if (!GetOrCreateInfoFor(node)->SetPossibleMaps(
+              PossibleMaps{map}, false, StaticTypeForMap(map, broker()),
+              broker(), known_node_aspects())) {
+        return OnContradiction();
+      }
+    }
     if (!node->property_key().is_none()) {
       auto& props_for_key = known_node_aspects().GetLoadedPropertiesForKey(
           zone(), node->is_const(), node->property_key());
@@ -370,17 +399,25 @@ class RecomputeKnownNodeAspectsProcessor {
     return ProcessResult::kContinue;
   }
 
+  ProcessResult ProcessNode(LoadFixedArrayElement* node) {
+    known_node_aspects().RecordTaggedKeyedProperty(
+        node->ElementsInput().node(), node->IndexInput().node(), node);
+    return ProcessResult::kContinue;
+  }
+
   ProcessResult ProcessNode(LoadDataViewByteLength* node) {
+    bool is_const = !v8_flags.track_array_buffer_views;
     auto& props_for_key = known_node_aspects().GetLoadedPropertiesForKey(
-        zone(), true, PropertyKey::ArrayBufferViewByteLength());
+        zone(), is_const, PropertyKey::ArrayBufferViewByteLength());
     props_for_key[node->ValueInput().node()] = node;
     return ProcessResult::kContinue;
   }
 
   ProcessResult ProcessNode(LoadTypedArrayLength* node) {
     if (!IsRabGsabTypedArrayElementsKind(node->elements_kind())) {
+      bool is_const = !v8_flags.track_array_buffer_views;
       auto& props_for_key = known_node_aspects().GetLoadedPropertiesForKey(
-          zone(), true, PropertyKey::TypedArrayLength());
+          zone(), is_const, PropertyKey::TypedArrayLength());
       props_for_key[node->ValueInput().node()] = node;
     }
     return ProcessResult::kContinue;
@@ -479,6 +516,12 @@ class RecomputeKnownNodeAspectsProcessor {
 
   ProcessResult ProcessNode(AssumeType* node) {
     return RecordType(node->input_node(0), node->asserted_type());
+  }
+
+  ProcessResult ProcessNode(CheckInt32IsSmi* node) {
+    NodeInfo* info = GetOrCreateInfoFor(node->input_node(0));
+    info->IntersectType(NodeType::kSmi);
+    return ProcessResult::kContinue;
   }
 
   ProcessResult ProcessNode(Node* node) { return ProcessResult::kContinue; }

@@ -261,14 +261,18 @@ WasmInterpreterThreadMap* WasmInterpreterThread::thread_interpreter_map_s =
 WasmInterpreterThread* WasmInterpreterThreadMap::GetCurrentInterpreterThread(
     Isolate* isolate) {
   const int current_thread_id = ThreadId::Current().ToInteger();
+  // Key by both the OS thread id and the isolate: the same OS thread can run
+  // wasm for different isolates over time (v8::Locker multiplexing), and each
+  // isolate needs its own WasmInterpreterThread so that isolate_,
+  // reference_stack_ and stack_mem_ are never reused across isolates.
+  const std::pair<int, Isolate*> key(current_thread_id, isolate);
   {
     base::MutexGuard guard(&mutex_);
 
-    auto it = map_.find(current_thread_id);
+    auto it = map_.find(key);
     if (it == map_.end()) {
-      map_[current_thread_id] =
-          std::make_unique<WasmInterpreterThread>(isolate);
-      it = map_.find(current_thread_id);
+      map_[key] = std::make_unique<WasmInterpreterThread>(isolate);
+      it = map_.find(key);
     }
     return it->second.get();
   }
@@ -720,12 +724,12 @@ void InitInstructionTableOnce(Isolate* isolate) {
 WasmInterpreter::WasmInterpreter(
     Isolate* isolate, const WasmModule* module,
     const ModuleWireBytes& wire_bytes,
-    DirectHandle<WasmInstanceObject> instance_object)
+    DirectHandle<WasmTrustedInstanceData> trusted_data)
     : zone_(isolate->allocator(), ZONE_NAME),
       module_bytes_(wire_bytes.start(), wire_bytes.end(), &zone_),
       codemap_(isolate, module, module_bytes_.data(), &zone_) {
   wasm_runtime_ = std::make_shared<WasmInterpreterRuntime>(
-      module, isolate, instance_object, &codemap_);
+      module, isolate, trusted_data, &codemap_);
   module->SetWasmInterpreter(wasm_runtime_);
 
 #if !defined(V8_DRUMBRAKE_BOUNDS_CHECKS)
@@ -9438,24 +9442,6 @@ bool WasmBytecodeGenerator::HasSideEffects(WasmOpcode opcode) {
     case kExprNopForTestingUnsupportedInLiftoff:
     case kExprTryTable:
     case kExprThrowRef:
-    case kExprF64Acos:
-    case kExprF64Asin:
-    case kExprF64Atan:
-    case kExprF64Atan2:
-    case kExprF64Cos:
-    case kExprF64Sin:
-    case kExprF64Tan:
-    case kExprF64Exp:
-    case kExprF64Log:
-    case kExprF64Pow:  // 0xdc - 0xe6
-    case kExprI32AsmjsDivS:
-    case kExprI32AsmjsDivU:
-    case kExprI32AsmjsRemS:
-    case kExprI32AsmjsRemU:
-    case kExprI32AsmjsSConvertF32:
-    case kExprI32AsmjsUConvertF32:
-    case kExprI32AsmjsSConvertF64:
-    case kExprI32AsmjsUConvertF64:  // 0xe7 - 0xfa
     case kExprRefCastNop:
 
     // StringRef

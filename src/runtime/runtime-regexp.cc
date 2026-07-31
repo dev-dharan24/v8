@@ -15,6 +15,7 @@
 #include "src/numbers/conversions-inl.h"
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-regexp-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/regexp/regexp-utils.h"
 #include "src/regexp/regexp.h"
 #include "src/strings/string-builder-inl.h"
@@ -840,8 +841,6 @@ StringReplaceGlobalRegExpWithEmptyString(
   // freshly allocated page or on an already swept page. Hence, the sweeper
   // thread can not get confused with the filler creation. No synchronization
   // needed.
-  // TODO(hpayer): We should shrink the large object page if the size
-  // of the object changed significantly.
   if (!HeapLayout::InAnyLargeSpace(*answer)) {
     heap->CreateFillerObjectAt(end_of_string, delta);
   }

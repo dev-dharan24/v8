@@ -2293,8 +2293,9 @@ class GraphBuildingNodeProcessor {
 
     ThrowingScope throwing_scope(this, node);
     V<Object> result = __ LoadDictionaryField(
-        object, context, frame_state, dictionary_index.raw_value(),
-        node->name(), feedback, ShouldLazyDeoptOnThrow(node));
+        object, Map(node->ReceiverInput()), context, frame_state,
+        dictionary_index.raw_value(), node->name(), feedback, node->is_super(),
+        ShouldLazyDeoptOnThrow(node));
     SetMap(node, result);
     return maglev::ProcessResult::kContinue;
   }
@@ -3173,9 +3174,10 @@ class GraphBuildingNodeProcessor {
     ThrowingScope throwing_scope(this, node);
 
     GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
-    SetMap(node, __ HasInPrototypeChain(
-                     Map(node->ValueInput()), node->prototype(), frame_state,
-                     native_context(), ShouldLazyDeoptOnThrow(node)));
+    SetMap(node, __ HasInPrototypeChain(Map(node->ObjectInput()),
+                                        Map(node->PrototypeInput()),
+                                        frame_state, native_context(),
+                                        ShouldLazyDeoptOnThrow(node)));
     return maglev::ProcessResult::kContinue;
   }
 
@@ -3460,11 +3462,15 @@ class GraphBuildingNodeProcessor {
   }
   maglev::ProcessResult Process(maglev::LoadTaggedField* node,
                                 const maglev::ProcessingState& state) {
-    MemoryRepresentation mem_repr = MemoryRepresentation::AnyTagged();
-    if (node->type() == maglev::NodeType::kSmi) {
-      mem_repr = MemoryRepresentation::TaggedSigned();
+    maglev::ProcessResult result = ProcessAbstractLoadTaggedField(
+        node, TaggedMemoryRepresentation(node->type()));
+    if (node->stable_field_map().has_value()) {
+      // Propagate the field's stable map so that LateLoadElimination knows
+      // the map of the loaded value.
+      __ AssumeMap(Map(node), compiler::ZoneRefSet<i::Map>(
+                                  node->stable_field_map().value()));
     }
-    return ProcessAbstractLoadTaggedField(node, mem_repr);
+    return result;
   }
   maglev::ProcessResult Process(maglev::LoadContextSlotNoCells* node,
                                 const maglev::ProcessingState& state) {
@@ -3572,22 +3578,44 @@ class GraphBuildingNodeProcessor {
   }
 #endif  // V8_ENABLE_UNDEFINED_DOUBLE
 
+  // Maps a maglev static type to the memory representation of a tagged
+  // field access.
+  MemoryRepresentation TaggedMemoryRepresentation(maglev::NodeType type) {
+    if (maglev::NodeTypeIs(type, maglev::NodeType::kSmi)) {
+      return MemoryRepresentation::TaggedSigned();
+    }
+    if (maglev::NodeTypeIs(type, maglev::NodeType::kAnyHeapObject)) {
+      return MemoryRepresentation::TaggedPointer();
+    }
+    return MemoryRepresentation::AnyTagged();
+  }
+  WriteBarrierKind WriteBarrierKindFor(MemoryRepresentation mem_repr) {
+    if (mem_repr == MemoryRepresentation::TaggedSigned()) {
+      return WriteBarrierKind::kNoWriteBarrier;
+    }
+    if (mem_repr == MemoryRepresentation::TaggedPointer()) {
+      return WriteBarrierKind::kPointerWriteBarrier;
+    }
+    DCHECK(mem_repr == MemoryRepresentation::AnyTagged());
+    return WriteBarrierKind::kFullWriteBarrier;
+  }
   maglev::ProcessResult Process(maglev::StoreTaggedFieldNoWriteBarrier* node,
                                 const maglev::ProcessingState& state) {
     __ Store(Map(node->ObjectInput()), Map(node->ValueInput()),
-             StoreOp::Kind::TaggedBase(), MemoryRepresentation::AnyTagged(),
+             StoreOp::Kind::TaggedBase(),
+             TaggedMemoryRepresentation(
+                 node->ValueInput().node()->GetStaticType(broker_)),
              WriteBarrierKind::kNoWriteBarrier, node->offset(),
              node->initializing_or_transitioning());
     return maglev::ProcessResult::kContinue;
   }
   maglev::ProcessResult Process(maglev::StoreTaggedFieldWithWriteBarrier* node,
                                 const maglev::ProcessingState& state) {
-    WriteBarrierKind write_barrier =
-        node->value_can_be_smi() ? WriteBarrierKind::kFullWriteBarrier
-                                 : WriteBarrierKind::kPointerWriteBarrier;
+    MemoryRepresentation mem_repr = TaggedMemoryRepresentation(
+        node->ValueInput().node()->GetStaticType(broker_));
     __ Store(Map(node->ObjectInput()), Map(node->ValueInput()),
-             StoreOp::Kind::TaggedBase(), MemoryRepresentation::AnyTagged(),
-             write_barrier, node->offset(),
+             StoreOp::Kind::TaggedBase(), mem_repr,
+             WriteBarrierKindFor(mem_repr), node->offset(),
              node->initializing_or_transitioning());
     return maglev::ProcessResult::kContinue;
   }
@@ -4042,6 +4070,13 @@ class GraphBuildingNodeProcessor {
     V<Word32> bool_res =
         ConvertCompare<Float64>(node->LeftInput(), node->RightInput(),
                                 node->operation(), Sign::kSigned);
+    SetMap(node, ConvertWord32ToJSBool(bool_res));
+    return maglev::ProcessResult::kContinue;
+  }
+  maglev::ProcessResult Process(maglev::Float64SameValue* node,
+                                const maglev::ProcessingState& state) {
+    V<Word32> bool_res =
+        __ Float64SameValue(Map(node->LeftInput()), Map(node->RightInput()));
     SetMap(node, ConvertWord32ToJSBool(bool_res));
     return maglev::ProcessResult::kContinue;
   }
@@ -5570,6 +5605,17 @@ class GraphBuildingNodeProcessor {
     return result;
   }
   V<Word32> Float64ToUint8Clamped(V<Float64> value) {
+    if (SupportedOperations::float64_min_max()) {
+      // ToUint8Clamp, branchless: clamp to [0, 255], round ties to even,
+      // truncate. NaN is correct with either NaN semantics of Float64Min/Max:
+      // if it propagates through the clamping, JSTruncateFloat64ToWord32 maps
+      // it to 0; if min/max ignore it, it was already clamped to 0.
+      V<Float64> clamped = __ Float64Min(__ Float64Max(value, kMinClampedUint8),
+                                         kMaxClampedUint8);
+      return __ JSTruncateFloat64ToWord32(__ Float64RoundTiesEven(clamped));
+    }
+    // Without native Float64Min/Max, the branchless version lowers to a long
+    // branchy sequence; use an explicit comparison chain instead.
     ScopedVar<Word32, AssemblerT> result(this);
     IF (__ Float64LessThan(value, kMinClampedUint8)) {
       result = __ Word32Constant(kMinClampedUint8);
@@ -6286,8 +6332,7 @@ class GraphBuildingNodeProcessor {
     DCHECK(!node->Is<maglev::VirtualObject>());
     if (const maglev::InlinedAllocation* alloc =
             node->TryCast<maglev::InlinedAllocation>()) {
-      DCHECK(alloc->HasBeenAnalysed());
-      if (alloc->HasBeenElided()) {
+      if (alloc->HasBeenAnalysed() && alloc->HasBeenElided()) {
         AddVirtualObjectInput(builder, virtual_objects,
                               virtual_objects.FindAllocatedWith(alloc));
         return;

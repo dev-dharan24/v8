@@ -72,6 +72,7 @@
 #include "src/objects/megadom-handler-inl.h"
 #include "src/objects/microtask-inl.h"
 #include "src/objects/module-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-body-descriptors-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/promise-inl.h"
@@ -2120,7 +2121,7 @@ int HeapObject::SizeFromMap(Tagged<Map> map) const {
   }
   if (instance_type == FEEDBACK_VECTOR_TYPE) {
     return FeedbackVector::SizeFor(
-        UncheckedCast<FeedbackVector>(this)->length());
+        UncheckedCast<FeedbackVector>(this)->length().value());
   }
   if (instance_type == BIGINT_TYPE) {
     return BigInt::SizeFor(UncheckedCast<BigInt>(this)->length());

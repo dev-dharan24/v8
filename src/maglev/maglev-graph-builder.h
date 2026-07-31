@@ -47,12 +47,14 @@ namespace internal {
 namespace maglev {
 
 class CallArguments;
+class MaglevGraphBuilder;
 
 template <typename ReducerT>
 class MapInference;
 
 struct CatchBlockDetails {
   BasicBlockRef* ref = nullptr;
+  MaglevGraphBuilder* handler_builder = nullptr;
   bool exception_handler_was_used = false;
   bool block_already_exists = false;
   int deopt_frame_distance = 0;
@@ -640,6 +642,10 @@ class MaglevGraphBuilder {
     return reducer_.GetCheckType(type);
   }
 
+  ReduceResult BuildAbort(AbortReason reason) {
+    return reducer_.BuildAbort(reason);
+  }
+
   std::optional<int32_t> TryGetInt32Constant(ValueNode* value);
   std::optional<uint32_t> TryGetUint32Constant(ValueNode* value);
   std::optional<Float64> TryGetFloat64OrHoleyFloat64Constant(
@@ -1214,9 +1220,10 @@ class MaglevGraphBuilder {
   ReduceResult BuildLoadTaggedField(
       ValueNode* object, uint32_t offset, NodeType type = NodeType::kUnknown,
       bool is_const = false, PropertyKey key = PropertyKey::None(),
-      IsArrayLength is_array_length = IsArrayLength::kNo) {
+      IsArrayLength is_array_length = IsArrayLength::kNo,
+      compiler::OptionalMapRef stable_field_map = {}) {
     return reducer_.BuildLoadTaggedField(object, offset, type, is_const, key,
-                                         is_array_length);
+                                         is_array_length, stable_field_map);
   }
 
   ReduceResult BuildStoreTaggedField(
@@ -1315,7 +1322,9 @@ class MaglevGraphBuilder {
 
   ValueNode* BuildLoadFixedArrayLength(ValueNode* fixed_array);
   ReduceResult BuildLoadJSArrayLength(ValueNode* js_array,
-                                      NodeType length_type = NodeType::kSmi);
+                                      NodeType length_type = NodeType::kSmi) {
+    return reducer_.BuildLoadJSArrayLength(js_array, length_type);
+  }
   ReduceResult BuildLoadJSDataViewByteLength(ValueNode* js_data_view);
   ReduceResult BuildLoadJSDataViewDataPointer(ValueNode* js_data_view);
   ReduceResult BuildLoadElements(
@@ -1457,7 +1466,9 @@ class MaglevGraphBuilder {
   // side effects, record its value, and allow that value to be reused on
   // subsequent loads.
   MaybeReduceResult TryReuseKnownPropertyLoad(ValueNode* lookup_start_object,
-                                              compiler::NameRef name);
+                                              compiler::NameRef name) {
+    return reducer_.TryReuseKnownPropertyLoad(lookup_start_object, name);
+  }
   ReduceResult BuildLoadStringLength(ValueNode* string);
 
   // Converts the input node to a representation that's valid to store into an
@@ -1582,8 +1593,12 @@ class MaglevGraphBuilder {
   bool HasValidInitialMap(compiler::JSFunctionRef new_target,
                           compiler::JSFunctionRef constructor);
 
-  ReduceResult BuildTaggedEqual(ValueNode* lhs, ValueNode* rhs);
-  ReduceResult BuildTaggedEqual(ValueNode* lhs, RootIndex rhs_index);
+  ReduceResult BuildTaggedEqual(ValueNode* lhs, ValueNode* rhs) {
+    return reducer_.BuildTaggedEqual(lhs, rhs);
+  }
+  ReduceResult BuildTaggedEqual(ValueNode* lhs, RootIndex rhs_index) {
+    return reducer_.BuildTaggedEqual(lhs, rhs_index);
+  }
 
   using BranchResult = ::v8::internal::maglev::BranchResult;
   using BranchType = ::v8::internal::maglev::BranchType;
@@ -1966,6 +1981,12 @@ void MaglevGraphBuilder::MarkPossibleSideEffect(NodeT* node) {
       if (node->template Cast<StoreMap>()->is_transitioning()) {
         loop_effects_->unstable_aspects_cleared = true;
       }
+    } else if constexpr (std::is_same_v<NodeT, TransitionElementsKind> ||
+                         std::is_same_v<NodeT,
+                                        TransitionElementsKindOrCheckMap>) {
+      // Elements-kind transitions only invalidate unstable map facts and
+      // cached elements of objects that may hold a source map.
+      loop_effects_->elements_kind_transitioned = true;
     } else if constexpr (!IsSimpleFieldStore(Node::opcode_of<NodeT>) &&
                          !IsTypedArrayStore(Node::opcode_of<NodeT>)) {
       loop_effects_->unstable_aspects_cleared = true;

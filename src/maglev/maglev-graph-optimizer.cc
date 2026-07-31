@@ -459,8 +459,9 @@ std::optional<Range> MaglevGraphOptimizer::GetRange(ValueNode* node) {
   return refined.is_empty() ? range : refined;
 }
 
-void MaglevGraphOptimizer::RecordBoundsCheckRefinement(ValueNode* index,
-                                                       ValueNode* length) {
+void MaglevGraphOptimizer::RecordBoundsCheckRefinement(
+    AssertCondition condition, ValueNode* index, ValueNode* length) {
+  if (condition != AssertCondition::kUnsignedLessThan) return;
   if (!ranges_) return;
   if (IsConstantNode(index->opcode())) return;
   Range length_range = ranges_->Get(reducer_.current_block(), length);
@@ -880,7 +881,7 @@ ProcessResult MaglevGraphOptimizer::VisitCheckInt32Condition(
     }
   }
 
-  RecordBoundsCheckRefinement(lhs, rhs);
+  RecordBoundsCheckRefinement(node->condition(), lhs, rhs);
   return ProcessResult::kContinue;
 }
 
@@ -1547,9 +1548,9 @@ ProcessResult MaglevGraphOptimizer::VisitCall(Call* node,
     int depth = node->exception_handler_info()->ShouldLazyDeopt()
                     ? 0
                     : node->exception_handler_info()->depth() + 1;
-    catch_details = {node->exception_handler_info()->catch_block_ref_address(),
-                     !node->exception_handler_info()->ShouldLazyDeopt(), true,
-                     depth};
+    catch_details = {
+        node->exception_handler_info()->catch_block_ref_address(), nullptr,
+        !node->exception_handler_info()->ShouldLazyDeopt(), true, depth};
   }
 
   int bytecode_length = shared.GetBytecodeArray(broker()).length();
@@ -1849,8 +1850,12 @@ ProcessResult MaglevGraphOptimizer::VisitGetTemplateObject(
 
 ProcessResult MaglevGraphOptimizer::VisitHasInPrototypeChain(
     HasInPrototypeChain* node, const ProcessingState& state) {
-  REPLACE_AND_RETURN_IF_DONE(reducer_.TryBuildFastHasInPrototypeChain(
-      node->input_node(0), node->prototype()));
+  if (compiler::OptionalHeapObjectRef prototype =
+          reducer_.TryGetConstant<HeapObject>(
+              node->input_node(HasInPrototypeChain::kPrototypeIndex))) {
+    REPLACE_AND_RETURN_IF_DONE(reducer_.TryBuildFastHasInPrototypeChain(
+        node->input_node(HasInPrototypeChain::kObjectIndex), *prototype));
+  }
   return ProcessResult::kContinue;
 }
 
@@ -1939,6 +1944,13 @@ ProcessResult MaglevGraphOptimizer::VisitLoadFixedArrayElement(
     REPLACE_AND_RETURN_IF_DONE(
         reducer_.TryBuildLoadFixedArrayElementConstantIndex(
             node->ElementsInput().node(), cst.value(), node->load_type()));
+  }
+  if (LoadFixedArrayElement* cached =
+          known_node_aspects().TryFindTaggedKeyedProperty(
+              node->ElementsInput().node(), node->IndexInput().node())) {
+    if (cached != node && cached->load_type() == node->load_type()) {
+      return ReplaceWith(cached);
+    }
   }
   return ProcessResult::kContinue;
 }
@@ -3178,6 +3190,22 @@ ProcessResult MaglevGraphOptimizer::VisitFloat64Compare(
     return ReplaceWith(reducer_.GetBooleanConstant(result.value()));
   }
   return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitFloat64SameValue(
+    Float64SameValue* node, const ProcessingState& state) {
+  auto left = reducer_.TryGetFloat64OrHoleyFloat64Constant(
+      UseRepresentation::kFloat64, node->input_node(0),
+      TaggedToFloat64ConversionType::kOnlyNumber);
+  if (!left) return ProcessResult::kContinue;
+
+  auto right = reducer_.TryGetFloat64OrHoleyFloat64Constant(
+      UseRepresentation::kFloat64, node->input_node(1),
+      TaggedToFloat64ConversionType::kOnlyNumber);
+  if (!right) return ProcessResult::kContinue;
+
+  return ReplaceWith(reducer_.GetBooleanConstant(
+      Object::SameNumberValue(left->get_scalar(), right->get_scalar())));
 }
 
 ProcessResult MaglevGraphOptimizer::VisitFloat64ToBoolean(

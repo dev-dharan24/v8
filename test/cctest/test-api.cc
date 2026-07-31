@@ -82,6 +82,7 @@
 #include "src/objects/js-promise-inl.h"
 #include "src/objects/lookup.h"
 #include "src/objects/map-updater.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/string-inl.h"
 #include "src/objects/synthetic-module-inl.h"
@@ -16301,39 +16302,6 @@ THREADED_TEST(ScriptContextDependence) {
            101);
 }
 
-#if V8_ENABLE_WEBASSEMBLY
-static int asm_warning_triggered = 0;
-
-static void AsmJsWarningListener(v8::Local<v8::Message> message,
-                                 v8::Local<Value>) {
-  CHECK_EQ(v8::Isolate::kMessageWarning, message->ErrorLevel());
-  asm_warning_triggered = 1;
-}
-
-TEST(AsmJsWarning) {
-  i::v8_flags.validate_asm = true;
-  if (i::v8_flags.suppress_asm_messages) return;
-
-  LocalContext env;
-  v8::Isolate* isolate = env.isolate();
-  v8::HandleScope scope(isolate);
-
-  asm_warning_triggered = 0;
-  isolate->AddMessageListenerWithErrorLevel(AsmJsWarningListener,
-                                            v8::Isolate::kMessageAll);
-  CompileRun(
-      "function module() {\n"
-      "  'use asm';\n"
-      "  var x = 'hi';\n"
-      "  return {};\n"
-      "}\n"
-      "module();");
-  int kExpectedWarnings = 1;
-  CHECK_EQ(kExpectedWarnings, asm_warning_triggered);
-  isolate->RemoveMessageListeners(AsmJsWarningListener);
-}
-#endif  // V8_ENABLE_WEBASSEMBLY
-
 static int error_level_message_count = 0;
 static int expected_error_level = 0;
 
@@ -16369,7 +16337,7 @@ TEST(ErrorLevelWarning) {
         v8::base::StaticCharVector("test")));
     i::DirectHandle<i::JSMessageObject> message =
         i::MessageHandler::MakeMessageObject(
-            i_isolate, i::MessageTemplate::kAsmJsInvalid, &location, msg);
+            i_isolate, i::MessageTemplate::kDataCloneError, &location, msg);
     message->set_error_level(levels[i]);
     expected_error_level = levels[i];
     i::MessageHandler::ReportMessage(i_isolate, &location, message);
@@ -17822,8 +17790,7 @@ UNINITIALIZED_TEST(GetHeapTotalAllocatedBytesSharedSpaces) {
                                                i::AllocationType::kSharedOld);
     USE(shared_alloc);
     i::Handle<i::TrustedFixedArray> shared_trusted_alloc =
-        i_isolate->factory()->NewTrustedFixedArray(
-            number_of_elements, i::AllocationType::kSharedTrusted);
+        i_isolate->factory()->NewTrustedFixedArray(number_of_elements);
     USE(shared_trusted_alloc);
     i::MaybeHandle<i::FixedArray> shared_lo_alloc =
         i_isolate->factory()->TryNewFixedArray(lo_number_of_elements,
@@ -26238,6 +26205,56 @@ TEST(FutexInterruption) {
       "Atomics.wait(i32a, 0, 0);");
   CHECK(try_catch.HasTerminated());
   timeout_thread.Join();
+}
+
+namespace {
+class ReentrantWaitThread : public v8::base::Thread {
+ public:
+  explicit ReentrantWaitThread(v8::Isolate* isolate)
+      : Thread(Options("ReentrantWaitThread")), isolate_(isolate) {}
+
+  static void InterruptCallback(v8::Isolate* isolate, void* data) {
+    v8::HandleScope scope(isolate);
+    v8::TryCatch try_catch(isolate);
+    CompileRun(
+        "var sab2 = new SharedArrayBuffer(4);"
+        "var i32a2 = new Int32Array(sab2);"
+        "Atomics.wait(i32a2, 0, 0, 10);");
+
+    CHECK(try_catch.HasCaught());
+    v8::String::Utf8Value exception_msg(isolate, try_catch.Exception());
+    CHECK_NOT_NULL(strstr(*exception_msg, "cannot be called in this context"));
+  }
+
+  void Run() override {
+    i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate_);
+    // Wait until main thread enters WaitSyncImpl and marks node->waiting_ =
+    // true
+    while (!i_isolate->futex_wait_list_node()->IsWaiting()) {
+      v8::base::OS::Sleep(v8::base::TimeDelta::FromMilliseconds(1));
+    }
+    isolate_->RequestInterrupt(InterruptCallback, nullptr);
+  }
+
+ private:
+  v8::Isolate* isolate_;
+};
+}  // namespace
+
+TEST(FutexReentrantWait) {
+  v8::Isolate* isolate = CcTest::isolate();
+  v8::HandleScope scope(isolate);
+  LocalContext env;
+
+  ReentrantWaitThread thread(isolate);
+  CHECK(thread.Start());
+
+  CompileRun(
+      "var ab = new SharedArrayBuffer(4);"
+      "var i32a = new Int32Array(ab);"
+      "Atomics.wait(i32a, 0, 0, 500);");
+
+  thread.Join();
 }
 
 TEST(StackCheckTermination) {

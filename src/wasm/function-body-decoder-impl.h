@@ -62,7 +62,6 @@ V8_INLINE bool ValidateAssumeTrue(bool condition, const char* message) {
 #endif
 
 #define CHECK_PROTOTYPE_OPCODE(feat)                                          \
-  DCHECK(this->module_->origin == kWasmOrigin);                               \
   if (!VALIDATE(this->enabled_.has_##feat())) {                               \
     this->DecodeError("Invalid opcode 0x%02x (enable with --wasm-" #feat ")", \
                       opcode);                                                \
@@ -1093,7 +1092,7 @@ struct MemoryAccessImmediate {
                                   ValidationTag = {}) {
     // Check for the fast path (two single-byte LEBs, mem index 0).
     const bool two_bytes = !ValidationTag::validate || decoder->end() - pc >= 2;
-    const bool use_fast_path = two_bytes && !(pc[0] & 0xe0) && !(pc[1] & 0x80);
+    const bool use_fast_path = two_bytes && !(pc[0] & 0xd0) && !(pc[1] & 0x80);
     if (V8_LIKELY(use_fast_path)) {
       alignment = pc[0];
       mem_index = 0;
@@ -1138,7 +1137,7 @@ struct MemoryAccessImmediate {
       mem_index = 0;
     }
 
-    if (alignment & 0x20) {
+    if (alignment & 0x10) {
       if (!acquire_release_enabled) {
         DecodeError<ValidationTag>(decoder, pc,
                                    "invalid memory ordering: acquire-release "
@@ -1148,7 +1147,7 @@ struct MemoryAccessImmediate {
             decoder, pc,
             "memory ordering immediate invalid on non-atomic operation");
       } else {
-        alignment &= ~0x20;
+        alignment &= ~0x10;
         uint8_t order_imm =
             decoder->read_u8<ValidationTag>(pc + length, "memory order");
         length++;
@@ -2743,20 +2742,6 @@ class WasmDecoder : public Decoder {
             return length;
         }
       }
-      case kAsmJsPrefix: {
-        uint32_t length;
-        std::tie(opcode, length) =
-            decoder->read_prefixed_opcode<ValidationTag>(pc);
-        switch (opcode) {
-          FOREACH_ASMJS_COMPAT_OPCODE(DECLARE_OPCODE_CASE)
-          return length;
-          default:
-            // This path is only possible if we are validating.
-            V8_ASSUME(ValidationTag::validate);
-            decoder->DecodeError(pc, "invalid opcode");
-            return length;
-        }
-      }
       case kSimdPrefix: {
         uint32_t length;
         std::tie(opcode, length) =
@@ -3074,7 +3059,6 @@ class WasmDecoder : public Decoder {
       FOREACH_ATOMIC_0_OPERAND_OPCODE(DECLARE_OPCODE_CASE)
       FOREACH_GC_OPCODE(DECLARE_OPCODE_CASE)
       FOREACH_ATOMIC_GC_OPCODE(DECLARE_OPCODE_CASE)
-      FOREACH_ASMJS_COMPAT_OPCODE(DECLARE_OPCODE_CASE)
         UNREACHABLE();
       // clang-format on
 #undef DECLARE_OPCODE_CASE
@@ -4470,8 +4454,6 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
   DECODE(StoreMem) { return DecodeStoreMem(GetStoreType(opcode)); }
 
   DECODE(MemoryGrow) {
-    // This opcode will not be emitted by the asm translator.
-    DCHECK_EQ(kWasmOrigin, this->module_->origin);
     MemoryIndexImmediate imm(this, this->pc_ + 1, validate);
     if (!this->Validate(this->pc_ + 1, imm)) return 0;
     ValueType mem_type = MemoryAddressType(imm.memory);
@@ -5070,14 +5052,6 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
     return DecodeNumericOpcode(full_opcode, opcode_length);
   }
 
-  DECODE(AsmJs) {
-    auto [full_opcode, opcode_length] =
-        this->template read_prefixed_opcode<ValidationTag>(this->pc_,
-                                                           "asmjs index");
-    trace_msg->AppendOpcode(full_opcode);
-    return DecodeAsmJsOpcode(full_opcode, opcode_length);
-  }
-
   DECODE(Simd) {
     this->detected_->add_simd();
     if (!CheckHardwareSupportsSimd()) {
@@ -5244,7 +5218,6 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
     DECODE_IMPL(CallRef);
     DECODE_IMPL(ReturnCallRef);
     DECODE_IMPL2(kNumericPrefix, Numeric);
-    DECODE_IMPL2(kAsmJsPrefix, AsmJs);
     DECODE_IMPL_CONST2(kSimdPrefix, Simd);
     DECODE_IMPL_CONST2(kAtomicPrefix, Atomic);
     DECODE_IMPL_CONST2(kGCPrefix, GC);
@@ -5838,6 +5811,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
     switch (opcode) {
       case kExprStructNew:
       case kExprStructNewDesc: {
+        this->detected_->add_gc_allocation();
         StructIndexImmediate imm(this, this->pc_ + opcode_length, validate);
         if (!this->Validate(this->pc_ + opcode_length, imm)) return 0;
         Value descriptor =
@@ -5851,6 +5825,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       }
       case kExprStructNewDefault:
       case kExprStructNewDefaultDesc: {
+        this->detected_->add_gc_allocation();
         StructIndexImmediate imm(this, this->pc_ + opcode_length, validate);
         if (!this->Validate(this->pc_ + opcode_length, imm)) return 0;
         if (ValidationTag::validate) {
@@ -5934,6 +5909,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         return opcode_length + field.length;
       }
       case kExprArrayNew: {
+        this->detected_->add_gc_allocation();
         ArrayIndexImmediate imm(this, this->pc_ + opcode_length, validate);
         if (!this->Validate(this->pc_ + opcode_length, imm)) return 0;
         auto [initial_value, length] =
@@ -5945,6 +5921,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         return opcode_length + imm.length;
       }
       case kExprArrayNewDefault: {
+        this->detected_->add_gc_allocation();
         ArrayIndexImmediate imm(this, this->pc_ + opcode_length, validate);
         if (!this->Validate(this->pc_ + opcode_length, imm)) return 0;
         if (!VALIDATE(imm.array_type->element_type().is_defaultable())) {
@@ -5963,6 +5940,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       case kExprArrayNewData: {
         // TODO(14616): Add check that array sharedness == segment sharedness?
         NON_CONST_ONLY
+        this->detected_->add_gc_allocation();
         ArrayIndexImmediate array_imm(this, this->pc_ + opcode_length,
                                       validate);
         if (!this->Validate(this->pc_ + opcode_length, array_imm)) return 0;
@@ -5991,6 +5969,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       case kExprArrayNewElem: {
         // TODO(14616): Add check that array sharedness == segment sharedness?
         NON_CONST_ONLY
+        this->detected_->add_gc_allocation();
         ArrayIndexImmediate array_imm(this, this->pc_ + opcode_length,
                                       validate);
         if (!this->Validate(this->pc_ + opcode_length, array_imm)) return 0;
@@ -6223,6 +6202,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         return opcode_length + array_imm.length;
       }
       case kExprArrayNewFixed: {
+        this->detected_->add_gc_allocation();
         ArrayIndexImmediate array_imm(this, this->pc_ + opcode_length,
                                       validate);
         if (!this->Validate(this->pc_ + opcode_length, array_imm)) return 0;
@@ -7863,31 +7843,6 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         this->DecodeError("invalid numeric opcode: 0x%x", opcode);
         return 0;
     }
-  }
-
-  unsigned DecodeAsmJsOpcode(WasmOpcode opcode, uint32_t opcode_length) {
-    if ((opcode >> 8) != kAsmJsPrefix) {
-      this->DecodeError("Invalid opcode: 0x%x", opcode);
-      return 0;
-    }
-
-    switch (opcode) {
-#define ASMJS_CASE(Op, ...) case kExpr##Op:
-      FOREACH_ASMJS_COMPAT_OPCODE(ASMJS_CASE)
-#undef ASMJS_CASE
-      {
-        // Deal with special asmjs opcodes.
-        if (!VALIDATE(is_asmjs_module(this->module_))) break;
-        const FunctionSig* asmJsSig = WasmOpcodes::AsmjsSignature(opcode);
-        DCHECK_NOT_NULL(asmJsSig);
-        BuildSimpleOperator(opcode, asmJsSig);
-        return opcode_length;
-      }
-      default:
-        break;
-    }
-    this->DecodeError("Invalid opcode: 0x%x", opcode);
-    return 0;
   }
 
   V8_INLINE Value CreateValue(ValueType type) { return Value{this->pc_, type}; }

@@ -363,7 +363,8 @@ class MergePointInterpreterFrameState {
   // Merges an unmerged framestate into a possibly merged framestate at the
   // start of the target catchblock.
   void MergeThrow(Graph* graph, bool is_tracing,
-                  const InterpreterFrameState& builder_frame,
+                  const InterpreterFrameState& handler_frame,
+                  const KnownNodeAspects& known_node_aspects,
                   const MaglevCompilationUnit* handler_unit);
 
   // Merges a dead framestate (e.g. one which has been early terminated with a
@@ -683,10 +684,19 @@ struct LoopEffects {
   ZoneSet<PropertyKey> keys_cleared;
   ZoneSet<InlinedAllocation*> allocations;
   bool unstable_aspects_cleared = false;
+  bool elements_kind_transitioned = false;
   bool may_have_aliasing_contexts = false;
+  bool WritesContextSlotOffset(int offset) const {
+    return std::any_of(
+        context_slot_written.begin(), context_slot_written.end(),
+        [offset](const auto& key) { return std::get<int>(key) == offset; });
+  }
   void Merge(const LoopEffects* other) {
     if (!unstable_aspects_cleared) {
       unstable_aspects_cleared = other->unstable_aspects_cleared;
+    }
+    if (!elements_kind_transitioned) {
+      elements_kind_transitioned = other->elements_kind_transitioned;
     }
     if (!may_have_aliasing_contexts) {
       may_have_aliasing_contexts = other->may_have_aliasing_contexts;

@@ -280,8 +280,7 @@ Handle<JSObject> CreateImportObjectInternal(
         DirectHandle<WasmTrustedInstanceData> trusted_data =
             WasmTrustedInstanceData::New(
                 isolate, module_object,
-                module_object->native_module().as_shared_ptr(),
-                SharedFlag{false});
+                module_object->native_module().as_shared_ptr());
         MaybeDirectHandle<WasmGlobalObject> maybe_global_obj =
             WasmGlobalObject::New(isolate, trusted_data,
                                   MaybeHandle<WasmGlobalObject::BufferType>(),
@@ -318,7 +317,7 @@ bool InstantiateModule(Isolate* isolate,
   ErrorThrower thrower(isolate, "WebAssembly Instantiation");
 
   if (!GetWasmEngine()
-           ->SyncInstantiate(isolate, &thrower, module_object, imports_obj, {})
+           ->SyncInstantiate(isolate, &thrower, module_object, imports_obj)
            .ToHandle(instance)) {
     isolate->clear_exception();
     thrower.Reset();  // Ignore errors.

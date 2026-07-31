@@ -37,6 +37,7 @@
 #include "src/objects/abstract-code-inl.h"
 #include "src/objects/bytecode-array.h"
 #include "src/objects/js-collection-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/profiler/heap-profiler.h"
 #include "src/sandbox/bytecode-verifier.h"
 #include "src/utils/utils.h"
@@ -99,8 +100,7 @@ V8_WARN_UNUSED_RESULT bool CheckMarkedForManualOptimization(
     PrintF(
         " should be prepared for optimization with "
         "%%PrepareFunctionForOptimization before  "
-        "%%OptimizeFunctionOnNextCall / %%OptimizeMaglevOnNextCall / "
-        "%%OptimizeOsr ");
+        "%%OptimizeFunctionOnNextCall / %%OptimizeMaglevOnNextCall");
     return false;
   }
   return true;
@@ -129,18 +129,6 @@ V8_WARN_UNUSED_RESULT Tagged<Object> ReturnFuzzSafe(Tagged<Object> value,
 #define CONVERT_BOOLEAN_ARG_FUZZ_SAFE(name, index) \
   CHECK_UNLESS_FUZZING(IsBoolean(args[index]));    \
   bool name = IsTrue(args[index]);
-
-bool IsAsmWasmFunction(Isolate* isolate, Tagged<JSFunction> function) {
-  DisallowGarbageCollection no_gc;
-#if V8_ENABLE_WEBASSEMBLY
-  // For simplicity we include invalid asm.js functions whose code hasn't yet
-  // been updated to CompileLazy but is still the InstantiateAsmJs builtin.
-  return function->shared()->HasAsmWasmData() ||
-         function->code(isolate)->builtin_id() == Builtin::kInstantiateAsmJs;
-#else
-  return false;
-#endif  // V8_ENABLE_WEBASSEMBLY
-}
 
 }  // namespace
 
@@ -266,7 +254,8 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeFunction) {
   }
 
   if (function->HasAttachedOptimizedCode(isolate)) {
-    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting);
+    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting,
+                                    function->code(isolate));
   }
 
   return ReadOnlyRoots(isolate).undefined_value();
@@ -283,7 +272,8 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeNow) {
   CHECK_UNLESS_FUZZING(!function.is_null());
 
   if (function->HasAttachedOptimizedCode(isolate)) {
-    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting);
+    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting,
+                                    function->code(isolate));
   }
 
   return ReadOnlyRoots(isolate).undefined_value();
@@ -360,8 +350,6 @@ bool CanOptimizeFunction(CodeKind target_kind,
   if (function->shared()->optimization_disabled(target_kind)) {
     return false;
   }
-
-  CHECK_UNLESS_FUZZING_RETURN_FALSE(!IsAsmWasmFunction(isolate, *function));
 
   // If we're fuzzing, allow having not marked the function for manual
   // optimization (if the steps below succeed).
@@ -659,8 +647,6 @@ RUNTIME_FUNCTION(Runtime_PrepareFunctionForOptimization) {
     return ReadOnlyRoots(isolate).undefined_value();
   }
 
-  CHECK_UNLESS_FUZZING(!IsAsmWasmFunction(isolate, *function));
-
   // Hold onto the bytecode array between marking and optimization to ensure
   // it's not flushed.
   ManualOptimizationTable::MarkFunctionForManualOptimization(
@@ -758,10 +744,15 @@ RUNTIME_FUNCTION(Runtime_OptimizeOsr) {
 
   CHECK_UNLESS_FUZZING(!function->shared()->all_optimization_disabled());
 
-  // If we're fuzzing, allow having not marked the function for manual
-  // optimization (if the steps below succeed).
-  if (!v8_flags.fuzzing) {
-    CHECK(CheckMarkedForManualOptimization(isolate, *function));
+  if (!v8_flags.fuzzing &&
+      !ManualOptimizationTable::IsMarkedForManualOptimization(isolate,
+                                                              *function)) {
+    PrintF("Warning: Function ");
+    ShortPrint(*function);
+    PrintF(
+        " might have to be prepared for optimization with "
+        "%%PrepareFunctionForOptimization before  "
+        "%%OptimizeOsr");
   }
 
   if (function->HasAvailableOptimizedCode(isolate) &&
@@ -2852,7 +2843,8 @@ RUNTIME_FUNCTION(Runtime_InstallBytecode) {
   shared->set_bytecode_array(*new_bytecode);
 
   if (function->HasAttachedOptimizedCode(isolate)) {
-    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting);
+    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting,
+                                    function->code(isolate));
   }
   function->UpdateCode(isolate,
                        *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));

@@ -22,6 +22,7 @@
 #include "src/compiler/turboshaft/select-lowering-reducer.h"
 #include "src/compiler/turboshaft/variable-reducer.h"
 #include "src/compiler/wasm-compiler-definitions.h"
+#include "src/execution/frame-constants.h"
 #include "src/flags/flags.h"
 #include "src/objects/object-list-macros.h"
 #include "src/trap-handler/trap-handler.h"
@@ -381,10 +382,6 @@ class TurboshaftGraphBuildingInterface
         }
       } else {
 #if DEBUG
-        // We don't have support for inlining asm.js functions, those should
-        // never be selected in `InliningTree`.
-        DCHECK(!wasm::is_asmjs_module(decoder->module_));
-
         if (v8_flags.liftoff && inlining_decisions_) {
           // DCHECK that `inlining_decisions_` is consistent.
           DCHECK(inlining_decisions_->is_inlined());
@@ -1064,8 +1061,7 @@ class TurboshaftGraphBuildingInterface
     result->op =
         __ GlobalGet(instance_cache_.trusted_instance_data(), imm.global);
 
-    if (V8_UNLIKELY(v8_flags.trace_wasm_globals) &&
-        !is_asmjs_module(decoder->module_)) {
+    if (V8_UNLIKELY(v8_flags.trace_wasm_globals)) {
       TraceGlobalOperation(decoder, imm.index, false);
     }
   }
@@ -1074,8 +1070,7 @@ class TurboshaftGraphBuildingInterface
                  const GlobalIndexImmediate& imm) {
     __ GlobalSet(instance_cache_.trusted_instance_data(), value.op, imm.global);
 
-    if (V8_UNLIKELY(v8_flags.trace_wasm_globals) &&
-        !is_asmjs_module(decoder->module_)) {
+    if (V8_UNLIKELY(v8_flags.trace_wasm_globals)) {
       TraceGlobalOperation(decoder, imm.index, true);
     }
   }
@@ -2161,6 +2156,7 @@ class TurboshaftGraphBuildingInterface
     OpIndex ret_val = __ Call(target_address, OpIndex::Invalid(),
                               base::VectorOf(inputs), ts_call_descriptor);
     BuildSwitchBackFromCentralStack(old_sp, old_limit);
+    instance_cache_.ReloadCachedMemory();
 
 #if DEBUG
     // Reset the context again after the call, to make sure nobody is using the
@@ -5094,12 +5090,6 @@ class TurboshaftGraphBuildingInterface
   }
 
   void DataDrop(FullDecoder* decoder, const IndexImmediate& imm) {
-    // TODO(14616): Fix sharedness.
-    // TODO(14616): Data segments aren't available during streaming compilation,
-    // hence the `has_shared()` check below. Discussion:
-    // github.com/WebAssembly/shared-everything-threads/issues/83
-    CHECK(!decoder->enabled_.has_shared() ||
-          !decoder->module_->data_segments[imm.index].shared);
     auto sig = FixedSizeSignature<MachineType>::Params(MachineType::Pointer(),
                                                        MachineType::Uint32());
     CallC(
@@ -7176,6 +7166,18 @@ class TurboshaftGraphBuildingInterface
     // stack check.
     CHECK_NE(liftoff_frame_size_,
              FunctionTypeFeedback::kUninitializedLiftoffFrameSize);
+
+    int parameter_stack_slots = 0;
+    class DummyResultCollector {
+     public:
+      void AddParamAt(size_t index, LinkageLocation location) {}
+      void AddReturnAt(size_t index, LinkageLocation location) {}
+    } result_collector;
+    wasm::IterateSignatureImpl(decoder->sig_, false, result_collector, nullptr,
+                               &parameter_stack_slots, nullptr, nullptr);
+
+    liftoff_frame_size_ += parameter_stack_slots * kSystemPointerSize +
+                           CommonFrameConstants::kFixedFrameSizeAboveFp;
     return liftoff_frame_size_;
   }
 
@@ -7709,26 +7711,6 @@ class TurboshaftGraphBuildingInterface
               arg, ExternalReference::wasm_f64_nearest_int(),
               MemoryRepresentation::Float64());
         }
-      case kExprF64Acos:
-        return CallCStackSlotToStackSlot(
-            arg, ExternalReference::f64_acos_wrapper_function(),
-            MemoryRepresentation::Float64());
-      case kExprF64Asin:
-        return CallCStackSlotToStackSlot(
-            arg, ExternalReference::f64_asin_wrapper_function(),
-            MemoryRepresentation::Float64());
-      case kExprF64Atan:
-        return __ Float64Atan(arg);
-      case kExprF64Cos:
-        return __ Float64Cos(arg);
-      case kExprF64Sin:
-        return __ Float64Sin(arg);
-      case kExprF64Tan:
-        return __ Float64Tan(arg);
-      case kExprF64Exp:
-        return __ Float64Exp(arg);
-      case kExprF64Log:
-        return __ Float64Log(arg);
       case kExprI32ConvertI64:
         return __ TruncateWord64ToWord32(arg);
       case kExprI64SConvertI32:
@@ -7839,26 +7821,7 @@ class TurboshaftGraphBuildingInterface
         return __ ChangeInt32ToInt64(__ TruncateWord64ToWord32(arg));
       case kExprRefIsNull:
         return __ IsNull(arg, input_type);
-      case kExprI32AsmjsLoadMem8S:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Int8());
-      case kExprI32AsmjsLoadMem8U:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Uint8());
-      case kExprI32AsmjsLoadMem16S:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Int16());
-      case kExprI32AsmjsLoadMem16U:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Uint16());
-      case kExprI32AsmjsLoadMem:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Int32());
-      case kExprF32AsmjsLoadMem:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Float32());
-      case kExprF64AsmjsLoadMem:
-        return AsmjsLoadMem(arg, MemoryRepresentation::Float64());
-      case kExprI32AsmjsSConvertF32:
-      case kExprI32AsmjsUConvertF32:
-        return __ JSTruncateFloat64ToWord32(__ ChangeFloat32ToFloat64(arg));
-      case kExprI32AsmjsSConvertF64:
-      case kExprI32AsmjsUConvertF64:
-        return __ JSTruncateFloat64ToWord32(arg);
+
       case kExprRefAsNonNull:
         // We abuse ref.as_non_null, which isn't otherwise used in this switch,
         // as a sentinel for the negation of ref.is_null.
@@ -8113,116 +8076,9 @@ class TurboshaftGraphBuildingInterface
         return __ Float64Min(lhs, rhs);
       case kExprF64Max:
         return __ Float64Max(lhs, rhs);
-      case kExprF64Pow:
-        return __ Float64Power(lhs, rhs);
-      case kExprF64Atan2:
-        return __ Float64Atan2(lhs, rhs);
-      case kExprF64Mod:
-        return CallCStackSlotToStackSlot(
-            lhs, rhs, ExternalReference::f64_mod_wrapper_function(),
-            MemoryRepresentation::Float64());
       case kExprRefEq:
         return __ TaggedEqual(lhs, rhs);
-      case kExprI32AsmjsDivS: {
-        // asmjs semantics return 0 when dividing by 0.
-        if (SupportedOperations::int32_div_is_safe()) {
-          return __ Int32Div(lhs, rhs);
-        }
-        Label<Word32> done(&asm_);
-        IF (UNLIKELY(__ Word32Equal(rhs, 0))) {
-          GOTO(done, __ Word32Constant(0));
-        } ELSE {
-          IF (UNLIKELY(__ Word32Equal(rhs, -1))) {
-            GOTO(done, __ Word32Sub(0, lhs));
-          } ELSE {
-            GOTO(done, __ Int32Div(lhs, rhs));
-          }
-        }
-        BIND(done, result);
-        return result;
-      }
-      case kExprI32AsmjsDivU: {
-        // asmjs semantics return 0 when dividing by 0.
-        if (SupportedOperations::uint32_div_is_safe()) {
-          return __ Uint32Div(lhs, rhs);
-        }
-        Label<Word32> done(&asm_);
-        IF (UNLIKELY(__ Word32Equal(rhs, 0))) {
-          GOTO(done, __ Word32Constant(0));
-        } ELSE {
-          GOTO(done, __ Uint32Div(lhs, rhs));
-        }
-        BIND(done, result);
-        return result;
-      }
-      case kExprI32AsmjsRemS: {
-        // General case for signed integer modulus, with optimization for
-        // (unknown) power of 2 right hand side.
-        //
-        //   if 0 < rhs then
-        //     mask = rhs - 1
-        //     if rhs & mask != 0 then
-        //       lhs % rhs
-        //     else
-        //       if lhs < 0 then
-        //         -(-lhs & mask)
-        //       else
-        //         lhs & mask
-        //   else
-        //     if rhs < -1 then
-        //       lhs % rhs
-        //     else
-        //       zero
-        Label<Word32> done(&asm_);
-        IF (__ Int32LessThan(0, rhs)) {
-          V<Word32> mask = __ Word32Sub(rhs, 1);
-          IF (__ Word32Equal(__ Word32BitwiseAnd(rhs, mask), 0)) {
-            IF (UNLIKELY(__ Int32LessThan(lhs, 0))) {
-              V<Word32> neg_lhs = __ Word32Sub(0, lhs);
-              V<Word32> combined = __ Word32BitwiseAnd(neg_lhs, mask);
-              GOTO(done, __ Word32Sub(0, combined));
-            } ELSE {
-              GOTO(done, __ Word32BitwiseAnd(lhs, mask));
-            }
-          } ELSE {
-            GOTO(done, __ Int32Mod(lhs, rhs));
-          }
-        } ELSE {
-          IF (__ Int32LessThan(rhs, -1)) {
-            GOTO(done, __ Int32Mod(lhs, rhs));
-          } ELSE {
-            GOTO(done, __ Word32Constant(0));
-          }
-        }
-        BIND(done, result);
-        return result;
-      }
-      case kExprI32AsmjsRemU: {
-        // asmjs semantics return 0 for mod with 0.
-        Label<Word32> done(&asm_);
-        IF (UNLIKELY(__ Word32Equal(rhs, 0))) {
-          GOTO(done, __ Word32Constant(0));
-        } ELSE {
-          GOTO(done, __ Uint32Mod(lhs, rhs));
-        }
-        BIND(done, result);
-        return result;
-      }
-      case kExprI32AsmjsStoreMem8:
-        AsmjsStoreMem(lhs, rhs, MemoryRepresentation::Int8());
-        return rhs;
-      case kExprI32AsmjsStoreMem16:
-        AsmjsStoreMem(lhs, rhs, MemoryRepresentation::Int16());
-        return rhs;
-      case kExprI32AsmjsStoreMem:
-        AsmjsStoreMem(lhs, rhs, MemoryRepresentation::Int32());
-        return rhs;
-      case kExprF32AsmjsStoreMem:
-        AsmjsStoreMem(lhs, rhs, MemoryRepresentation::Float32());
-        return rhs;
-      case kExprF64AsmjsStoreMem:
-        AsmjsStoreMem(lhs, rhs, MemoryRepresentation::Float64());
-        return rhs;
+
       default:
         UNREACHABLE();
     }
@@ -9122,62 +8978,6 @@ class TurboshaftGraphBuildingInterface
     __ Unreachable();
   }
 
-  void AsmjsStoreMem(V<Word32> index, OpIndex value,
-                     MemoryRepresentation repr) {
-    // Since asmjs does not support unaligned accesses, we can bounds-check
-    // ignoring the access size.
-    // Technically, we should do a signed 32-to-ptr extension here. However,
-    // that is an explicit instruction, whereas unsigned extension is implicit.
-    // Since the difference is only observable for memories larger than 2 GiB,
-    // and since we disallow such memories, we can use unsigned extension.
-    V<WordPtr> index_ptr = __ ChangeUint32ToUintPtr(index);
-    IF (LIKELY(__ UintPtrLessThan(index_ptr, MemSize(0)))) {
-      __ Store(MemStart(0), index_ptr, value, StoreOp::Kind::RawAligned(), repr,
-               compiler::kNoWriteBarrier, 0);
-    }
-  }
-
-  OpIndex AsmjsLoadMem(V<Word32> index, MemoryRepresentation repr) {
-    // Since asmjs does not support unaligned accesses, we can bounds-check
-    // ignoring the access size.
-    Variable result = __ NewVariable(repr.ToRegisterRepresentation());
-
-    // Technically, we should do a signed 32-to-ptr extension here. However,
-    // that is an explicit instruction, whereas unsigned extension is implicit.
-    // Since the difference is only observable for memories larger than 2 GiB,
-    // and since we disallow such memories, we can use unsigned extension.
-    V<WordPtr> index_ptr = __ ChangeUint32ToUintPtr(index);
-    IF (LIKELY(__ UintPtrLessThan(index_ptr, MemSize(0)))) {
-      __ SetVariable(result, __ Load(MemStart(0), index_ptr,
-                                     LoadOp::Kind::RawAligned(), repr));
-    } ELSE {
-      switch (repr) {
-        case MemoryRepresentation::Int8():
-        case MemoryRepresentation::Int16():
-        case MemoryRepresentation::Int32():
-        case MemoryRepresentation::Uint8():
-        case MemoryRepresentation::Uint16():
-        case MemoryRepresentation::Uint32():
-          __ SetVariable(result, __ Word32Constant(0));
-          break;
-        case MemoryRepresentation::Float32():
-          __ SetVariable(result, __ Float32Constant(
-                                     std::numeric_limits<float>::quiet_NaN()));
-          break;
-        case MemoryRepresentation::Float64():
-          __ SetVariable(result, __ Float64Constant(
-                                     std::numeric_limits<double>::quiet_NaN()));
-          break;
-        default:
-          UNREACHABLE();
-      }
-    }
-
-    OpIndex result_op = __ GetVariable(result);
-    __ SetVariable(result, OpIndex::Invalid());
-    return result_op;
-  }
-
   V<WasmArray> BoundsCheckArrayWithLength(V<WasmArrayNullable> array,
                                           V<Word32> index, V<Word32> length,
                                           compiler::CheckForNull null_check) {
@@ -9739,10 +9539,9 @@ class TurboshaftGraphBuildingInterface
       // Configuration without Liftoff and feedback, e.g., for testing.
       return size < no_liftoff_inlining_budget_ &&
              // In a production configuration, `InliningTree` decides what to
-             // (not) inline, e.g., asm.js functions or to not exceed
-             // `kMaxInlinedCount`. But without Liftoff, we need to "manually"
-             // comply with these constraints here.
-             !is_asmjs_module(decoder->module_) &&
+             // (not) inline, e.g., to not exceed `kMaxInlinedCount`. But
+             // without Liftoff, we need to "manually" comply with these
+             // constraints here.
              inlining_positions_->size() < InliningTree::kMaxInlinedCount;
     }
     return false;

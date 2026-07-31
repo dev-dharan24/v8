@@ -89,6 +89,8 @@
 #include "src/utils/utils.h"
 #include "src/zone/zone.h"
 
+namespace v8::internal::maglev {
+
 #define TRACE(...)                        \
   if (V8_UNLIKELY(is_tracing())) {        \
     TraceLogger(tracer()) << __VA_ARGS__; \
@@ -97,8 +99,6 @@
 #define FAIL(...)                                                         \
   TRACE("Failed " << __func__ << ":" << __LINE__ << ": " << __VA_ARGS__); \
   return {};
-
-namespace v8::internal::maglev {
 
 namespace {
 
@@ -139,6 +139,14 @@ NodeType NodeTypeFromAccessInfo(
     return NodeType::kJSReceiver;
   }
   if (type.Is(compiler::Type::Object())) {
+    return NodeType::kAnyHeapObject;
+  }
+
+  // Plain HeapObject-representation fields have Type::NonInternal() as their
+  // field type (only class-tracked fields get a narrower type), which none of
+  // the branches above match; the representation still guarantees a heap
+  // object.
+  if (access_info.field_representation().IsHeapObject()) {
     return NodeType::kAnyHeapObject;
   }
 
@@ -3018,7 +3026,7 @@ ReduceResult MaglevGraphBuilder::StoreAndCacheContextSlot(
     unobserved_context_slot_stores_[key] = store;
   } else {
     if (known_node_aspects().may_have_aliasing_contexts() !=
-        KnownNodeAspects::ContextSlotLoadsAlias::kYes) {
+        KnownNodeAspects::ContextSlotLoadsAlias::kAlways) {
       auto last_store = unobserved_context_slot_stores_.find(key);
       if (last_store != unobserved_context_slot_stores_.end()) {
         MarkNodeDead(last_store->second);
@@ -3190,34 +3198,6 @@ ReduceResult MaglevGraphBuilder::VisitPopContext() {
   SetContext(LoadRegister(0));
   SetCurrentScopeInfo(register_scope_infos_[iterator_.GetRegisterOperand(0)]);
   return ReduceResult::Done();
-}
-
-ReduceResult MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
-                                                  ValueNode* rhs) {
-  ValueNode* tagged_lhs;
-  GET_VALUE_OR_ABORT(tagged_lhs, GetTaggedValue(lhs));
-  ValueNode* tagged_rhs;
-  GET_VALUE_OR_ABORT(tagged_rhs, GetTaggedValue(rhs));
-  if (tagged_lhs == tagged_rhs) {
-    return GetBooleanConstant(true);
-  }
-  if (reducer_.HaveDisjointTypes(tagged_lhs, tagged_rhs)) {
-    return GetBooleanConstant(false);
-  }
-  // TODO(victorgomes): We could retrieve the HeapObjectRef in HeapConstant and
-  // compare them.
-  if (IsConstantNode(tagged_lhs->opcode()) && !tagged_lhs->Is<HeapConstant>() &&
-      tagged_lhs->opcode() == tagged_rhs->opcode()) {
-    // Constants nodes are canonicalized, except for the node holding
-    // HeapObjectRef, so equal constants should have been handled above.
-    return GetBooleanConstant(false);
-  }
-  return AddNewNodeNoInputConversion<TaggedEqual>({tagged_lhs, tagged_rhs});
-}
-
-ReduceResult MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
-                                                  RootIndex rhs_index) {
-  return BuildTaggedEqual(lhs, GetRootConstant(rhs_index));
 }
 
 ReduceResult MaglevGraphBuilder::VisitTestReferenceEqual() {
@@ -4234,6 +4214,12 @@ ReduceResult MaglevGraphBuilder::BuildStoreFixedArrayElement(
   // TODO(victorgomes): Support storing element to a virtual object. If we
   // modify the elements array, we need to modify the original object to point
   // to the new elements array.
+
+  // Unfortunately we need to check for empty types this late. If you think we
+  // can detect them earlier, have a look at
+  // test/mjsunit/maglev/regress-538884561-2.js.
+  ABORT_IF_EMPTY_TYPE(value);
+
   if (CanElideWriteBarrier(elements, value)) {
     return AddNewNode<StoreFixedArrayElementNoWriteBarrier>(
         {elements, index, value});
@@ -4471,39 +4457,41 @@ ReduceResult MaglevGraphBuilder::BuildLoadField(
   // Do the load.
   if (field_index.is_double()) {
     ValueNode* heap_number;
-    GET_VALUE_OR_ABORT(
-        heap_number,
-        AddNewNode<LoadTaggedField>({load_source}, field_index.offset(),
-                                    NodeType::kHeapNumber, false,
-                                    PropertyKey::None(), IsArrayLength::kNo));
+    GET_VALUE_OR_ABORT(heap_number,
+                       AddNewNode<LoadTaggedField>(
+                           {load_source}, field_index.offset(),
+                           NodeType::kHeapNumber, false, PropertyKey::None(),
+                           IsArrayLength::kNo, compiler::OptionalMapRef{}));
     return AddNewNode<LoadFloat64>(
         {heap_number}, static_cast<int>(offsetof(HeapNumber, value_)));
   }
 
   const auto node_type = NodeTypeFromAccessInfo(this->broker(), access_info);
+  compiler::OptionalMapRef stable_field_map;
+  if (access_info.field_representation().IsHeapObject() &&
+      access_info.field_map().has_value() &&
+      access_info.field_map().value().is_stable()) {
+    stable_field_map = access_info.field_map();
+  }
   ValueNode* value;
-  GET_VALUE_OR_ABORT(value, BuildLoadTaggedField(
-                                load_source, field_index.offset(), node_type,
-                                AccessInfoGuaranteedConst(access_info), name));
+  GET_VALUE_OR_ABORT(
+      value, BuildLoadTaggedField(load_source, field_index.offset(), node_type,
+                                  AccessInfoGuaranteedConst(access_info), name,
+                                  IsArrayLength::kNo, stable_field_map));
 
-  // Insert stable field information if present.
+  // Insert the static field information: the type for every access, and the
+  // map identity when the field has a stable map.
   NodeInfo* known_info = GetOrCreateInfoFor(value);
-  if (access_info.field_representation().IsSmi()) {
-    known_info->IntersectType(NodeType::kSmi);
-  } else if (access_info.field_representation().IsHeapObject()) {
-    if (access_info.field_map().has_value() &&
-        access_info.field_map().value().is_stable()) {
-      DCHECK(access_info.field_map().value().IsJSReceiverMap());
-      auto map = access_info.field_map().value();
-      if (!known_info->SetPossibleMaps(PossibleMaps{map}, false,
-                                       StaticTypeForMap(map, broker()),
-                                       broker(), known_node_aspects())) {
-        return reducer_.EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
-      }
-      broker()->dependencies()->DependOnStableMap(map);
-    } else {
-      known_info->IntersectType(NodeType::kAnyHeapObject);
+  if (stable_field_map.has_value()) {
+    DCHECK(stable_field_map.value().IsJSReceiverMap());
+    if (!known_info->SetPossibleMaps(PossibleMaps{stable_field_map.value()},
+                                     false, node_type, broker(),
+                                     known_node_aspects())) {
+      return reducer_.EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
     }
+    broker()->dependencies()->DependOnStableMap(stable_field_map.value());
+  } else {
+    known_info->IntersectType(node_type);
   }
   return value;
 }
@@ -4517,27 +4505,6 @@ ValueNode* MaglevGraphBuilder::BuildLoadFixedArrayLength(
   GET_VALUE(length, AddNewNode<LoadInt32>(
                         {fixed_array},
                         static_cast<int>(offsetof(FixedArray, length_))));
-  return length;
-}
-
-ReduceResult MaglevGraphBuilder::BuildLoadJSArrayLength(ValueNode* js_array,
-                                                        NodeType length_type) {
-  // TODO(leszeks): JSArray.length is known to be non-constant, don't bother
-  // searching the constant values.
-  MaybeReduceResult known_length =
-      TryReuseKnownPropertyLoad(js_array, broker()->length_string());
-  if (known_length.IsDone()) {
-    DCHECK(known_length.IsDoneWithValue());
-    return known_length.value();
-  }
-
-  ValueNode* length;
-  GET_VALUE_OR_ABORT(
-      length, BuildLoadTaggedField(
-                  js_array, offsetof(JSArray, length_), length_type, false,
-                  broker()->length_string(), IsArrayLength::kYes));
-  reducer_.RecordKnownProperty(js_array, broker()->length_string(), length,
-                               false, compiler::AccessMode::kLoad);
   return length;
 }
 
@@ -4685,11 +4652,11 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
                                     StoreMap::Kind::kTransitioning);
     } else {
       ValueNode* heap_number;
-      GET_VALUE_OR_ABORT(
-          heap_number,
-          AddNewNode<LoadTaggedField>({store_target}, field_index.offset(),
-                                      NodeType::kHeapNumber, false,
-                                      PropertyKey::None(), IsArrayLength::kNo));
+      GET_VALUE_OR_ABORT(heap_number,
+                         AddNewNode<LoadTaggedField>(
+                             {store_target}, field_index.offset(),
+                             NodeType::kHeapNumber, false, PropertyKey::None(),
+                             IsArrayLength::kNo, compiler::OptionalMapRef{}));
       return AddNewNode<StoreFloat64>(
           {heap_number, value}, static_cast<int>(offsetof(HeapNumber, value_)));
     }
@@ -4749,10 +4716,11 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildPropertyLoad(
         load_source = lookup_start_object;
       }
       ValueNode* result;
-      GET_VALUE_OR_ABORT(result, AddNewNode<LoadDictionaryField>(
-                                     {GetContext(), load_source}, name,
-                                     access_info.dictionary_index().as_int(),
-                                     feedback_source));
+      GET_VALUE_OR_ABORT(
+          result, AddNewNode<LoadDictionaryField>(
+                      {GetContext(), load_source, receiver}, name,
+                      access_info.dictionary_index().as_int(), feedback_source,
+                      receiver != lookup_start_object));
       return result;
     }
     case compiler::PropertyAccessInfo::kDictionaryProtoDataConstant: {
@@ -5170,6 +5138,8 @@ ReduceResult MaglevGraphBuilder::BuildLoadTypedArrayLength(
     ValueNode* object, ElementsKind elements_kind) {
   DCHECK(IsTypedArrayOrRabGsabTypedArrayElementsKind(elements_kind));
   bool is_variable_length = IsRabGsabTypedArrayElementsKind(elements_kind);
+  bool is_const_length =
+      !is_variable_length && !v8_flags.track_array_buffer_views;
 
   if (!is_variable_length) {
     if (auto const_object = TryGetConstant<JSTypedArray>(object)) {
@@ -5187,8 +5157,8 @@ ReduceResult MaglevGraphBuilder::BuildLoadTypedArrayLength(
     // Note: We can't use broker()->length_string() here, because it could
     // conflict with redefinitions of the TypedArray length property.
 
-    if (ValueNode* length = known_node_aspects().TryFindLoadedConstantProperty(
-            object, PropertyKey::TypedArrayLength())) {
+    if (ValueNode* length = known_node_aspects().TryFindLoadedProperty(
+            object, PropertyKey::TypedArrayLength(), is_const_length)) {
       return length;
     }
   }
@@ -5198,7 +5168,8 @@ ReduceResult MaglevGraphBuilder::BuildLoadTypedArrayLength(
                      AddNewNode<LoadTypedArrayLength>({object}, elements_kind));
   if (!is_variable_length) {
     reducer_.RecordKnownProperty(object, PropertyKey::TypedArrayLength(),
-                                 result, true, compiler::AccessMode::kLoad);
+                                 result, is_const_length,
+                                 compiler::AccessMode::kLoad);
   }
   return result;
 }
@@ -6538,23 +6509,6 @@ void MaglevGraphBuilder::AdvanceThroughContinuationForPolymorphicPropertyLoad(
     iterator_.Advance();
     UpdateSourceAndBytecodePosition(iterator_.current_offset());
   }
-}
-
-MaybeReduceResult MaglevGraphBuilder::TryReuseKnownPropertyLoad(
-    ValueNode* lookup_start_object, compiler::NameRef name) {
-  if (ValueNode* property = known_node_aspects().TryFindLoadedProperty(
-          lookup_start_object, name)) {
-    TRACE("  * Reusing non-constant loaded property "
-          << PrintNodeLabel(property) << ": " << PrintNode(property));
-    return property;
-  }
-  if (ValueNode* property = known_node_aspects().TryFindLoadedConstantProperty(
-          lookup_start_object, name)) {
-    TRACE("  * Reusing constant loaded property "
-          << PrintNodeLabel(property) << ": " << PrintNode(property));
-    return property;
-  }
-  return {};
 }
 
 ReduceResult MaglevGraphBuilder::BuildLoadStringLength(ValueNode* string) {
@@ -7978,10 +7932,12 @@ ReduceResult MaglevGraphBuilder::BuildEagerInlineCall(
   CatchBlockDetails catch_block_details = GetCurrentTryCatchBlock();
   if (catch_block_details.ref &&
       catch_block_details.exception_handler_was_used) {
-    if (IsInsideTryBlock()) {
+    if (MaglevGraphBuilder* handler = catch_block_details.handler_builder) {
       // Merge the current state into the handler state.
-      GetCatchBlockFrameState()->MergeThrow(
-          graph(), is_tracing(), current_interpreter_frame_, compilation_unit_);
+      handler->GetCatchBlockFrameState()->MergeThrow(
+          graph(), is_tracing(), handler->current_interpreter_frame(),
+          *current_interpreter_frame_.known_node_aspects(),
+          handler->compilation_unit());
     }
     catch_block_details.deopt_frame_distance++;
   }
@@ -8512,9 +8468,51 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ValueNode* receiver = args.receiver();
   if (!receiver) return {};
 
-  RETURN_IF_ABORT(BuildCheckInstanceType(receiver, NodeType::kJSGeneratorObject,
-                                         JS_GENERATOR_OBJECT_TYPE,
-                                         JS_GENERATOR_OBJECT_TYPE));
+  // The following is to rule out cross-realm generator next inlining.
+  MapInference inference(this, receiver);
+  auto possible_maps = inference.TryGetPossibleMaps();
+  bool can_use_static_maps = false;
+  if (possible_maps && !possible_maps->is_empty()) {
+    can_use_static_maps = true;
+    for (compiler::MapRef map : *possible_maps) {
+      if (map.instance_type() != JS_GENERATOR_OBJECT_TYPE) {
+        can_use_static_maps = false;
+        break;
+      }
+      compiler::OptionalObjectRef ctor = map.GetConstructor(broker());
+      if (!ctor.has_value() || !ctor->IsJSFunction() ||
+          !ctor->AsJSFunction().native_context(broker()).equals(
+              target.native_context(broker())) ||
+          !target.native_context(broker()).equals(
+              broker()->target_native_context())) {
+        return {};
+      }
+    }
+  }
+
+  if (can_use_static_maps) {
+    RETURN_IF_ABORT(inference.InsertMapChecks(zone()));
+  } else {
+    RETURN_IF_ABORT(BuildCheckInstanceType(
+        receiver, NodeType::kJSGeneratorObject, JS_GENERATOR_OBJECT_TYPE,
+        JS_GENERATOR_OBJECT_TYPE));
+
+    ValueNode* context;
+    GET_VALUE_OR_ABORT(
+        context,
+        BuildLoadTaggedField(receiver, offsetof(JSGeneratorObject, context_)));
+    ValueNode* context_map;
+    GET_VALUE_OR_ABORT(context_map, BuildLoadMap(context));
+    ValueNode* native_context;
+    GET_VALUE_OR_ABORT(
+        native_context,
+        BuildLoadTaggedField(
+            context_map,
+            offsetof(Map, constructor_or_back_pointer_or_native_context_)));
+    RETURN_IF_ABORT(BuildCheckValueByReference(native_context,
+                                               target.native_context(broker()),
+                                               DeoptimizeReason::kWrongValue));
+  }
 
   ValueNode* continuation;
   GET_VALUE_OR_ABORT(continuation,
@@ -8529,6 +8527,16 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ValueNode* executing_constant =
       GetSmiConstant(JSGeneratorObject::kGeneratorExecuting);
   ValueNode* next_constant = GetSmiConstant(JSGeneratorObject::kNext);
+
+  // If any of the constants have an empty type, we're in dead code, and the
+  // write barrier elision logic inside StoreTaggedFieldNoWriteBarrier will be
+  // confused. Bail out now. Ideally, this would be done inside
+  // BuildStoreTaggedFieldNoWriteBarrier, but in the code below we want to
+  // assert there won't be deopts after we've called into user code, and we have
+  // no way to distinguish an abort (reducer_.BuildAbort()) from a deopt.
+  ABORT_IF_EMPTY_TYPE(closed_constant);
+  ABORT_IF_EMPTY_TYPE(executing_constant);
+  ABORT_IF_EMPTY_TYPE(next_constant);
 
   MaglevSubGraphBuilder::Label generator_already_closed(&subgraph, 1);
   MaglevSubGraphBuilder::Label generator_finished(&subgraph, 1);
@@ -8690,47 +8698,76 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
   std::optional<MapInference> map_inference;
   ValueNode* iterated_object =
       iterator->get(offsetof(JSArrayIterator, iterated_object_));
-  ElementsKind elements_kind;
-  base::SmallVector<compiler::MapRef, 4> maps;
+
+  SmallZoneVector<compiler::MapRef, DEFAULT_MAX_POLYMORPHIC_MAP_COUNT>
+      double_maps(zone());
+  SmallZoneVector<compiler::MapRef, DEFAULT_MAX_POLYMORPHIC_MAP_COUNT>
+      tagged_maps(zone());
+  SmallZoneVector<compiler::MapRef, DEFAULT_MAX_POLYMORPHIC_MAP_COUNT> all_maps(
+      zone());
+
+  auto process_map = [&](compiler::MapRef map) -> bool {
+    if (!map.supports_fast_array_iteration(broker())) {
+      return false;
+    }
+    if (IsTypedArrayElementsKind(map.elements_kind())) {
+      return false;
+    }
+    if (IsDoubleElementsKind(map.elements_kind())) {
+      double_maps.push_back(map);
+    } else {
+      tagged_maps.push_back(map);
+    }
+    all_maps.push_back(map);
+    return true;
+  };
+
   if (iterated_object->Is<InlinedAllocation>()) {
     VirtualObject* array = iterated_object->Cast<InlinedAllocation>()->object();
-    // TODO(victorgomes): Remove this once we track changes in the inlined
-    // allocated object.
-    if (IsEscaping(iterated_object->Cast<InlinedAllocation>())) {
-      FAIL("allocation is escaping, map could have been changed");
-    }
-    // TODO(victorgomes): This effectively disable the optimization for `for-of`
-    // loops. We need to figure it out a way to re-enable this.
-    if (IsInsideLoop()) {
-      FAIL("we're inside a loop, iterated object map could change");
-    }
     auto map = *array->map();
-    if (!map.supports_fast_array_iteration(broker())) {
-      FAIL("no fast array iteration support");
+    if (!process_map(map)) {
+      return {};
     }
-    elements_kind = map.elements_kind();
-    maps.push_back(map);
   } else {
     map_inference.emplace(this, iterated_object);
     auto possible_maps = map_inference->TryGetPossibleMaps();
     if (!possible_maps) {
       FAIL("iterated object is unknown");
     }
-    if (!CanInlineArrayIteratingBuiltin(broker(), *possible_maps,
-                                        &elements_kind)) {
-      FAIL("no fast array iteration support or incompatible maps");
-    }
-    for (auto map : *possible_maps) {
-      maps.push_back(map);
+    for (compiler::MapRef map : *possible_maps) {
+      if (!process_map(map)) {
+        return {};
+      }
     }
   }
 
-  // TODO(victorgomes): Support typed arrays.
-  if (IsTypedArrayElementsKind(elements_kind)) {
-    FAIL("no typed arrays support");
+  std::optional<ElementsKind> double_kind;
+  if (!double_maps.empty()) {
+    double_kind = double_maps[0].elements_kind();
+    for (compiler::MapRef map : double_maps) {
+      bool union_ok =
+          UnionElementsKindUptoSize(&*double_kind, map.elements_kind());
+      DCHECK(union_ok);
+      USE(union_ok);
+    }
   }
 
-  if (IsHoleyElementsKind(elements_kind) &&
+  std::optional<ElementsKind> tagged_kind;
+  if (!tagged_maps.empty()) {
+    tagged_kind = tagged_maps[0].elements_kind();
+    for (compiler::MapRef map : tagged_maps) {
+      bool union_ok =
+          UnionElementsKindUptoSize(&*tagged_kind, map.elements_kind());
+      DCHECK(union_ok);
+      USE(union_ok);
+    }
+  }
+
+  if (double_kind.has_value() && IsHoleyElementsKind(*double_kind) &&
+      !broker()->dependencies()->DependOnNoElementsProtector()) {
+    FAIL("no elements protector");
+  }
+  if (tagged_kind.has_value() && IsHoleyElementsKind(*tagged_kind) &&
       !broker()->dependencies()->DependOnNoElementsProtector()) {
     FAIL("no elements protector");
   }
@@ -8738,7 +8775,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
   if (map_inference.has_value()) {
     RETURN_IF_ABORT(map_inference->InsertMapChecks(zone()));
   } else {
-    RETURN_IF_ABORT(BuildCheckMaps(iterated_object, base::VectorOf(maps)));
+    RETURN_IF_ABORT(BuildCheckMaps(iterated_object, base::VectorOf(all_maps)));
   }
 
   // Load the [[NextIndex]] from the {iterator}.
@@ -8751,11 +8788,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
   ValueNode* uint32_index;
   GET_VALUE_OR_ABORT(uint32_index, GetUint32ElementIndex(index));
   ValueNode* length;
-  GET_VALUE_OR_ABORT(
-      length,
-      BuildLoadJSArrayLength(iterated_object, IsFastElementsKind(elements_kind)
-                                                  ? NodeType::kSmi
-                                                  : NodeType::kNumber));
+  // The array length is a smim since we only handle fast elements kinds
+  // (non-fast elements kinds are filtered out above).
+  GET_VALUE_OR_ABORT(length,
+                     BuildLoadJSArrayLength(iterated_object, NodeType::kSmi));
   ValueNode* uint32_length;
   GET_VALUE_OR_ABORT(uint32_length, GetUint32ElementIndex(length));
 
@@ -8782,19 +8818,58 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
         if (iteration_kind == IterationKind::kKeys) {
           subgraph.set(ret_value, index);
         } else {
-          ValueNode* value;
-          GET_VALUE_OR_ABORT(
-              value,
-              BuildElementLoadOnJSArrayOrJSObject(
-                  iterated_object, int32_index, base::VectorOf(maps),
-                  elements_kind, KeyedAccessLoadMode::kHandleOOBAndHoles));
+          if (double_maps.empty() || tagged_maps.empty()) {
+            ValueNode* value;
+            GET_VALUE_OR_ABORT(
+                value,
+                BuildElementLoadOnJSArrayOrJSObject(
+                    iterated_object, int32_index, base::VectorOf(all_maps),
+                    double_maps.empty() ? *tagged_kind : *double_kind,
+                    KeyedAccessLoadMode::kHandleOOBAndHoles));
+            subgraph.set(ret_value, value);
+          } else {
+            MaglevSubGraphBuilder::Label double_branch(
+                &subgraph, static_cast<int>(double_maps.size()));
+            MaglevSubGraphBuilder::Label done_loading(&subgraph, 2,
+                                                      {&ret_value});
+
+            ValueNode* iterated_object_map;
+            GET_VALUE_OR_ABORT(iterated_object_map,
+                               BuildLoadMap(iterated_object));
+            for (compiler::MapRef map : double_maps) {
+              RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
+                  &double_branch, {iterated_object_map, GetConstant(map)}));
+            }
+
+            // Tagged path (fallthrough)
+            ValueNode* tagged_value;
+            GET_VALUE_OR_ABORT(
+                tagged_value,
+                BuildElementLoadOnJSArrayOrJSObject(
+                    iterated_object, int32_index, base::VectorOf(tagged_maps),
+                    *tagged_kind, KeyedAccessLoadMode::kHandleOOBAndHoles));
+            subgraph.set(ret_value, tagged_value);
+            subgraph.Goto(&done_loading);
+
+            // Double path
+            subgraph.Bind(&double_branch);
+            ValueNode* double_value;
+            GET_VALUE_OR_ABORT(
+                double_value,
+                BuildElementLoadOnJSArrayOrJSObject(
+                    iterated_object, int32_index, base::VectorOf(double_maps),
+                    *double_kind, KeyedAccessLoadMode::kHandleOOBAndHoles));
+            subgraph.set(ret_value, double_value);
+            subgraph.Goto(&done_loading);
+
+            subgraph.Bind(&done_loading);
+          }
           if (iteration_kind == IterationKind::kEntries) {
             ValueNode* key_value_array;
-            GET_VALUE_OR_ABORT(key_value_array,
-                               BuildAndAllocateKeyValueArray(index, value));
+            ValueNode* loaded_value = subgraph.get(ret_value);
+            GET_VALUE_OR_ABORT(key_value_array, BuildAndAllocateKeyValueArray(
+                                                    index, loaded_value));
             subgraph.set(ret_value, key_value_array);
-          } else {
-            subgraph.set(ret_value, value);
           }
         }
         // Add 1 to index
@@ -8811,23 +8886,18 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
         // Index is greater or equal than length.
         subgraph.set(is_done, GetBooleanConstant(true));
         subgraph.set(ret_value, GetRootConstant(RootIndex::kUndefinedValue));
-        if (!IsTypedArrayElementsKind(elements_kind)) {
-          // Mark the {iterator} as exhausted by setting the [[NextIndex]] to a
-          // value that will never pass the length check again (aka the maximum
-          // value possible for the specific iterated object). Note that this is
-          // different from what the specification says, which is changing the
-          // [[IteratedObject]] field to undefined, but that makes it difficult
-          // to eliminate the map checks and "length" accesses in for..of loops.
-          //
-          // This is not necessary for JSTypedArray's, since the length of those
-          // cannot change later and so if we were ever out of bounds for them
-          // we will stay out-of-bounds forever.
-          return BuildStoreTaggedField(receiver,
-                                       GetRootConstant(RootIndex::kMaxUInt32),
-                                       offsetof(JSArrayIterator, next_index_),
-                                       StoreTaggedMode::kDefault);
-        }
-        return ReduceResult::Done();
+        // Mark the {iterator} as exhausted by setting the [[NextIndex]] to a
+        // value that will never pass the length check again (aka the maximum
+        // value possible for the specific iterated object). Note that this is
+        // different from what the specification says, which is changing the
+        // [[IteratedObject]] field to undefined, but that makes it difficult
+        // to eliminate the map checks and "length" accesses in for..of loops.
+
+        // If we want to add support for resizable typed arrays, we'll need to
+        // use a different max value.
+        return BuildStoreTaggedField(
+            receiver, GetRootConstant(RootIndex::kMaxUInt32),
+            offsetof(JSArrayIterator, next_index_), StoreTaggedMode::kDefault);
       }));
 
   // Allocate result object and return.
@@ -10809,6 +10879,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceStringConstructor(
 MaybeReduceResult MaglevGraphBuilder::TryReduceBuiltin(
     compiler::JSFunctionRef target, compiler::SharedFunctionInfoRef shared,
     CallArguments& args, const compiler::FeedbackSource& feedback_source) {
+  if (V8_UNLIKELY(v8_flags.maglev_disable_builtin_reducers)) return {};
   if (args.mode() != CallArguments::kDefault) {
     // TODO(victorgomes): Maybe inline the spread stub? Or call known function
     // directly if arguments list is an array.
@@ -16530,6 +16601,7 @@ void MaglevGraphBuilder::ProcessMergePointAtExceptionHandlerStart(int offset) {
   // Expressions would have to be explicitly preserved across exceptions.
   // However, at this point we do not know which ones might be used.
   current_interpreter_frame_.known_node_aspects()->ClearAvailableExpressions();
+  current_interpreter_frame_.known_node_aspects()->ClearTaggedKeyedProperties();
 
   // Merges aren't simple fallthroughs, so we should reset the checkpoint
   // validity.
@@ -16913,7 +16985,7 @@ CatchBlockDetails MaglevGraphBuilder::GetCurrentTryCatchBlock() {
   if (IsInsideTryBlock()) {
     // Inside a try-block.
     int offset = catch_block_stack_.top().handler;
-    return {&jump_targets_[offset],
+    return {&jump_targets_[offset], this,
             merge_states_[offset]->exception_handler_was_used(), false, 0};
   }
   if (!is_inline()) {
@@ -16931,8 +17003,8 @@ CatchBlockDetails MaglevGraphBuilder::GetTryCatchBlockForNonEagerInlining(
           : 0;
   // Since this CatchBlockDetails is stored in a non-eager call site,
   // the catch block will already exist by the time inlining is attempted.
-  return {info->catch_block_ref_address(), !info->ShouldLazyDeopt(), true,
-          deopt_frame_distance};
+  return {info->catch_block_ref_address(), nullptr, !info->ShouldLazyDeopt(),
+          true, deopt_frame_distance};
 }
 
 ReduceResult MaglevGraphBuilder::GetTaggedValue(
@@ -17248,12 +17320,12 @@ void MaglevGraphBuilder::AttachExceptionHandlerInfo(NodeBase* node) {
 
     current_block()->AddExceptionHandler(node->exception_handler_info());
 
-    if (IsInsideTryBlock()) {
+    if (MaglevGraphBuilder* handler = catch_block.handler_builder) {
       // Merge the current state into the handler state.
-      auto state = GetCatchBlockFrameState();
-      DCHECK_NOT_NULL(state);
-      state->MergeThrow(graph(), is_tracing(), current_interpreter_frame_,
-                        compilation_unit_);
+      handler->GetCatchBlockFrameState()->MergeThrow(
+          graph(), is_tracing(), handler->current_interpreter_frame(),
+          *current_interpreter_frame_.known_node_aspects(),
+          handler->compilation_unit());
     }
   } else {
     // Patch no exception handler marker.
@@ -17502,6 +17574,7 @@ ReduceResult MaglevGraphBuilder::BuildGetCharCodeAt(ValueNode* string,
 }
 
 #undef TRACE
+#undef FAIL
 #undef TRACE_CANNOT_INLINE
 
 }  // namespace v8::internal::maglev

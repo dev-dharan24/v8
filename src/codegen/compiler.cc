@@ -9,7 +9,6 @@
 
 #include "include/v8-script.h"
 #include "src/api/api-inl.h"
-#include "src/asmjs/asm-js.h"
 #include "src/ast/scopes.h"
 #include "src/base/fpu.h"
 #include "src/base/logging.h"
@@ -422,18 +421,9 @@ void LogUnoptimizedCompilation(Isolate* isolate,
                                LogEventListener::CodeTag code_type,
                                base::TimeDelta time_taken_to_execute,
                                base::TimeDelta time_taken_to_finalize) {
-  DirectHandle<AbstractCode> abstract_code;
-  if (shared->HasBytecodeArray()) {
-    abstract_code = direct_handle(
-        Cast<AbstractCode>(shared->GetBytecodeArray(isolate)), isolate);
-  } else {
-#if V8_ENABLE_WEBASSEMBLY
-    DCHECK(shared->HasAsmWasmData());
-    abstract_code = Cast<AbstractCode>(BUILTIN_CODE(isolate, InstantiateAsmJs));
-#else
-    UNREACHABLE();
-#endif  // V8_ENABLE_WEBASSEMBLY
-  }
+  DCHECK(shared->HasBytecodeArray());
+  DirectHandle<AbstractCode> abstract_code(
+      Cast<AbstractCode>(shared->GetBytecodeArray(isolate)), isolate);
 
   double time_taken_ms = time_taken_to_execute.InMillisecondsF() +
                          time_taken_to_finalize.InMillisecondsF();
@@ -657,23 +647,6 @@ uint64_t TurbofanCompilationJob::trace_id() const {
 
 namespace {
 
-#if V8_ENABLE_WEBASSEMBLY
-bool UseAsmWasm(FunctionLiteral* literal, bool asm_wasm_broken) {
-  // Check whether asm.js validation is enabled.
-  if (!v8_flags.validate_asm) return false;
-
-  // Modules that have validated successfully, but were subsequently broken by
-  // invalid module instantiation attempts are off limit forever.
-  if (asm_wasm_broken) return false;
-
-  // In stress mode we want to run the validator on everything.
-  if (v8_flags.stress_validate_asm) return true;
-
-  // In general, we respect the "use asm" directive.
-  return literal->scope()->IsAsmModule();
-}
-#endif
-
 }  // namespace
 
 void Compiler::InstallInterpreterTrampolineCopy(
@@ -721,37 +694,16 @@ template <typename IsolateT>
 void InstallUnoptimizedCode(UnoptimizedCompilationInfo* compilation_info,
                             DirectHandle<SharedFunctionInfo> shared_info,
                             IsolateT* isolate) {
-  if (compilation_info->has_bytecode_array()) {
-    DCHECK(!shared_info->HasBytecodeArray());  // Only compiled once.
-    DCHECK(!compilation_info->has_asm_wasm_data());
-    DCHECK(!shared_info->HasFeedbackMetadata());
+  DCHECK(compilation_info->has_bytecode_array());
+  DCHECK(!shared_info->HasBytecodeArray());  // Only compiled once.
+  DCHECK(!shared_info->HasFeedbackMetadata());
 
-#if V8_ENABLE_WEBASSEMBLY
-    // If the function failed asm-wasm compilation, mark asm_wasm as broken
-    // to ensure we don't try to compile as asm-wasm.
-    if (compilation_info->literal()->scope()->IsAsmModule()) {
-      shared_info->set_is_asm_wasm_broken(true);
-    }
-#endif  // V8_ENABLE_WEBASSEMBLY
+  DirectHandle<FeedbackMetadata> feedback_metadata =
+      FeedbackMetadata::New(isolate, compilation_info->feedback_vector_spec());
+  shared_info->set_feedback_metadata(*feedback_metadata, kReleaseStore);
 
-    DirectHandle<FeedbackMetadata> feedback_metadata = FeedbackMetadata::New(
-        isolate, compilation_info->feedback_vector_spec());
-    shared_info->set_feedback_metadata(*feedback_metadata, kReleaseStore);
-
-    shared_info->set_age(0);
-    shared_info->set_bytecode_array(*compilation_info->bytecode_array());
-  } else {
-#if V8_ENABLE_WEBASSEMBLY
-    DCHECK(compilation_info->has_asm_wasm_data());
-    // We should only have asm/wasm data when finalizing on the main thread.
-    DCHECK((std::is_same_v<IsolateT, Isolate>));
-    shared_info->set_asm_wasm_data(*compilation_info->asm_wasm_data());
-    shared_info->set_feedback_metadata(
-        ReadOnlyRoots(isolate).empty_feedback_metadata(), kReleaseStore);
-#else
-    UNREACHABLE();
-#endif  // V8_ENABLE_WEBASSEMBLY
-  }
+  shared_info->set_age(0);
+  shared_info->set_bytecode_array(*compilation_info->bytecode_array());
 }
 
 template <typename IsolateT>
@@ -830,20 +782,6 @@ ExecuteSingleUnoptimizedCompilationJob(
     AccountingAllocator* allocator,
     std::vector<FunctionLiteral*>* eager_inner_literals,
     LocalIsolate* local_isolate) {
-#if V8_ENABLE_WEBASSEMBLY
-  if (UseAsmWasm(literal, parse_info->flags().is_asm_wasm_broken())) {
-    std::unique_ptr<UnoptimizedCompilationJob> asm_job(
-        AsmJs::NewCompilationJob(parse_info, literal, allocator));
-    if (asm_job->ExecuteJob() == CompilationJob::SUCCEEDED) {
-      return asm_job;
-    }
-    // asm.js validation failed, fall through to standard unoptimized compile.
-    // Note: we rely on the fact that AsmJs jobs have done all validation in the
-    // PrepareJob and ExecuteJob phases and can't fail in FinalizeJob with
-    // with a validation error or another error that could be solve by falling
-    // through to standard unoptimized compile.
-  }
-#endif
   std::unique_ptr<UnoptimizedCompilationJob> job(
       interpreter::Interpreter::NewCompilationJob(
           parse_info, literal, script, allocator, eager_inner_literals,
@@ -1239,6 +1177,33 @@ void RecordMaglevFunctionCompilation(Isolate* isolate,
       isolate, LogEventListener::CodeTag::kFunction, script, shared,
       feedback_vector, code, code->kind(), time_taken_ms);
 }
+
+// A bailout on a property of the function itself repeats on every attempt.
+// Recording it stops the tiering manager from picking Maglev again, so the
+// function tiers up to Turbofan instead of recompiling Maglev forever.
+void MaybeMarkMaglevCompilationFailed(DirectHandle<JSFunction> function,
+                                      BytecodeOffset osr_offset,
+                                      BailoutReason reason) {
+  // The bit lives on the SharedFunctionInfo, so an OSR-only bailout must not
+  // disable Maglev for the regular entry point too.
+  if (IsOSR(osr_offset)) return;
+  switch (reason) {
+    case BailoutReason::kMaglevGraphBuildingFailed:
+      function->shared()->set_maglev_compilation_failed(true);
+      break;
+    default:
+      break;
+  }
+}
+
+void AbortMaglevCompilationJob(Isolate* isolate,
+                               DirectHandle<JSFunction> function,
+                               BytecodeOffset osr_offset,
+                               BailoutReason reason) {
+  CompilerTracer::TraceAbortedMaglevCompile(isolate, function, reason);
+  MaybeMarkMaglevCompilationFailed(function, osr_offset, reason);
+  function->SetTieringInProgress(isolate, false, osr_offset);
+}
 #endif  // V8_ENABLE_MAGLEV
 
 MaybeHandle<Code> CompileMaglev(Isolate* isolate, Handle<JSFunction> function,
@@ -1282,7 +1247,7 @@ MaybeHandle<Code> CompileMaglev(Isolate* isolate, Handle<JSFunction> function,
     CompilerTracer::TraceStartMaglevCompile(isolate, function, job->is_osr(),
                                             mode);
     CompilationJob::Status status = job->PrepareJob(isolate);
-    CHECK_EQ(status, CompilationJob::SUCCEEDED);  // TODO(v8:7700): Use status.
+    if (status != CompilationJob::SUCCEEDED) return {};
   }
 
   if (IsSynchronous(mode)) {
@@ -1290,6 +1255,12 @@ MaybeHandle<Code> CompileMaglev(Isolate* isolate, Handle<JSFunction> function,
         job->ExecuteJob(isolate->counters()->runtime_call_stats(),
                         isolate->main_thread_local_isolate());
     if (status == CompilationJob::FAILED) {
+      // Synchronous compilation never sets tiering_in_progress, so unlike
+      // FinalizeMaglevCompilationJob this must not reset it.
+      CompilerTracer::TraceAbortedMaglevCompile(isolate, function,
+                                                job->bailout_reason_);
+      MaybeMarkMaglevCompilationFailed(function, osr_offset,
+                                       job->bailout_reason_);
       return {};
     }
     CHECK_EQ(status, CompilationJob::SUCCEEDED);
@@ -1715,11 +1686,13 @@ BackgroundCompileTask::BackgroundCompileTask(
     DCHECK_NULL(compile_hint_callback_data);
   }
   flags_.set_compile_hints_magic_enabled(
-      options &
-      ScriptCompiler::CompileOptions::kFollowCompileHintsMagicComment);
+      v8_flags.compile_hints_magic ||
+      (options &
+       ScriptCompiler::CompileOptions::kFollowCompileHintsMagicComment));
   flags_.set_compile_hints_per_function_magic_enabled(
-      options & ScriptCompiler::CompileOptions::
-                    kFollowCompileHintsPerFunctionMagicComment);
+      v8_flags.compile_hints_magic ||
+      (options & ScriptCompiler::CompileOptions::
+                     kFollowCompileHintsPerFunctionMagicComment));
 }
 
 BackgroundCompileTask::BackgroundCompileTask(
@@ -2728,7 +2701,7 @@ MaybeHandle<SharedFunctionInfo> BackgroundCompileTask::FinalizeScript(
   Handle<Script> script = script_;
 
   // We might not have been able to finalize all jobs on the background
-  // thread (e.g. asm.js jobs), so finalize those deferred jobs now.
+  // thread, so finalize those deferred jobs now.
   if (FinalizeDeferredUnoptimizedCompilationJobs(
           isolate, script, &jobs_to_retry_finalization_on_main_thread_,
           compile_state_.pending_error_handler(),
@@ -2752,13 +2725,7 @@ MaybeHandle<SharedFunctionInfo> BackgroundCompileTask::FinalizeScript(
       // compilation (HasUncompiledData). Function here are all user defined
       // functions and should not have a builtin_id.
       DCHECK(!shared->HasBuiltinId());
-      DCHECK(shared->HasBytecodeArray() ||
-             shared->HasUncompiledData(isolate)
-#if V8_ENABLE_WEBASSEMBLY
-             // compiled data for 'use asm' functions
-             || shared->HasAsmWasmData()
-#endif
-      );
+      DCHECK(shared->HasBytecodeArray() || shared->HasUncompiledData(isolate));
     }
   }
 #endif
@@ -2819,7 +2786,7 @@ bool BackgroundCompileTask::FinalizeFunction(
       input_shared_info_.ToHandleChecked();
 
   // We might not have been able to finalize all jobs on the background
-  // thread (e.g. asm.js jobs), so finalize those deferred jobs now.
+  // thread, so finalize those deferred jobs now.
   if (FinalizeDeferredUnoptimizedCompilationJobs(
           isolate, script_, &jobs_to_retry_finalization_on_main_thread_,
           compile_state_.pending_error_handler(),
@@ -3091,7 +3058,7 @@ bool Compiler::Compile(Isolate* isolate, Handle<SharedFunctionInfo> shared_info,
   }
   parse_info.literal()->set_shared_function_info(shared_info);
 
-  // Generate the unoptimized bytecode or asm-js data.
+  // Generate the unoptimized bytecode.
   FinalizeUnoptimizedCompilationDataList
       finalize_unoptimized_compilation_data_list;
 
@@ -4123,10 +4090,12 @@ MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
 
       flags.set_is_eager(compile_options & ScriptCompiler::kEagerCompile);
       flags.set_compile_hints_magic_enabled(
-          compile_options & ScriptCompiler::kFollowCompileHintsMagicComment);
+          v8_flags.compile_hints_magic ||
+          (compile_options & ScriptCompiler::kFollowCompileHintsMagicComment));
       flags.set_compile_hints_per_function_magic_enabled(
-          compile_options &
-          ScriptCompiler::kFollowCompileHintsPerFunctionMagicComment);
+          v8_flags.compile_hints_magic ||
+          (compile_options &
+           ScriptCompiler::kFollowCompileHintsPerFunctionMagicComment));
 
       if (DirectHandle<Script> script; maybe_script.ToHandle(&script)) {
         flags.set_script_id(script->id());
@@ -4581,9 +4550,6 @@ void Compiler::FinalizeTurbofanCompilationJob(TurbofanCompilationJob* job,
   if (V8_LIKELY(use_result)) {
     function->SetTieringInProgress(isolate, false,
                                    job->compilation_info()->osr_offset());
-    if (!IsOSR(osr_offset)) {
-      function->UpdateCode(isolate, shared->GetCode(isolate));
-    }
   }
 }
 
@@ -4606,24 +4572,26 @@ void Compiler::FinalizeMaglevCompilationJob(maglev::MaglevCompilationJob* job,
   DirectHandle<JSFunction> function = job->function();
   BytecodeOffset osr_offset = job->osr_offset();
 
+  if (job->state() == CompilationJob::State::kFailed) {
+    AbortMaglevCompilationJob(isolate, function, osr_offset,
+                              job->bailout_reason_);
+    return;
+  }
+  DCHECK_EQ(job->state(), CompilationJob::State::kReadyToFinalize);
+
   if (function->ActiveTierIsTurbofan(isolate) && !job->is_osr()) {
-    function->SetTieringInProgress(isolate, false, osr_offset);
-    CompilerTracer::TraceAbortedMaglevCompile(isolate, function,
-                                              BailoutReason::kCancelled);
+    AbortMaglevCompilationJob(isolate, function, osr_offset,
+                              BailoutReason::kCancelled);
     return;
   }
   // Discard code compiled for a discarded native context without finalization.
   if (function->native_context()->IsDetached()) {
-    CompilerTracer::TraceAbortedMaglevCompile(
-        isolate, function, BailoutReason::kDetachedNativeContext);
+    AbortMaglevCompilationJob(isolate, function, osr_offset,
+                              BailoutReason::kDetachedNativeContext);
     return;
   }
 
   const CompilationJob::Status status = job->FinalizeJob(isolate);
-
-  // TODO(v8:7700): Use the result and check if job succeed
-  // when all the bytecodes are implemented.
-  USE(status);
 
   if (status == CompilationJob::SUCCEEDED) {
     DirectHandle<SharedFunctionInfo> shared(function->shared(), isolate);
@@ -4659,11 +4627,11 @@ void Compiler::FinalizeMaglevCompilationJob(maglev::MaglevCompilationJob* job,
     CompilerTracer::TraceFinishMaglevCompile(
         isolate, function, job->is_osr(), job->prepare_in_ms(),
         job->execute_in_ms(), job->finalize_in_ms());
+    function->SetTieringInProgress(isolate, false, osr_offset);
   } else {
-    CompilerTracer::TraceAbortedMaglevCompile(isolate, function,
-                                              job->bailout_reason_);
+    AbortMaglevCompilationJob(isolate, function, osr_offset,
+                              job->bailout_reason_);
   }
-  function->SetTieringInProgress(isolate, false, osr_offset);
 #endif
 }
 
@@ -4673,7 +4641,7 @@ void Compiler::PostInstantiation(Isolate* isolate,
                                  IsCompiledScope* is_compiled_scope) {
   DirectHandle<SharedFunctionInfo> shared(function->shared(), isolate);
 
-  // If code is compiled to bytecode (i.e., isn't asm.js), then allocate a
+  // If code is compiled to bytecode, then allocate a
   // feedback and check for optimized code.
   if (is_compiled_scope->is_compiled() && shared->HasBytecodeArray()) {
     // Don't reset budget if there is a closure feedback cell array already. We

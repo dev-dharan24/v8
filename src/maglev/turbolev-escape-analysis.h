@@ -36,7 +36,12 @@ namespace v8::internal::maglev {
 //
 // # Implementation
 //
-// Escape Analysis happens in 2 phases:
+// Escape Analysis happens in 3 phases:
+//
+//   * `AnalyzerPrePass` does a single forward pass over the graph to check if
+//     there are any objects that might not escape (if not, we stop here) and to
+//     mark objects that definitely escape as escaping so that
+//     `CandidateAnalyzer` doesn't both tracking them from the start.
 //
 //   * `CandidateAnalyzer` looks at the graph, computes which objects are
 //     escaping, and decides which objects to elide. It also computes the value
@@ -100,7 +105,13 @@ struct EscapeAnalysisData {
         keys_mappings(phase_zone),
         loaded_values(phase_zone),
         alloc_dependencies(phase_zone),
-        new_phis(phase_zone) {}
+        new_phis(phase_zone),
+        loop_stack(phase_zone),
+        alloc_definition_loop(phase_zone) {
+    // We initialize {loop_stack} with a dummy entry so that we don't need
+    // special cases when checking if an object is defined within a loop or not.
+    loop_stack.push_back({nullptr, false});
+  }
 
   Graph* graph;
   MaglevCompilationInfo* compilation_info;
@@ -111,8 +122,23 @@ struct EscapeAnalysisData {
   Candidates candidates;
 
   FieldValuesTable field_values;
+
+  // Number of predecessor snapshots that were merged to create the current
+  // snapshot. This is the predecessor count of the current block, except when
+  // visiting a loop header for the 1st time, where the backedge predecessor
+  // hasn't been visited yet and thus has no snapshot.
+  int merged_predecessor_count = 0;
+
   ZoneAbslFlatHashMap<NodeBase*, Snapshot> snapshots;
   ZoneAbslFlatHashMap<ObjectField, Key> keys_mappings;
+
+  // In order to handle exception handlers (which have no explicit predecessors
+  // in Maglev), we would need to compute the state from the predecessors, but
+  // predecessors are not available. For now, we just don't do any escape
+  // analysis if the graph has an exception handler.
+  // TODO(dmercadier): while iterating the graph, we could record exception
+  // handlers predecessors in a side table fairly easily.
+  bool has_exception_handler = false;
 
   // When the CandidateAnalyzer encounters a LoadTaggedField, it must resolve it
   // right away, rather than resolving it once its users are visited, so that if
@@ -130,6 +156,31 @@ struct EscapeAnalysisData {
   // are only inserted later by the Elider. {new_phis} also stores the Key so
   // that FixLoopPhis can find out the backedge value for the new phis.
   ZoneAbslFlatHashMap<BasicBlock*, ZoneVector<std::pair<Phi*, Key>>*> new_phis;
+
+  // When an object gets marked as escaped inside of a loop, this loop needs to
+  // be revisited, as well as the outer loops. Unless the object was defined
+  // inside of the current loop: in that case it wouldn't have any loop phi and
+  // thus marking it as escaping won't invalidate anything that was computed
+  // earlier. Here is how we track which loops need to be revisited during the
+  // analysis phase:
+  //
+  //   1. When we enter a loop, we push it to {loop_stack}.
+  //
+  //   2. When we encounter an InlinedAllocation, we look in {loop_stack} what
+  //      the current loop is, and we record it in {alloc_definition_loop}.
+  //
+  //   3. When we escape an InlinedAllocation, we set the
+  //      `has_escaped_candidate` field of all loops in {loop_stack} to true,
+  //      until we reach its defining loop (which won't need revisit).
+  //
+  //   4. When we reach a loop backedge, we pop it from {loop_stack} and check
+  //      if it needs revisit based on its `has_escaped_candidate` field.
+  struct LoopHeader {
+    BasicBlock* header;
+    bool has_escaped_candidate;
+  };
+  ZoneVector<LoopHeader> loop_stack;
+  ZoneAbslFlatHashMap<InlinedAllocation*, BasicBlock*> alloc_definition_loop;
 
   MaglevGraphLabeller* labeller() {
     DCHECK(compilation_info->has_graph_labeller());

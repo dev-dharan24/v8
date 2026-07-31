@@ -409,6 +409,7 @@ v8_cluster_source_set("v8_unittests_sources") {
     "heap/object-stats-unittest.cc",
     "heap/page-casting-unittest.cc",
     "heap/page-promotion-unittest.cc",
+    "heap/pending-allocations-unittest.cc",
     "heap/persistent-handles-unittest.cc",
     "heap/pool-unittest.cc",
     "heap/safepoint-unittest.cc",
@@ -457,6 +458,7 @@ v8_cluster_source_set("v8_unittests_sources") {
     "maglev/hamt-unittest.cc",
     "maglev/maglev-assembler-unittest.cc",
     "maglev/maglev-graph-builder-unittest.cc",
+    "maglev/maglev-graph-processor-unittest.cc",
     "maglev/maglev-test.cc",
     "maglev/maglev-test.h",
     "maglev/node-type-unittest.cc",
@@ -507,6 +509,7 @@ v8_cluster_source_set("v8_unittests_sources") {
     "profiler/heap-snapshot-utils.h",
     "profiler/strings-storage-unittest.cc",
     "regexp/regexp-unittest.cc",
+    "regress/regress-536271629-unittest.cc",
     "regress/regress-crbug-1041240-unittest.cc",
     "regress/regress-crbug-1056054-unittest.cc",
     "regress/regress-crbug-938251-unittest.cc",
@@ -553,6 +556,7 @@ v8_cluster_source_set("v8_unittests_sources") {
 
   exclude_from_cluster = [
     "api/dictionary-template-unittest.cc",
+    "api/interceptor-unittest.cc",
     "base/virtual-address-space-unittest.cc",
     "base/hashing-unittest.cc",
     "compiler/run-variables-unittest.cc",
@@ -679,8 +683,6 @@ v8_cluster_source_set("v8_unittests_sources") {
     sources += [
       "../../test/common/wasm/wasm-macro-gen.h",
       "api/api-wasm-unittest.cc",
-      "asmjs/asm-scanner-unittest.cc",
-      "asmjs/asm-types-unittest.cc",
       "compiler/int64-lowering-unittest.cc",
       "compiler/turboshaft/wasm-simd-unittest.cc",
       "compiler/wasm-address-reassociation-unittest.cc",
@@ -717,6 +719,7 @@ v8_cluster_source_set("v8_unittests_sources") {
       "wasm/wasm-disassembler-unittest-too-many-ends.wasm.inc",
       "wasm/wasm-disassembler-unittest-too-many-ends.wat.inc",
       "wasm/wasm-disassembler-unittest.cc",
+      "wasm/wasm-interpreter-thread-unittest.cc",
       "wasm/wasm-macro-gen-unittest.cc",
       "wasm/wasm-module-builder-unittest.cc",
       "wasm/wasm-module-sourcemap-unittest.cc",

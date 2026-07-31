@@ -3310,9 +3310,9 @@ JSNativeContextSpecialization::BuildPropertyLoad(
     } else {
       const ZoneVector<MapRef>& maps = access_info.lookup_start_object_maps();
       DCHECK_EQ(maps.size(), 1);
-      value = graph()->NewNode(
+      value = effect = graph()->NewNode(
           simplified()->TypedArrayLength(maps[0].elements_kind()),
-          lookup_start_object);
+          lookup_start_object, effect, control);
     }
   } else {
     DCHECK(access_info.IsDataField() || access_info.IsFastDataConstant() ||
@@ -3326,8 +3326,8 @@ JSNativeContextSpecialization::BuildPropertyLoad(
       value = maybe_value.value();
     } else if (access_info.IsDictionaryDataField()) {
       value = access_builder.BuildLoadDictionaryField(
-          name, access_info, lookup_start_object, &effect, &control, source,
-          context, frame_state);
+          name, access_info, lookup_start_object, receiver, &effect, &control,
+          source, context, frame_state);
       if (if_exceptions != nullptr) {
         Node* const if_exception =
             graph()->NewNode(common()->IfException(), effect, control);

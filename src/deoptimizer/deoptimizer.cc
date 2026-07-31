@@ -501,7 +501,7 @@ void Deoptimizer::DeoptimizeFunction(Tagged<JSFunction> function,
   TimerEventScope<TimerEventDeoptimizeCode> timer(isolate);
   TRACE_EVENT("v8", "V8.DeoptimizeCode");
   function->ResetIfCodeFlushed(isolate);
-  if (code.is_null()) code = function->code(isolate);
+  DCHECK(!code.is_null());
 
   if (CodeKindCanDeoptimize(code->kind())) {
     // Mark the code for deoptimization and unlink any functions that also
@@ -1328,10 +1328,25 @@ FrameDescription* Deoptimizer::DoComputeWasmLiftoffFrame(
   }
 
   // Store frame kind.
+  // For growable stacks, the frame at the entry point of a new stack segment
+  // is marked as WASM_SEGMENT_START. Preserving this marker on the bottommost
+  // frame during deoptimization ensures that the return sequence will shrink
+  // the stack segment when returning to the caller.
   uint32_t frame_type_offset =
       base_offset + WasmLiftoffFrameConstants::kFrameTypeOffset;
+  StackFrame::Type frame_type = StackFrame::WASM;
+  if (is_bottommost) {
+    intptr_t input_frame_marker =
+        base::Memory<intptr_t>(input_->GetFramePointerAddress() +
+                               TypedFrameConstants::kFrameTypeOffset);
+    if (StackFrame::MarkerToType(input_frame_marker) ==
+        StackFrame::WASM_SEGMENT_START) {
+      DCHECK(v8_flags.wasm_growable_stacks);
+      frame_type = StackFrame::WASM_SEGMENT_START;
+    }
+  }
   output_frame->SetFrameSlot(frame_type_offset,
-                             StackFrame::TypeToMarker(StackFrame::WASM));
+                             StackFrame::TypeToMarker(frame_type));
   // Fill feedback vector stack slot.
   // Instead of storing the actual feedback vector, we simply store the declared
   // function index of the wasm function. This is done because the feedback
@@ -1413,6 +1428,10 @@ void Deoptimizer::DoComputeOutputFramesWasmImpl() {
   caller_frame_top_ = stack_fp_ + CommonFrameConstants::kFixedFrameSizeAboveFp +
                       input_->parameter_count() * kSystemPointerSize;
 
+  StackGuard* const stack_guard = isolate()->stack_guard();
+  CHECK_GT(static_cast<uintptr_t>(caller_frame_top_),
+           stack_guard->real_jslimit());
+
   FILE* trace_file =
       verbose_tracing_enabled() ? trace_scope()->file() : nullptr;
   translated_state_.Init(isolate_, input_->GetFramePointerAddress(), stack_fp_,
@@ -1443,10 +1462,12 @@ void Deoptimizer::DoComputeOutputFramesWasmImpl() {
           WasmLiftoffFrameConstants::kInstanceDataOffset))));
 
   std::stack<intptr_t> shadow_stack;
+  size_t total_output_frame_size = 0;
   for (int i = 0; i < output_count_; ++i) {
     TranslatedFrame& frame = translated_state_.frames()[i];
     output_[i] = DoComputeWasmLiftoffFrame(
         frame, native_module, wasm_trusted_instance, i, shadow_stack);
+    total_output_frame_size += output_[i]->GetFrameSize();
   }
 
 #ifdef V8_ENABLE_CET_SHADOW_STACK
@@ -1505,6 +1526,18 @@ void Deoptimizer::DoComputeOutputFramesWasmImpl() {
   if (verbose_tracing_enabled()) {
     TraceDeoptEnd(timer.Elapsed().InMillisecondsF());
   }
+
+  // The following invariant is fairly tricky to guarantee, since the size of
+  // an optimized frame and its deoptimized counterparts usually differs. We
+  // thus need to consider the case in which deoptimized frames are larger than
+  // the optimized frame in stack checks in optimized code. We do this by
+  // applying an offset to stack checks (see kArchStackPointerGreaterThan in the
+  // code generator).
+  // Note that we explicitly allow deopts to exceed the limit by a certain
+  // number of slack bytes.
+  CHECK_GT(
+      static_cast<uintptr_t>(caller_frame_top_) - total_output_frame_size,
+      stack_guard->real_jslimit() - kStackLimitSlackForDeoptimizationInBytes);
 }
 
 void Deoptimizer::GetWasmStackSlotsCounts(const wasm::FunctionSig* sig,

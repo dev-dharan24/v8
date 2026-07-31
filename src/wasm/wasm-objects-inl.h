@@ -26,6 +26,7 @@
 #include "src/objects/heap-object-field-inl.h"
 #include "src/objects/heap-object.h"
 #include "src/objects/managed.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/object-predicates-inl.h"
 #include "src/objects/pod-array-inl.h"
 #include "src/objects/slots-inl.h"
@@ -369,10 +370,6 @@ WTI_TAGGED_ACCESSORS(untagged_globals_buffer, Tagged<ByteArray>,
 WTI_TAGGED_ACCESSORS(tagged_globals_buffer, Tagged<FixedArray>,
                      kTaggedGlobalsBufferOffset)
 WTI_TAGGED_ACCESSORS(tables, Tagged<FixedArray>, kTablesOffset)
-#if V8_ENABLE_DRUMBRAKE
-WTI_OPTIONAL_TAGGED_ACCESSORS(interpreter_object, Tagged<Tuple2>,
-                              kInterpreterObjectOffset)
-#endif  // V8_ENABLE_DRUMBRAKE
 WTI_PROTECTED_POINTER_ACCESSORS(dispatch_table0, WasmDispatchTable,
                                 kProtectedDispatchTable0Offset)
 WTI_PROTECTED_POINTER_ACCESSORS(dispatch_tables, ProtectedFixedArray,
@@ -382,6 +379,11 @@ WTI_PROTECTED_POINTER_ACCESSORS(dispatch_table_for_imports,
                                 kProtectedDispatchTableForImportsOffset)
 WTI_PROTECTED_POINTER_ACCESSORS(tags_table, TrustedFixedArray,
                                 kProtectedTagsTableOffset)
+#if V8_ENABLE_DRUMBRAKE
+WTI_PROTECTED_POINTER_ACCESSORS(interpreter_handle,
+                                TrustedManaged<wasm::InterpreterHandle>,
+                                kProtectedInterpreterHandleOffset)
+#endif  // V8_ENABLE_DRUMBRAKE
 #undef WTI_PROTECTED_POINTER_ACCESSORS
 WTI_TAGGED_ACCESSORS(func_refs, Tagged<FixedArray>, kFuncRefsOffset)
 WTI_TAGGED_ACCESSORS(managed_object_maps, Tagged<FixedArray>,
@@ -1494,29 +1496,6 @@ int WasmExceptionTag::index() const { return index_.load().value(); }
 void WasmExceptionTag::set_index(int value) {
   index_.store(this, Smi::FromInt(value));
 }
-
-// AsmWasmData
-Tagged<TrustedManaged<wasm::NativeModule>> AsmWasmData::managed_native_module()
-    const {
-  DCHECK(has_managed_native_module());
-  return managed_native_module_.load();
-}
-void AsmWasmData::set_managed_native_module(
-    Tagged<TrustedManaged<wasm::NativeModule>> value, WriteBarrierMode mode) {
-  managed_native_module_.store(this, value, mode);
-}
-bool AsmWasmData::has_managed_native_module() const {
-  return !managed_native_module_.load().is_null();
-}
-void AsmWasmData::clear_managed_native_module() {
-  managed_native_module_.store(this, {}, SKIP_WRITE_BARRIER);
-}
-
-uint64_t AsmWasmData::uses_bitset() const { return uses_bitset_.value(); }
-void AsmWasmData::set_uses_bitset(uint64_t value) {
-  uses_bitset_.set_value(value);
-}
-
 Tagged<JSReceiver> WasmSuspendingObject::callable() const {
   return callable_.load();
 }

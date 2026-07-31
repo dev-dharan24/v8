@@ -30,6 +30,7 @@
 #include "src/objects/heap-object.h"
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/map-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/oddball.h"
 #include "src/objects/string.h"
 
@@ -1842,7 +1843,10 @@ Address TranslatedState::DecompressIfNeeded(intptr_t value) {
 #ifdef V8_TARGET_ARCH_LOONG64
       // The 32-bit compressed values are supposed to be sign-extended on
       // loongarch64.
-      is_int32(value)) {
+      // Retain the validation logic to handle potentially zero-extended
+      // compressed values.
+      (is_int32(value) ||
+       static_cast<uintptr_t>(value) <= std::numeric_limits<uint32_t>::max())) {
 #else
       static_cast<uintptr_t>(value) <= std::numeric_limits<uint32_t>::max()) {
 #endif

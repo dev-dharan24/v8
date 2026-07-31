@@ -1436,11 +1436,19 @@ class LiftoffCompiler {
     if (ool->builtin == Builtin::kWasmGrowableStackGuard) {
       WasmGrowableStackGuardDescriptor descriptor;
       DCHECK_EQ(0, descriptor.GetStackParameterCount());
-      DCHECK_EQ(1, descriptor.GetRegisterParameterCount());
-      Register param_reg = descriptor.GetRegisterParameter(0);
-      __ LoadConstant(LiftoffRegister(param_reg),
+      DCHECK_EQ(2, descriptor.GetRegisterParameterCount());
+      Register param_reg0 = descriptor.GetRegisterParameter(0);
+      Register param_reg1 = descriptor.GetRegisterParameter(1);
+      __ LoadConstant(LiftoffRegister(param_reg0),
                       WasmValue::ForUintPtr(descriptor_->ParameterSlotCount() *
                                             kSystemPointerSize));
+      __ LoadConstant(LiftoffRegister(param_reg1), WasmValue::ForUintPtr(0));
+    } else if (ool->builtin == Builtin::kWasmStackGuard) {
+      WasmStackGuardDescriptor descriptor;
+      DCHECK_EQ(0, descriptor.GetStackParameterCount());
+      DCHECK_EQ(1, descriptor.GetRegisterParameterCount());
+      Register param_reg = descriptor.GetRegisterParameter(0);
+      __ LoadConstant(LiftoffRegister(param_reg), WasmValue::ForUintPtr(0));
     }
 
     Builtin builtin = ool->builtin;
@@ -7589,12 +7597,6 @@ class LiftoffCompiler {
   }
 
   void DataDrop(FullDecoder* decoder, const IndexImmediate& imm) {
-    // TODO(14616): Fix sharedness.
-    // TODO(14616): Data segments aren't available during streaming compilation,
-    // hence the `has_shared()` check below.
-    CHECK(!decoder->enabled_.has_shared() ||
-          !decoder->module_->data_segments[imm.index].shared);
-
     LiftoffRegList pinned;
     Register instance_data = __ cache_state() -> cached_instance_data;
     if (instance_data == no_reg) {
@@ -11125,6 +11127,15 @@ class LiftoffCompiler {
         trapping_instruction_pc, SourcePosition(decoder->position()), true);
     if (for_debugging_) {
       DefineSafepoint(trapping_instruction_pc);
+    }
+    if (V8_UNLIKELY(debug_sidetable_builder_)) {
+      // The trap handler fakes a call from fault_address + 1, so the debugger
+      // will look up the stack frame and scope at trapping_instruction_pc + 1.
+      debug_sidetable_builder_->NewEntry(
+          trapping_instruction_pc + 1,
+          GetCurrentDebugSideTableEntries(
+              decoder, DebugSideTableBuilder::kAllowRegisters)
+              .as_vector());
     }
   }
 

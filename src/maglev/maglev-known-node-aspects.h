@@ -402,6 +402,12 @@ class KnownNodeAspects {
       bool is_tracing_enabled);
   void ClearUnstableNodeAspects(bool is_tracing_enabled);
 
+  // Returns the node info for `object` if its possible maps are known and not
+  // stale, otherwise nullptr. Cached [Elements] facts survive an elements-kind
+  // transition only for such objects: stale or unknown maps mean the object
+  // may alias a transition source, whose elements store can be reallocated.
+  const NodeInfo* TryGetInfoWithFreshMaps(ValueNode* object) const;
+
   void OnSideEffect() {
     // A side effect could change existing objects' maps. For stable maps we
     // know this hasn't happened (because we added a dependency on the maps
@@ -431,11 +437,12 @@ class KnownNodeAspects {
   void ClearAll() {
     loaded_constant_properties_.clear();
     loaded_properties_.clear();
+    loaded_tagged_keyed_properties_.clear();
     loaded_context_constants_.clear();
     loaded_context_slots_.clear();
     available_expressions_.clear();
     side_effects_require_invalidation_ = false;
-    may_have_aliasing_contexts_ = ContextSlotLoadsAlias::kNone;
+    may_have_aliasing_contexts_ = ContextSlotLoadsAlias::kNever;
     node_infos_.clear();
     virtual_objects_ = {};
   }
@@ -623,6 +630,31 @@ class KnownNodeAspects {
     return false;
   }
 
+  // Cache of LoadFixedArrayElement results keyed by (elements, index). Any
+  // write that does not pass PreservesTaggedKeyedProperties clears it.
+  LoadFixedArrayElement* TryFindTaggedKeyedProperty(ValueNode* elements,
+                                                    ValueNode* index) {
+    auto it = loaded_tagged_keyed_properties_.find(
+        {elements->UnwrapIdentities(), index->UnwrapIdentities()});
+    if (it == loaded_tagged_keyed_properties_.end()) return nullptr;
+    return it->second->UnwrapIdentities()->TryCast<LoadFixedArrayElement>();
+  }
+  void RecordTaggedKeyedProperty(ValueNode* elements, ValueNode* index,
+                                 LoadFixedArrayElement* load) {
+    std::pair<ValueNode*, ValueNode*> key{elements->UnwrapIdentities(),
+                                          index->UnwrapIdentities()};
+    auto it = loaded_tagged_keyed_properties_.find(key);
+    if (it != loaded_tagged_keyed_properties_.end()) {
+      it->second = load;
+      return;
+    }
+    if (loaded_tagged_keyed_properties_.size() >= kMaxTaggedKeyedProperties) {
+      return;
+    }
+    loaded_tagged_keyed_properties_.emplace(key, load);
+  }
+  void ClearTaggedKeyedProperties() { loaded_tagged_keyed_properties_.clear(); }
+
   void increment_effect_epoch() {
     if (effect_epoch_ < kEffectEpochOverflow) effect_epoch_++;
   }
@@ -684,10 +716,10 @@ class KnownNodeAspects {
   }
 
   enum class ContextSlotLoadsAlias : uint8_t {
-    kNone,
+    kNever,
     kOnlyLoadsRelativeToCurrentContext,
     kOnlyLoadsRelativeToConstant,
-    kYes,
+    kAlways,
   };
   ContextSlotLoadsAlias may_have_aliasing_contexts() const {
     return may_have_aliasing_contexts_;
@@ -695,9 +727,9 @@ class KnownNodeAspects {
   static ContextSlotLoadsAlias ContextSlotLoadsAliasMerge(
       ContextSlotLoadsAlias m1, ContextSlotLoadsAlias m2) {
     if (m1 == m2) return m1;
-    if (m1 == ContextSlotLoadsAlias::kNone) return m2;
-    if (m2 == ContextSlotLoadsAlias::kNone) return m1;
-    return ContextSlotLoadsAlias::kYes;
+    if (m1 == ContextSlotLoadsAlias::kNever) return m2;
+    if (m2 == ContextSlotLoadsAlias::kNever) return m1;
+    return ContextSlotLoadsAlias::kAlways;
   }
   struct ContextStoreResult {
     enum Type {
@@ -751,6 +783,16 @@ class KnownNodeAspects {
                                         : loaded_context_constants_.empty();
   }
 
+  static bool BuiltinInvalidatesKNA(Builtin builtin) {
+    switch (builtin) {
+      // TODO(victorgomes): Add more builtins to the list!
+      case Builtin::kCloneFastJSArray:
+        return false;
+      default:
+        return true;
+    }
+  }
+
   template <typename NodeT>
   void MarkPossibleSideEffect(NodeT* node, compiler::JSHeapBroker* broker,
                               bool is_tracing_enabled) {
@@ -758,6 +800,14 @@ class KnownNodeAspects {
     if constexpr (!NodeT::kProperties.can_write()) return;
 
     increment_effect_epoch();
+
+    if constexpr (!PreservesTaggedKeyedProperties(Node::opcode_of<NodeT>)) {
+      loaded_tagged_keyed_properties_.clear();
+    }
+
+    if constexpr (Node::opcode_of<NodeT> == Opcode::kCallBuiltin) {
+      if (!BuiltinInvalidatesKNA(node->builtin())) return;
+    }
 
     if constexpr (Node::opcode_of<NodeT> == Opcode::kMaybeGrowFastElements) {
       if (ClearLoadedPropertiesForKey(broker->length_string())) {
@@ -802,11 +852,12 @@ class KnownNodeAspects {
   explicit KnownNodeAspects(Zone* zone)
       : loaded_constant_properties_(zone),
         loaded_properties_(zone),
+        loaded_tagged_keyed_properties_(zone),
         loaded_context_constants_(zone),
         loaded_context_slots_(zone),
         available_expressions_(zone),
         side_effects_require_invalidation_(false),
-        may_have_aliasing_contexts_(ContextSlotLoadsAlias::kNone),
+        may_have_aliasing_contexts_(ContextSlotLoadsAlias::kNever),
         effect_epoch_(0),
         node_infos_(zone),
         virtual_objects_() {}
@@ -874,6 +925,12 @@ class KnownNodeAspects {
   LoadedPropertyMap loaded_constant_properties_;
   // Flushed after side-effecting calls.
   LoadedPropertyMap loaded_properties_;
+  // (elements, index) -> LoadFixedArrayElement. Flushed by any write that
+  // does not pass PreservesTaggedKeyedProperties. Bounded by
+  // kMaxTaggedKeyedProperties, since the map is copied at every clone.
+  static constexpr size_t kMaxTaggedKeyedProperties = 100;
+  ZoneMap<std::pair<ValueNode*, ValueNode*>, ValueNode*>
+      loaded_tagged_keyed_properties_;
   // Unconditionally valid across side-effecting calls.
   ZoneMap<std::tuple<ValueNode*, int>, ValueNode*> loaded_context_constants_;
   // Flushed after side-effecting calls.
@@ -969,6 +1026,12 @@ class KnownMapsMerger {
       if (intersect_set_.is_empty()) {
         // TODO(marja): Refactor to return false here explicitly.
         node_type_ = EmptyNodeType();
+      } else if (RequestedMapsAdmitSmis()) {
+        // Smis pass a map check against the HeapNumber map, so the check does
+        // not prove that the object is a heap object. InsertMap accounts for
+        // this, but the HeapNumber map might have been filtered out above (or
+        // might not be a known possible map at all), so re-apply it here.
+        node_type_ = maglev::UnionType(node_type_, NodeType::kSmi);
       }
     } else {
       // A missing entry here means the universal set, i.e., we don't know
@@ -1029,6 +1092,12 @@ class KnownMapsMerger {
   }
 
   NodeType node_type() const { return node_type_; }
+
+  bool RequestedMapsAdmitSmis() const {
+    return std::any_of(
+        requested_maps_.begin(), requested_maps_.end(),
+        [](compiler::MapRef map) { return map.IsHeapNumberMap(); });
+  }
 
  private:
   compiler::JSHeapBroker* broker_;

@@ -646,6 +646,8 @@ std::string_view AtomicLoopKindName(AtomicLoopKind kind) {
       return "none";
     case AtomicLoopKind::kAtEnd:
       return "at-end";
+    case AtomicLoopKind::kTotal:
+      return "total";
     case AtomicLoopKind::kBoundary:
       return "boundary";
     case AtomicLoopKind::kDisjoint:
@@ -762,6 +764,7 @@ EmitResult Trace::Flush(Compiler* compiler, Node* successor,
         case AtomicLoopKind::kNone:
           break;
         case AtomicLoopKind::kAtEnd:
+        case AtomicLoopKind::kTotal:
         case AtomicLoopKind::kDisjoint:
           if (cp_offset_ == 0 || (cp_offset_ > 0 && uniform_prefix)) {
             drain_useless_loop = loop;
@@ -1888,10 +1891,89 @@ bool QuickCheckDetails::Rationalize(bool asc) {
   return found_useful_op;
 }
 
+void Node::set_bm_info(bool not_at_start, BoyerMooreLookahead* bm) {
+  if (!bm->caches_node_info()) return;
+  bm_info_[not_at_start ? 1 : 0] = bm;
+}
+
 uint32_t Node::EatsAtLeast(bool not_at_start) {
   return not_at_start ? eats_at_least_.from_not_start
                       : eats_at_least_.from_possibly_start;
 }
+
+namespace {
+
+// An approximate single-character quick check (Position::determines_perfectly
+// == false) admits many false positives: a scattered class like [+\-%&|^]
+// rationalizes to a weak common-bits mask, and merging a choice's alternatives
+// weakens it further.  When the node's own first-character set is small, reject
+// non-members exactly with a membership table instead. The table is indexed
+// modulo kTableSize (see CheckBitInTable), so in two-byte mode it still admits
+// false positives from aliasing; the body's full check backstops it.
+//
+// Returns a table whose bit is set for every first character the node can
+// match, or an empty handle when a table is not worthwhile.
+//
+// The set is recovered by a fresh position-0 FillInBMInfo walk of this node.
+// FillInBMInfo only ever over-approximates, so a nonzero result is a valid
+// superset (false positives allowed, false negatives not). The walk is fresh
+// rather than reading the shared bm_info_ because that slot holds the union
+// over sibling alternatives, not this node's own set. It runs on a non-caching
+// lookahead (set_caches_node_info) so the transient walk does not overwrite
+// that shared slot.
+Handle<ByteArray> TryBuildFirstCharacterTable(Node* node, uint32_t mask,
+                                              Compiler* compiler,
+                                              bool not_at_start) {
+  if (node->EatsAtLeast(not_at_start) < 1) {
+    TRACE("* No first-character table: eats nothing");
+    return {};
+  }
+
+  Zone* zone = node->zone();
+  BoyerMooreLookahead* lookahead =
+      zone->New<BoyerMooreLookahead>(1, compiler, zone);
+  lookahead->set_caches_node_info(false);
+  node->FillInBMInfo(compiler->isolate(), 0, Node::kRecursionBudget, lookahead,
+                     not_at_start);
+
+  const int count = lookahead->at(0)->map_count();
+  if (count == 0) {
+    // First-character set unknown; keep the mask.
+    TRACE("* No first-character table: set unknown");
+    return {};
+  }
+
+  // The mask already rejects everything outside 2^popcount(~mask) characters. A
+  // table is only worth its load and heap object when it is strictly more
+  // selective than that, so bail when the mask is at least as discriminating.
+  //
+  // Each table bit stands for (char_mask + 1) / kTableSize code units (2 in
+  // one-byte mode, 512 in two-byte), since map_count() and CheckBitInTable both
+  // key on character & kMask, so scale the count into code units before
+  // comparing. Without the scale the table looks artificially selective and we
+  // emit a strictly worse check: a wider table plus, once we clear the mask
+  // below, the loss of the downstream masked-class fold.
+  const uint32_t char_mask = CharMask(compiler->one_byte());
+  const int alias_factor = (char_mask + 1) / RegExpMacroAssembler::kTableSize;
+  const int mask_accepts = 1 << base::bits::CountPopulation(~mask & char_mask);
+  if (count * alias_factor >= mask_accepts) {
+    TRACE("* No first-character table: mask at least as discriminating");
+    return {};
+  }
+
+  // A single-position skip table is a membership table: one byte per character,
+  // nonzero iff the character can start a match.
+  // TODO(jgruber): A node emitted up to kMaxCopiesCodeGenerated times repeats
+  // this walk and allocates a byte-identical table each time. Memoizing the
+  // table on the node would collapse both (cf. the boundary-test tables).
+  Handle<ByteArray> table = compiler->isolate()->factory()->NewByteArray(
+      RegExpMacroAssembler::kTableSize, AllocationType::kOld);
+  lookahead->GetSkipTable(0, 0, table);
+  TRACE("* Emit first-character table");
+  return table;
+}
+
+}  // namespace
 
 bool Node::EmitQuickCheck(Compiler* compiler, Trace* bounds_check_trace,
                           Trace* trace, bool preload_has_checked_bounds,
@@ -1939,6 +2021,42 @@ bool Node::EmitQuickCheck(Compiler* compiler, Trace* bounds_check_trace,
     assembler->LoadCurrentCharacter(cp_offset, bounds_check_trace->backtrack(),
                                     !preload_has_checked_bounds,
                                     details->characters(), bounds_check_offset);
+  }
+
+  // Approximate single-character check: prefer an exact membership table (see
+  // TryBuildFirstCharacterTable).
+  if (details->characters() == 1 &&
+      !details->positions(0)->determines_perfectly) {
+    const bool not_at_start = trace->at_start() == Trace::FALSE_VALUE;
+    Handle<ByteArray> table =
+        TryBuildFirstCharacterTable(this, mask, compiler, not_at_start);
+    if (!table.is_null()) {
+      // The table only proved that the character is in the set. It did not
+      // prove the mask equation (x & mask) == value, which we never emitted.
+      // Downstream code trusts a published mask/value and would skip a compare
+      // on that basis, so clear both (on the position and on the Rationalize()
+      // condensate) to signal that nothing is proven here; the body then
+      // re-checks in full (see mask_known in EmitClassRanges).
+      // The table also proves the low bits every member shares, which we drop
+      // here. Keeping them would let the body skip a compare (the "masked-class
+      // fold"), but that fold only helps for tightly-grouped character sets,
+      // and the table only fires for scattered ones -- so there is nothing to
+      // gain today. Revisit if the table ever starts firing for grouped sets
+      // too.
+      details->positions(0)->mask = 0;
+      details->positions(0)->value = 0;
+      details->set_mask(0);
+      details->set_value(0);
+      if (fall_through_on_failure) {
+        assembler->CheckBitInTable(table, on_possible_success);
+      } else {
+        Label matched;
+        assembler->CheckBitInTable(table, &matched);
+        assembler->GoTo(trace->backtrack());
+        assembler->Bind(&matched);
+      }
+      return true;
+    }
   }
 
   bool need_mask = true;
@@ -2991,16 +3109,103 @@ AtomicLoopBodyAnalysis AnalyzeAtomicLoopBody(
   return result;
 }
 
+// Node-visit cap for ContinuationAlwaysSucceeds (see its |budget| comment).
+constexpr int kContinuationAlwaysSucceedsBudget = 1000;
+
+// Whether |node| has a guaranteed-success path: it reaches EndNode(ACCEPT)
+// consuming zero input and failing no assertion, so at any position it cannot
+// fail.  Then the loop's drain is dead code (see AtomicLoopKind::kTotal).
+//
+// |budget| bounds the total node visits: on a false result the walk explores
+// every path, and a re-convergent nullable subtree (/(?:a?|b?)(?:a?|b?).../)
+// is exponential in the number of forks, so it is capped and returns the
+// conservative false when spent.  Real always-succeeds continuations are short
+// nullable chains far under the cap.
+bool ContinuationAlwaysSucceeds(Node* node, int depth, int* budget) {
+  if (depth > Compiler::kMaxRecursion || node == nullptr) return false;
+  if (--*budget < 0) return false;
+  if (ActionNode* action = node->AsActionNode()) {
+    switch (action->action_type()) {
+      // These actions emit no failure branch of their own: ActionNode::Emit
+      // defers them to the trace or emits a pure state write (register, flag,
+      // position restore, or the no-op eats-at-least hint) and then
+      // unconditionally emits on_success, so the path's outcome is whatever
+      // follows.
+      // - POSITIVE_SUBMATCH_SUCCESS commits a matched positive lookahead (a
+      //   zero-width position/stackpointer restore); its only backtrack is the
+      //   register-clear cleanup, reached solely via on_success's own backtrack
+      //   (DCHECK(trace->backtrack() == nullptr) in its Emit).
+      // - BEGIN_POSITIVE_SUBMATCH starts a positive lookahead whose on_success
+      //   is its body.  The lookahead succeeds iff the body does; recursing
+      //   walks the body and reports success only for a body that reaches
+      //   ACCEPT infallibly (e.g. the nullable /a*/ of /\w+(?=a*)/), so a body
+      //   that can fail (/\w+(?=a)/) correctly returns false.
+      case ActionNode::STORE_POSITION:
+      case ActionNode::CLEAR_CAPTURES:
+      case ActionNode::SET_REGISTER_FOR_LOOP:
+      case ActionNode::INCREMENT_REGISTER:
+      case ActionNode::MODIFY_FLAGS:
+      case ActionNode::EATS_AT_LEAST:
+      case ActionNode::RESTORE_POSITION:
+      case ActionNode::POSITIVE_SUBMATCH_SUCCESS:
+      case ActionNode::BEGIN_POSITIVE_SUBMATCH:
+        return ContinuationAlwaysSucceeds(action->on_success(), depth + 1,
+                                          budget);
+      // EMPTY_MATCH_CHECK emits a conditional backtrack, so the path can fail.
+      // A negative lookaround fails whenever its inner match succeeds, which no
+      // walk of a single always-succeeding path can rule out.
+      case ActionNode::EMPTY_MATCH_CHECK:
+      case ActionNode::BEGIN_NEGATIVE_SUBMATCH:
+        return false;
+    }
+  }
+  if (EndNode* end = node->AsEndNode()) {
+    return end->action() == EndNode::ACCEPT;
+  }
+  // A LoopChoiceNode is a ChoiceNode too: a `*` / `{0,n}` loop reaches ACCEPT
+  // through its unguarded exit (continue) alternative, while a `+` / `{m,}`
+  // loop's exit carries a GEQ-min guard and is skipped below, leaving only its
+  // consuming body -- correctly not nullable.
+  if (ChoiceNode* choice = node->AsChoiceNode()) {
+    // A negative lookaround is not a plain disjunction (its first alternative
+    // must fail); do not treat it as one.
+    if (choice->AsNegativeLookaroundChoiceNode() != nullptr) return false;
+    // The disjunction succeeds if any unguarded alternative does: a
+    // lower-priority epsilon-accept alternative is still reached as a last
+    // resort by the continuation's own backtracking.  Guarded alternatives
+    // (e.g. a loop's GEQ-min exit guard) may be blocked, so they are skipped.
+    for (GuardedAlternative& alt : *choice->alternatives()) {
+      if (alt.guards() != nullptr && alt.guards()->length() != 0) continue;
+      if (ContinuationAlwaysSucceeds(alt.node(), depth + 1, budget)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // A TextNode consumes; anything else is not provably infallible.
+  return false;
+}
+
 // Facts about a fixed-length loop's continuation alternative, computed by
 // AnalyzeAtomicLoopContinuation in one walk of the continuation chain.
+//
+// TODO(jgruber): at_end_accept, always_succeeds, starts_with_boundary and
+// first_set are all functions of the same subtree; a single recursive walk
+// co-computing nullable(C) and a fork-descending FIRST(C) would subsume them
+// and strengthen kDisjoint, but it changes landed kDisjoint/kBoundary behavior
+// so it belongs in its own fuzzer-gated refactor.
 struct AtomicLoopContinuationAnalysis {
   // The chain is AssertionNode(AT_END), zero or more position-insensitive
   // ActionNodes, EndNode(ACCEPT).  Such a continuation fails at every
   // retreat position (all strictly before the end).  AT_END is the only
   // retreat-insensitive assertion kind: AT_START becomes true at position
   // 0, AT_BOUNDARY / AT_NON_BOUNDARY / AFTER_NEWLINE depend on the
-  // surrounding characters.
+  // surrounding characters.  A bare ACCEPT with no leading AT_END is the
+  // stronger always_succeeds case below, not this one.
   bool at_end_accept = false;
+  // The continuation cannot fail at the greedy extent (see
+  // ContinuationAlwaysSucceeds, AtomicLoopKind::kTotal).
+  bool always_succeeds = false;
   // The chain starts with a \b assertion.  Over a word-character body,
   // every *interior* retreat position sits between two body characters
   // where \b is false, so interior retries fail at the assertion.  The
@@ -3025,6 +3230,10 @@ AtomicLoopContinuationAnalysis AnalyzeAtomicLoopContinuation(
   AtomicLoopContinuationAnalysis result;
   if (alt->guards() != nullptr && alt->guards()->length() != 0) return result;
   Node* node = alt->node();
+  // The always-succeeds fact needs a branch-descending walk (a disjunction
+  // succeeds if any alternative does), unlike the single-spine facts below.
+  int budget = kContinuationAlwaysSucceedsBudget;
+  result.always_succeeds = ContinuationAlwaysSucceeds(node, 0, &budget);
   if (AssertionNode* head = node->AsAssertionNode()) {
     result.starts_with_boundary =
         head->assertion_type() == AssertionNode::AT_BOUNDARY;
@@ -3035,7 +3244,8 @@ AtomicLoopContinuationAnalysis AnalyzeAtomicLoopContinuation(
   // ACCEPT with only a leading AT_END, first_alive while no node has yet
   // altered what the continuation's first consumed character can be (so once we
   // reach a TextNode its first element still overapproximates
-  // FIRST(continuation)).
+  // FIRST(continuation)). A bare ACCEPT with no leading AT_END is the stronger
+  // always_succeeds case above, not this walk.
   bool at_end_alive =
       node->AsAssertionNode() != nullptr &&
       node->AsAssertionNode()->assertion_type() == AssertionNode::AT_END;
@@ -3121,7 +3331,10 @@ AtomicLoopKind ClassifyAtomicLoop(LoopChoiceNode* loop, Flags flags) {
   AtomicLoopContinuationAnalysis cont =
       AnalyzeAtomicLoopContinuation(continuation, flags, zone, &first_set);
 
+  // Mutually exclusive: a leading AT_END fails the always-succeeds walk (it
+  // stops at the assertion), so only one of these fires.
   if (cont.at_end_accept) return AtomicLoopKind::kAtEnd;
+  if (cont.always_succeeds) return AtomicLoopKind::kTotal;
   if (!body_info.set_known) return AtomicLoopKind::kNone;
   CharacterRange::Canonicalize(&body_set);
   // Disjointness before the boundary rule: where both apply (a \b followed
@@ -3184,12 +3397,15 @@ DrainMode ChooseFixedLengthLoopDrainMode(ChoiceNode* choice, Trace* trace,
     case AtomicLoopKind::kNone:
       return DrainMode::kFull;
     case AtomicLoopKind::kAtEnd:
+    case AtomicLoopKind::kTotal:
       // Tail position (continuation ends in ACCEPT): the loop-exit backtrack
       // dispatches through the backtrack stack to frames that all restore or
       // ignore the position, so parking is safe with a null exit target, and
       // under any grant with a non-null one (keeps /x(a+$|a)/ siblings
       // correct).  Otherwise every retry is still futile, so restore-only
       // suffices (as for kDisjoint); no need for the char-by-char kFull drain.
+      // kTotal takes the same modes: it is strictly stronger (see
+      // AtomicLoopKind), so the drain is dead either way.
       return (parkable && (trace->backtrack() == nullptr ||
                            trace->parked_grant() != ParkedGrant::kNone))
                  ? DrainMode::kOmit

@@ -319,24 +319,6 @@ RUNTIME_FUNCTION(Runtime_WasmTraceExit) {
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
-RUNTIME_FUNCTION(Runtime_IsAsmWasmCode) {
-  SealHandleScope shs(isolate);
-  DisallowGarbageCollection no_gc;
-  if (args.length() != 1 || !IsJSFunction(args[0])) {
-    return CrashUnlessFuzzing(isolate);
-  }
-  auto function = Cast<JSFunction>(args[0]);
-  if (!function->shared()->HasAsmWasmData()) {
-    return ReadOnlyRoots(isolate).false_value();
-  }
-  if (function->shared()->HasBuiltinId() &&
-      function->shared()->builtin_id() == Builtin::kInstantiateAsmJs) {
-    // Hasn't been compiled yet.
-    return ReadOnlyRoots(isolate).false_value();
-  }
-  return ReadOnlyRoots(isolate).true_value();
-}
-
 namespace {
 
 bool DisallowWasmCodegenFromStringsCallback(v8::Local<v8::Context> context,
@@ -808,8 +790,7 @@ static Tagged<Object> CreateWasmObject(Isolate* isolate,
   // Instantiate the module.
   MaybeDirectHandle<WasmInstanceObject> maybe_instance =
       engine->SyncInstantiate(isolate, &thrower, module_object,
-                              Handle<JSReceiver>::null(),
-                              MaybeDirectHandle<JSArrayBuffer>());
+                              Handle<JSReceiver>::null());
   CHECK(!thrower.error());
   DirectHandle<WasmInstanceObject> instance;
   if (!maybe_instance.ToHandle(&instance)) {

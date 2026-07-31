@@ -280,6 +280,11 @@ inline ReduceResult MaybeReduceResult::Checked() { return ReduceResult(*this); }
     DCHECK_NOT_NULL(variable);               \
   } while (false)
 
+#define ABORT_IF_EMPTY_TYPE(node)                 \
+  if (IsEmptyNodeType(GetType(node))) {           \
+    return BuildAbort(AbortReason::kUnreachable); \
+  }
+
 template <typename BaseT>
 concept ReducerBaseWithKNA = requires(BaseT* b) { b->known_node_aspects(); };
 
@@ -806,6 +811,13 @@ class MaglevReducer {
   ReduceResult BuildCheckSmi(ValueNode* object);
   ReduceResult BuildCheckString(ValueNode* object);
 
+  ReduceResult BuildTaggedEqual(ValueNode* lhs, ValueNode* rhs);
+  ReduceResult BuildTaggedEqual(ValueNode* lhs, RootIndex rhs_index);
+
+  ReduceResult BuildSameValue(ValueNode* lhs, ValueNode* rhs);
+  ReduceResult BuildNumberSameValue(ValueNode* lhs, ValueNode* rhs);
+  bool IsNeitherNaNNorZero(ValueNode* node);
+
   ReduceResult TryBuildCheckInt32Condition(ValueNode* lhs, ValueNode* rhs,
                                            AssertCondition condition,
                                            DeoptimizeReason reason);
@@ -936,7 +948,8 @@ class MaglevReducer {
   ReduceResult BuildLoadTaggedField(
       ValueNode* object, uint32_t offset, NodeType type = NodeType::kUnknown,
       bool is_const = false, PropertyKey key = PropertyKey::None(),
-      IsArrayLength is_array_length = IsArrayLength::kNo);
+      IsArrayLength is_array_length = IsArrayLength::kNo,
+      compiler::OptionalMapRef stable_field_map = {});
 
   ReduceResult BuildLoadFixedDoubleArrayElement(ValueNode* elements,
                                                 ValueNode* index);
@@ -1109,6 +1122,8 @@ class MaglevReducer {
 #endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
 
 #define MAGLEV_REDUCER_BUILTIN(V)              \
+  V(ArrayIndexOf)                              \
+  V(ArrayIncludes)                             \
   V(ArrayIsArray)                              \
   V(ArrayPrototypeAt)                          \
   V(ArrayPrototypeEntries)                     \
@@ -1140,8 +1155,11 @@ class MaglevReducer {
   V(MathMax)                                   \
   V(MathMin)                                   \
   V(MathRound)                                 \
+  V(MathSign)                                  \
   V(MathSqrt)                                  \
   V(MathTrunc)                                 \
+  V(ObjectIs)                                  \
+  V(ObjectPrototypeIsPrototypeOf)              \
   V(PromisePrototypeThen)                      \
   V(PromiseResolveTrampoline)                  \
   V(RegExpPrototypeTest)                       \
@@ -1185,6 +1203,19 @@ class MaglevReducer {
   ReduceResult BuildLoadElements(
       ValueNode* object, std::optional<ElementsKind> kind = std::nullopt);
 
+  ReduceResult BuildLoadJSArrayLength(ValueNode* js_array,
+                                      NodeType length_type = NodeType::kSmi);
+
+  template <typename ReducerCb>
+  MaybeReduceResult TryWithFastArrayElements(const char* builtin_name,
+                                             CallArguments& args,
+                                             ReducerCb Reducer);
+
+  template <typename ReducerCb>
+  MaybeReduceResult TryWithArrayIterationArgs(const char* builtin_name,
+                                              CallArguments& args,
+                                              ReducerCb Reducer);
+
   ReduceResult BuildAssumeMapForElements(ValueNode* elements,
                                          ElementsKind kind);
 
@@ -1193,6 +1224,8 @@ class MaglevReducer {
   ReduceResult BuildCheckInstanceType(ValueNode* object, NodeType target_type,
                                       InstanceType first, InstanceType last);
   ReduceResult GetInt32ElementIndex(ValueNode* index_object);
+  MaybeReduceResult TryReuseKnownPropertyLoad(ValueNode* lookup_start_object,
+                                              compiler::NameRef name);
   void RecordKnownProperty(ValueNode* lookup_start_object, PropertyKey key,
                            ValueNode* value, bool is_const,
                            compiler::AccessMode access_mode);
@@ -1205,6 +1238,8 @@ class MaglevReducer {
 
   ReduceResult BuildInt32Max(ValueNode* a, ValueNode* b);
   ReduceResult BuildInt32Min(ValueNode* a, ValueNode* b);
+  ReduceResult BuildInt32Sign(ValueNode* value);
+  ReduceResult BuildFloat64Sign(ValueNode* value);
 
   class BranchBuilder : public BranchBuilderBase<BranchBuilder> {
    public:
